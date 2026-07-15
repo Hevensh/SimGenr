@@ -1,0 +1,55 @@
+from __future__ import annotations
+
+import numpy as np
+
+from world_generator.core.config import WorldGridConfig
+from world_generator.core.datatypes import TerrainBase, TerrainFeatures
+
+
+def derive_terrain_features(
+    base: TerrainBase,
+    grid: WorldGridConfig,
+) -> TerrainFeatures:
+    elevation = base.elevation.astype(np.float32)
+    cell_m = float(grid.cell_size_km) * 1000.0
+    grad_y, grad_x = np.gradient(elevation, cell_m, cell_m)
+    slope = np.hypot(grad_x, grad_y).astype(np.float32)
+    aspect = np.arctan2(-grad_y, -grad_x)
+    aspect_sin = np.sin(aspect).astype(np.float32)
+    aspect_cos = np.cos(aspect).astype(np.float32)
+    roughness = _local_range(elevation, radius=1).astype(np.float32)
+    curvature = _laplacian(elevation, cell_m).astype(np.float32)
+    return TerrainFeatures(
+        elevation=elevation,
+        slope=slope,
+        aspect_sin=aspect_sin,
+        aspect_cos=aspect_cos,
+        roughness=roughness,
+        curvature=curvature,
+    )
+
+
+def _local_range(values: np.ndarray, radius: int) -> np.ndarray:
+    padded = np.pad(values, radius, mode="edge")
+    windows = []
+    for dr in range(2 * radius + 1):
+        for dc in range(2 * radius + 1):
+            windows.append(padded[dr : dr + values.shape[0], dc : dc + values.shape[1]])
+    stack = np.stack(windows, axis=0)
+    local = stack.max(axis=0) - stack.min(axis=0)
+    denom = max(float(np.nanmax(local)), 1e-6)
+    return (local / denom).astype(np.float32)
+
+
+def _laplacian(values: np.ndarray, cell_m: float) -> np.ndarray:
+    padded = np.pad(values, 1, mode="edge")
+    center = padded[1:-1, 1:-1]
+    lap = (
+        padded[:-2, 1:-1]
+        + padded[2:, 1:-1]
+        + padded[1:-1, :-2]
+        + padded[1:-1, 2:]
+        - 4.0 * center
+    )
+    scale = max(cell_m * cell_m, 1.0)
+    return lap / scale

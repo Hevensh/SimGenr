@@ -1,0 +1,2 @@
+"""Initial city generation."""
+

@@ -1,0 +1,161 @@
+seed: 42
+
+world:
+  height: 64
+  width: 64
+  cell_size_km: 1.0
+
+terrain:
+  octaves: 6
+  mountain_ridges: 4
+  basins: 2
+  elevation_min_m: 0.0
+  elevation_max_m: 2500.0
+  plainness: 0.35
+  ridge_strength: 0.42
+  basin_strength: 0.22
+  boundary_falloff: 0.08
+
+hydrology:
+  river_threshold_quantile: 0.98
+  river_max_dilation_cells: 1
+  river_dilation_min_strength: 0.72
+  lake_max_elevation_quantile: 0.48
+  lake_slope_threshold: 0.08
+  lake_min_accumulation_quantile: 0.92
+  lake_min_cells: 6
+  lake_extra_dilation_cells: 1
+  lake_expansion_slope_multiplier: 1.15
+  flow_smoothing_steps: 2
+  river_depth_min_m: 4.0
+  river_depth_max_m: 28.0
+  lake_depth_m: 18.0
+  flood_water_decay_km: 4.0
+
+land:
+  protected_fraction: 0.10
+  water_buffer_km: 1.5
+  steep_slope_threshold: 0.22
+  high_flood_threshold: 0.70
+  vegetation_noise_weight: 0.25
+  random_patch_count: 5
+
+climate:
+  base_temperature_c: 28.0
+  latitude_temperature_gradient_c: 12.0
+  lapse_rate_c_per_km: 5.8
+  water_moderation_km: 8.0
+  annual_amplitude_c: 13.0
+  coastal_amplitude_reduction_c: 5.0
+  prevailing_wind_degrees: 255.0
+  prevailing_wind_speed_mps: 5.5
+  wind_speed_terrain_factor: 0.35
+  wind_direction_terrain_steering: 1.20
+  wind_direction_noise_degrees: 28.0
+  wind_direction_smoothing_steps: 6
+  humidity_water_decay_km: 10.0
+  precipitation_base_mm_year: 760.0
+  orographic_precipitation_factor: 0.55
+  rain_shadow_factor: 0.28
+  irradiance_base_w_m2: 195.0
+  climate_noise_weight: 0.12
+
+weather:
+  days: 365
+  start_day_of_year: 0
+  advection_rho: 0.92
+  innovation_smoothing_steps: 5
+  synoptic_shift_cells_per_day: 1.4
+  temperature_synoptic_c: 2.4
+  humidity_synoptic_weight: 0.18
+  cloud_synoptic_weight: 0.28
+  wind_synoptic_weight: 0.22
+  precipitation_event_scale: 2.4
+  irradiance_cloud_sensitivity: 0.68
+  pressure_base_hpa: 1013.0
+  pressure_synoptic_hpa: 9.0
+  seasonal_second_harmonic: 0.18
+  seasonal_third_harmonic: 0.08
+  temperature_seasonal_lag_days: 24.0
+  solar_seasonal_lag_days: 4.0
+  low_frequency_temperature_c: 1.4
+  low_frequency_irradiance_weight: 0.06
+
+city:
+  city_count: 8
+  min_city_distance_km: 8.0
+  total_population: 1200000.0
+  core_water_min_distance_km: 1.0
+  water_access_optimal_km: 4.0
+  water_access_sigma_km: 3.0
+  waterfront_optimal_km: 0.8
+  waterfront_sigma_km: 0.9
+  max_core_flood_risk: 0.58
+  edge_buffer_km: 3.0
+  urban_radius_min_km: 2.5
+  urban_radius_max_km: 8.0
+  city_size_alpha: 1.25
+
+land_use:
+  industrial_edge_preference: 0.55
+  park_waterfront_weight: 0.55
+  agriculture_max_urban_density: 0.22
+  agriculture_slope_soft_limit: 0.14
+  agriculture_slope_hard_limit: 0.24
+  residential_core_weight: 0.18
+  residential_load_anchor_weight: 0.14
+  load_residential_weight: 0.48
+  load_commercial_weight: 0.34
+  load_industrial_weight: 0.18
+
+energy:
+  wind_candidate_count: 8
+  pv_candidate_count: 8
+  load_node_count: 18
+  min_source_distance_km: 3.0
+  min_cross_source_distance_km: 1.5
+  min_load_node_distance_km: 2.0
+  source_relax_iterations: 3
+  source_neighbor_repulsion_weight: 0.06
+  load_relax_iterations: 0
+  load_neighbor_repulsion_weight: 0.10
+  load_relax_max_step_cells: 1
+  wind_min_city_distance_km: 3.0
+  wind_city_half_distance_km: 12.0
+  wind_flatness_weight: 0.55
+  wind_roughness_penalty_weight: 0.45
+  pv_min_city_distance_km: 1.5
+  wind_capacity_min_mw: 40.0
+  wind_capacity_max_mw: 180.0
+  pv_capacity_min_mw: 25.0
+  pv_capacity_max_mw: 140.0
+  load_capacity_min_mw: 10.0
+  load_capacity_max_mw: 120.0
+
+power_grid:
+  thermal_candidate_count: 4
+  thermal_load_optimal_km: 5.0
+  thermal_load_sigma_km: 4.0
+  thermal_residential_buffer_km: 4.0
+  thermal_capacity_min_mw: 80.0
+  thermal_capacity_max_mw: 260.0
+  thermal_min_generation_distance_km: 2.5
+  thermal_relax_iterations: 2
+  thermal_neighbor_repulsion_weight: 0.12
+  candidate_knn: 8
+  redundancy_ratio: 0.35
+  load_cluster_radius_km: 6.0
+  generation_cluster_radius_km: 4.0
+  load_cluster_min_loads: 3
+  load_cluster_generation_links: 2
+  load_cluster_external_degree_penalty: 0.70
+  generation_cluster_external_degree_penalty: 0.55
+  line_water_penalty: 2.8
+  line_protected_penalty: 3.5
+  line_slope_penalty: 1.6
+  line_terrain_cost_penalty: 1.2
+  max_line_segment_km: 8.0
+
+output:
+  root: outputs
+  world_name: small_debug
