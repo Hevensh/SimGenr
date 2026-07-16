@@ -4,8 +4,13 @@ from pathlib import Path
 
 import numpy as np
 
-from world_generator.visualization.common import add_deduped_legend, draw_elevation_with_water_overlay, draw_grid_edge_lines, save_single_map
-from world_generator.visualization.land_use_figures import _building_texture_overlay
+from world_generator.visualization.common import (
+    add_deduped_legend,
+    draw_built_environment_texture,
+    draw_elevation_with_water_overlay,
+    draw_grid_edge_lines,
+    save_single_map,
+)
 
 
 REFINED_TOPOLOGY_FILES = [
@@ -31,6 +36,7 @@ def _save_refined_topology_overview(static_maps: dict[str, np.ndarray], path: Pa
     fig, axes = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
     ax = axes[0]
     image = draw_elevation_with_water_overlay(ax, static_maps)
+    draw_built_environment_texture(ax, static_maps)
     _draw_routes(ax, static_maps)
     _draw_buses(ax, static_maps)
     add_deduped_legend(ax, static_maps)
@@ -56,7 +62,7 @@ def _save_segmented_line_overlay(static_maps: dict[str, np.ndarray], path: Path)
 
     fig, ax = plt.subplots(figsize=(7, 6), constrained_layout=True)
     image = draw_elevation_with_water_overlay(ax, static_maps)
-    _draw_built_environment_texture(ax, static_maps)
+    draw_built_environment_texture(ax, static_maps)
     _draw_routes(ax, static_maps)
     _draw_buses(ax, static_maps)
     add_deduped_legend(ax, static_maps)
@@ -66,41 +72,6 @@ def _save_segmented_line_overlay(static_maps: dict[str, np.ndarray], path: Path)
     fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
     fig.savefig(path, dpi=180)
     plt.close(fig)
-
-
-def _draw_built_environment_texture(ax: object, static_maps: dict[str, np.ndarray]) -> None:
-    required = {
-        "land_use_zone",
-        "load_density_base",
-        "economic_activity",
-        "residential",
-        "commercial",
-        "industrial",
-        "agriculture",
-        "park_green",
-    }
-    if not required.issubset(static_maps):
-        return
-    overlay = _building_texture_overlay(
-        static_maps["land_use_zone"],
-        static_maps["load_density_base"],
-        static_maps["economic_activity"],
-        static_maps["residential"],
-        static_maps["commercial"],
-        static_maps["industrial"],
-        static_maps["agriculture"],
-        static_maps["park_green"],
-        scale=3,
-    )
-    height, width = static_maps["land_use_zone"].shape
-    ax.imshow(
-        overlay,
-        origin="upper",
-        extent=(-0.5, width - 0.5, height - 0.5, -0.5),
-        interpolation="nearest",
-        zorder=1,
-    )
-
 
 def _save_transit_bus_candidates(static_maps: dict[str, np.ndarray], path: Path) -> None:
     import matplotlib.pyplot as plt

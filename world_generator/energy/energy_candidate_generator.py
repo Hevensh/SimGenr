@@ -73,47 +73,52 @@ def generate_energy_candidates(
         * pv_city_ok
     )
     pv_suitability[water | protected] = 0.0
+    wind_selection_utility = _local_source_utility(wind_suitability, config.wind_selection_radius_km, grid)
+    pv_selection_utility = _local_source_utility(pv_suitability, config.pv_selection_radius_km, grid)
 
-    load_node_density = _normalize01(
-        land_use.load_density_base
-        * (0.48 + 0.34 * land_use.residential + 0.18 * land_use.commercial + 0.12 * land_use.industrial)
-        * (1.0 - 0.35 * hydrology.flood_risk)
-    )
+    load_node_density = _normalize01(land_use.load_density_base * (1.0 - 0.35 * hydrology.flood_risk))
     load_node_density[water | protected] = 0.0
 
     wind_candidates = _select_candidates(
         wind_suitability,
+        wind_selection_utility,
         "wind",
         config.wind_candidate_count,
-        config.min_source_distance_km,
+        config.wind_min_source_distance_km,
         config.wind_capacity_min_mw,
         config.wind_capacity_max_mw,
         grid,
+        config,
     )
     wind_candidates = _relax_candidates(
         wind_suitability,
+        wind_selection_utility,
         wind_candidates,
         (),
-        config.min_source_distance_km,
+        config.wind_min_source_distance_km,
         config.wind_capacity_min_mw,
         config.wind_capacity_max_mw,
         grid,
         config.source_relax_iterations,
         config.source_neighbor_repulsion_weight,
+        hard_min_distance_km=0.65 * config.wind_min_source_distance_km,
     )
     pv_candidates = _select_candidates(
         pv_suitability,
+        pv_selection_utility,
         "pv",
         config.pv_candidate_count,
         config.min_source_distance_km,
         config.pv_capacity_min_mw,
         config.pv_capacity_max_mw,
         grid,
+        config,
         avoid_candidates=wind_candidates,
         avoid_min_distance_km=config.min_cross_source_distance_km,
     )
     pv_candidates = _relax_candidates(
         pv_suitability,
+        pv_selection_utility,
         pv_candidates,
         tuple(wind_candidates),
         config.min_source_distance_km,
@@ -122,7 +127,26 @@ def generate_energy_candidates(
         grid,
         config.source_relax_iterations,
         config.source_neighbor_repulsion_weight,
+        hard_min_distance_km=0.65 * config.min_source_distance_km,
         avoid_distance_km=config.min_cross_source_distance_km,
+    )
+    wind_candidates = _apply_source_cluster_capacity(
+        wind_candidates,
+        wind_suitability,
+        config.wind_capacity_min_mw,
+        config.wind_capacity_max_mw,
+        config.wind_cluster_radius_km,
+        config.wind_cluster_capacity_max_multiplier,
+        grid,
+    )
+    pv_candidates = _apply_source_cluster_capacity(
+        pv_candidates,
+        pv_suitability,
+        config.pv_capacity_min_mw,
+        config.pv_capacity_max_mw,
+        config.pv_cluster_radius_km,
+        config.pv_cluster_capacity_max_multiplier,
+        grid,
     )
     load_candidates = _select_load_candidates(
         load_node_density,
@@ -130,19 +154,6 @@ def generate_energy_candidates(
         water | protected,
         config,
         grid,
-    )
-    load_candidates = _relax_candidates(
-        load_node_density,
-        load_candidates,
-        (),
-        config.min_load_node_distance_km,
-        config.load_capacity_min_mw,
-        config.load_capacity_max_mw,
-        grid,
-        config.load_relax_iterations,
-        config.load_neighbor_repulsion_weight,
-        max_step_cells=config.load_relax_max_step_cells,
-        hard_min_distance_km=config.min_load_node_distance_km,
     )
     wind_candidate_map = _candidate_map(wind_suitability.shape, wind_candidates)
     pv_candidate_map = _candidate_map(pv_suitability.shape, pv_candidates)
@@ -165,40 +176,52 @@ def generate_energy_candidates(
 
 def _select_candidates(
     suitability: np.ndarray,
+    utility_map: np.ndarray,
     kind: str,
     count: int,
     min_distance_km: float,
     capacity_min_mw: float,
     capacity_max_mw: float,
     grid: WorldGridConfig,
+    config: EnergyConfig,
     selected: list[EnergyCandidate] | None = None,
     avoid_candidates: list[EnergyCandidate] | tuple[EnergyCandidate, ...] = (),
     avoid_min_distance_km: float | None = None,
 ) -> list[EnergyCandidate]:
     min_distance_cells = max(min_distance_km / max(grid.cell_size_km, 1e-6), 1.0)
+    spread_radius_cells = max(config.source_spread_radius_km / max(grid.cell_size_km, 1e-6), min_distance_cells)
     avoid_min_distance_cells = min_distance_cells
     if avoid_min_distance_km is not None:
         avoid_min_distance_cells = max(avoid_min_distance_km / max(grid.cell_size_km, 1e-6), 1.0)
-    flat_order = np.argsort(-suitability.ravel())
     selected = list(selected or [])
     avoid = list(avoid_candidates)
-    for flat_index in flat_order:
-        row, col = np.unravel_index(int(flat_index), suitability.shape)
+    rows, cols = np.indices(suitability.shape)
+    while len(selected) < count:
+        score_map = utility_map.copy()
+        hard_mask = np.zeros(suitability.shape, dtype=bool)
+        coverage = np.zeros(suitability.shape, dtype=np.float32)
+        for item in selected:
+            distance = np.hypot(rows - item.row, cols - item.col)
+            coverage = np.maximum(coverage, np.exp(-np.square(distance / max(spread_radius_cells, 1e-6))))
+            hard_mask |= distance < min_distance_cells
+        for item in avoid:
+            distance = np.hypot(rows - item.row, cols - item.col)
+            hard_mask |= distance < avoid_min_distance_cells
+        if selected:
+            score_map *= 1.0 - config.source_spread_penalty_weight * coverage
+        score_map[hard_mask] = -1.0
+        score_map[(suitability <= 1e-6) | (utility_map <= 1e-6)] = -1.0
+        row, col = np.unravel_index(int(np.argmax(score_map)), suitability.shape)
         score = float(suitability[row, col])
-        if score <= 1e-6:
+        if score <= 1e-6 or float(score_map[row, col]) <= 0.0:
             break
-        if any(np.hypot(row - item.row, col - item.col) < min_distance_cells for item in selected):
-            continue
-        if any(np.hypot(row - item.row, col - item.col) < avoid_min_distance_cells for item in avoid):
-            continue
         selected.append(_make_candidate(len(selected), kind, row, col, score, capacity_min_mw, capacity_max_mw, grid))
-        if len(selected) >= count:
-            break
     return selected
 
 
 def _relax_candidates(
     suitability: np.ndarray,
+    utility_map: np.ndarray,
     candidates: list[EnergyCandidate],
     avoid_candidates: tuple[EnergyCandidate, ...],
     min_distance_km: float,
@@ -230,6 +253,7 @@ def _relax_candidates(
             same_others = tuple(updated) + tuple(relaxed[index + 1 :])
             row, col, score = _best_relaxed_cell(
                 suitability,
+                utility_map,
                 candidate.row,
                 candidate.col,
                 same_others,
@@ -258,6 +282,7 @@ def _relax_candidates(
 
 def _best_relaxed_cell(
     suitability: np.ndarray,
+    utility_map: np.ndarray,
     row: int,
     col: int,
     same_others: tuple[EnergyCandidate, ...],
@@ -275,8 +300,9 @@ def _best_relaxed_cell(
     sigma = max(min_distance_cells, 1.0)
     for rr in range(max(row - search_radius, 0), min(row + search_radius + 1, suitability.shape[0])):
         for cc in range(max(col - search_radius, 0), min(col + search_radius + 1, suitability.shape[1])):
-            utility = float(suitability[rr, cc])
-            if utility <= 1e-6:
+            center_score = float(suitability[rr, cc])
+            utility = float(utility_map[rr, cc])
+            if center_score <= 1e-6 or utility <= 1e-6:
                 continue
             same_distances = [float(np.hypot(rr - item.row, cc - item.col)) for item in same_others]
             avoid_distances = [float(np.hypot(rr - item.row, cc - item.col)) for item in avoid_candidates]
@@ -293,7 +319,7 @@ def _best_relaxed_cell(
                 best_score = score
                 best_row = int(rr)
                 best_col = int(cc)
-                best_utility = utility
+                best_utility = center_score
     return best_row, best_col, best_utility
 
 
@@ -318,6 +344,83 @@ def _make_candidate(
         capacity_mw=float(capacity),
         suitability=float(score),
     )
+
+
+def _apply_source_cluster_capacity(
+    candidates: list[EnergyCandidate],
+    suitability: np.ndarray,
+    capacity_min_mw: float,
+    capacity_max_mw: float,
+    cluster_radius_km: float,
+    max_multiplier: float,
+    grid: WorldGridConfig,
+) -> list[EnergyCandidate]:
+    if not candidates:
+        return candidates
+    radius_cells = max(cluster_radius_km / max(grid.cell_size_km, 1e-6), 0.0)
+    updated: list[EnergyCandidate] = []
+    for candidate in candidates:
+        local_sum = _local_suitability_sum(suitability, candidate.row, candidate.col, radius_cells)
+        center = max(float(suitability[candidate.row, candidate.col]), 1e-6)
+        multiplier = float(np.clip(local_sum / center, 1.0, max_multiplier))
+        base_capacity = capacity_min_mw + (capacity_max_mw - capacity_min_mw) * np.sqrt(candidate.suitability)
+        updated.append(
+            EnergyCandidate(
+                candidate_id=candidate.candidate_id,
+                kind=candidate.kind,
+                row=candidate.row,
+                col=candidate.col,
+                x=candidate.x,
+                y=candidate.y,
+                capacity_mw=float(base_capacity * multiplier),
+                suitability=candidate.suitability,
+            )
+        )
+    return updated
+
+
+def _local_source_utility(suitability: np.ndarray, cluster_radius_km: float, grid: WorldGridConfig) -> np.ndarray:
+    radius_cells = max(cluster_radius_km / max(grid.cell_size_km, 1e-6), 0.0)
+    if radius_cells <= 0.0:
+        return suitability.copy()
+    radius_int = int(np.ceil(radius_cells))
+    utility = np.zeros_like(suitability, dtype=np.float32)
+    for dr in range(-radius_int, radius_int + 1):
+        for dc in range(-radius_int, radius_int + 1):
+            distance = float(np.hypot(dr, dc))
+            if distance > radius_cells:
+                continue
+            shifted = np.zeros_like(suitability, dtype=np.float32)
+            src_r0 = max(-dr, 0)
+            src_r1 = min(suitability.shape[0] - dr, suitability.shape[0])
+            src_c0 = max(-dc, 0)
+            src_c1 = min(suitability.shape[1] - dc, suitability.shape[1])
+            dst_r0 = src_r0 + dr
+            dst_r1 = src_r1 + dr
+            dst_c0 = src_c0 + dc
+            dst_c1 = src_c1 + dc
+            if src_r0 >= src_r1 or src_c0 >= src_c1:
+                continue
+            taper = 1.0 - 0.35 * distance / max(radius_cells, 1e-6)
+            shifted[dst_r0:dst_r1, dst_c0:dst_c1] = suitability[src_r0:src_r1, src_c0:src_c1]
+            utility += taper * shifted
+    utility *= suitability > 1e-6
+    return _normalize01(utility)
+
+
+def _local_suitability_sum(suitability: np.ndarray, row: int, col: int, radius_cells: float) -> float:
+    if radius_cells <= 0.0:
+        return float(suitability[row, col])
+    radius_int = int(np.ceil(radius_cells))
+    total = 0.0
+    for rr in range(max(row - radius_int, 0), min(row + radius_int + 1, suitability.shape[0])):
+        for cc in range(max(col - radius_int, 0), min(col + radius_int + 1, suitability.shape[1])):
+            distance = float(np.hypot(rr - row, cc - col))
+            if distance > radius_cells:
+                continue
+            taper = 1.0 - 0.35 * distance / max(radius_cells, 1e-6)
+            total += float(suitability[rr, cc]) * taper
+    return total
 
 
 def _select_load_candidates(
@@ -359,17 +462,54 @@ def _select_load_candidates(
             )
         )
 
-    fill_candidates = _select_candidates(
+    fill_candidates = _select_spread_load_candidates(
         load_density,
-        "load",
-        config.load_node_count,
-        config.min_load_node_distance_km,
-        config.load_capacity_min_mw,
-        config.load_capacity_max_mw,
+        selected,
+        config,
         grid,
-        selected=selected,
     )
     return fill_candidates[: config.load_node_count]
+
+
+def _select_spread_load_candidates(
+    load_density: np.ndarray,
+    selected: list[EnergyCandidate],
+    config: EnergyConfig,
+    grid: WorldGridConfig,
+) -> list[EnergyCandidate]:
+    selected = list(selected)
+    rows, cols = np.indices(load_density.shape)
+    min_distance_cells = max(config.min_load_node_distance_km / max(grid.cell_size_km, 1e-6), 1.0)
+    spread_radius_cells = max(config.load_spread_radius_km / max(grid.cell_size_km, 1e-6), min_distance_cells)
+    while len(selected) < config.load_node_count:
+        score = load_density.copy()
+        if selected:
+            nearest_distance = np.full(load_density.shape, np.inf, dtype=np.float32)
+            hard_mask = np.zeros(load_density.shape, dtype=bool)
+            for item in selected:
+                distance = np.hypot(rows - item.row, cols - item.col)
+                nearest_distance = np.minimum(nearest_distance, distance)
+                hard_mask |= distance < min_distance_cells
+            local_coverage = np.exp(-np.square(nearest_distance / max(spread_radius_cells, 1e-6)))
+            score *= 1.0 - config.load_spread_penalty_weight * local_coverage
+            score[hard_mask] = -1.0
+        score[load_density <= 1e-6] = -1.0
+        row, col = np.unravel_index(int(np.argmax(score)), score.shape)
+        if float(score[row, col]) <= 0.0:
+            break
+        selected.append(
+            _make_candidate(
+                len(selected),
+                "load",
+                int(row),
+                int(col),
+                float(load_density[row, col]),
+                config.load_capacity_min_mw,
+                config.load_capacity_max_mw,
+                grid,
+            )
+        )
+    return selected
 
 
 def _best_city_load_cell(

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from world_generator.visualization.common import draw_elevation_with_water_overlay, save_single_map
+from world_generator.visualization.common import draw_built_environment_texture, draw_elevation_with_water_overlay, save_single_map
 
 
 GRID_NODE_FILES = [
@@ -54,6 +54,7 @@ def _save_grid_node_overview(static_maps: dict[str, np.ndarray], path: Path) -> 
 
     ax = axes[1, 1]
     image = draw_elevation_with_water_overlay(ax, static_maps)
+    draw_built_environment_texture(ax, static_maps)
     ax.set_title("Grid buses over terrain/hydrology")
     ax.set_xticks([])
     ax.set_yticks([])
@@ -68,6 +69,7 @@ def _save_bus_overlay(static_maps: dict[str, np.ndarray], path: Path, title: str
 
     fig, ax = plt.subplots(figsize=(7, 6), constrained_layout=True)
     image = draw_elevation_with_water_overlay(ax, static_maps)
+    draw_built_environment_texture(ax, static_maps)
     _draw_bus_markers(ax, static_maps, groups)
     ax.set_title(title)
     ax.set_xticks([])

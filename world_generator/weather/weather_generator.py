@@ -141,6 +141,97 @@ def generate_daily_weather(
         weather_class=weather_class,
         timestamps=timestamps,
         channel_names=WEATHER_CHANNELS,
+        time_unit="day",
+        start_day_of_year=int(config.start_day_of_year),
+    )
+
+
+def generate_hourly_weather_week(
+    daily_weather: WeatherStore,
+    config: WeatherConfig,
+    rng: np.random.Generator,
+) -> WeatherStore:
+    week_days = int(np.clip(config.hourly_week_days, 1, max(1, daily_weather.dynamic.shape[0])))
+    start_index = int(rng.integers(0, max(daily_weather.dynamic.shape[0] - week_days + 1, 1)))
+    hours = week_days * 24
+    shape = daily_weather.dynamic.shape[2:]
+    dynamic = np.zeros((hours, len(daily_weather.channel_names), *shape), dtype=np.float32)
+    weather_class = np.zeros((hours, *shape), dtype=np.int16)
+    timestamps = np.arange(hours, dtype=np.int32) + int(daily_weather.timestamps[start_index]) * 24
+    channels = {name: index for index, name in enumerate(daily_weather.channel_names)}
+    wind_noise = _hourly_correlated_noise(hours, shape, rng, config.hourly_wind_variability)
+    cloud_noise = _hourly_correlated_noise(hours, shape, rng, config.hourly_cloud_variability)
+    storm_system = _hourly_weather_system(hours, shape, rng)
+    temperature_noise = _hourly_correlated_scalar_noise(hours, rng, config.hourly_temperature_noise_c)
+    cloud_synoptic = _hourly_correlated_scalar_noise(hours, rng, 0.055)
+    daily_amplitude = rng.uniform(0.70, 1.25, size=week_days).astype(np.float32)
+    daily_peak_shift = rng.normal(0.0, 1.7, size=week_days).astype(np.float32)
+    rain_event_gate = _rain_event_gate(hours, rng, config.hourly_storm_event_rate)
+
+    for hour_index in range(hours):
+        local_hour = hour_index % 24
+        local_day = hour_index // 24
+        day_a = min(start_index + local_day, daily_weather.dynamic.shape[0] - 1)
+        day_b = min(day_a + 1, daily_weather.dynamic.shape[0] - 1)
+        frac = local_hour / 24.0
+        base = (1.0 - frac) * daily_weather.dynamic[day_a] + frac * daily_weather.dynamic[day_b]
+
+        solar = _solar_hour_factor(local_hour + 0.25 * daily_peak_shift[local_day])
+        temperature_diurnal = -np.cos(2.0 * np.pi * (local_hour - 5.0 - daily_peak_shift[local_day]) / 24.0)
+        cloud = np.clip(
+            base[channels["cloud"]]
+            + cloud_synoptic[hour_index]
+            + cloud_noise[hour_index]
+            + 0.22 * storm_system[hour_index],
+            0.0,
+            1.0,
+        )
+        temperature = (
+            base[channels["temperature"]]
+            + config.hourly_temperature_diurnal_c * daily_amplitude[local_day] * temperature_diurnal
+            + temperature_noise[hour_index]
+            - 1.35 * np.maximum(cloud - base[channels["cloud"]], 0.0)
+        )
+        wind_speed = np.clip(base[channels["wind_speed"]] * (1.0 + wind_noise[hour_index]), 0.05, None)
+
+        base_speed = np.maximum(base[channels["wind_speed"]], 0.1)
+        wind_u = base[channels["wind_u"]] / base_speed * wind_speed
+        wind_v = base[channels["wind_v"]] / base_speed * wind_speed
+        wetness = np.clip(0.35 * base[channels["humidity"]] + 0.65 * cloud, 0.0, 1.0)
+        event_intensity = np.maximum(storm_system[hour_index] + 0.45 * cloud_noise[hour_index], 0.0)
+        event_intensity = np.clip(event_intensity * rain_event_gate[hour_index], 0.0, 1.0)
+        precipitation = base[channels["precipitation"]] / 24.0 * (0.12 + 0.55 * wetness)
+        precipitation += config.hourly_precipitation_burstiness * event_intensity * np.maximum(cloud - 0.48, 0.0) ** 1.4
+        precipitation = np.clip(precipitation, 0.0, None)
+        humidity = np.clip(
+            base[channels["humidity"]]
+            + 0.055 * (cloud - base[channels["cloud"]])
+            + 0.050 * event_intensity
+            - 0.020 * temperature_diurnal
+            + 0.35 * cloud_noise[hour_index],
+            0.02,
+            0.99,
+        )
+        irradiance = np.clip(base[channels["irradiance"]] * solar * (1.0 - 0.74 * cloud**1.25), 0.0, None)
+
+        dynamic[hour_index] = base.astype(np.float32)
+        dynamic[hour_index, channels["wind_u"]] = wind_u.astype(np.float32)
+        dynamic[hour_index, channels["wind_v"]] = wind_v.astype(np.float32)
+        dynamic[hour_index, channels["wind_speed"]] = wind_speed.astype(np.float32)
+        dynamic[hour_index, channels["temperature"]] = temperature.astype(np.float32)
+        dynamic[hour_index, channels["humidity"]] = humidity.astype(np.float32)
+        dynamic[hour_index, channels["cloud"]] = cloud.astype(np.float32)
+        dynamic[hour_index, channels["precipitation"]] = precipitation.astype(np.float32)
+        dynamic[hour_index, channels["irradiance"]] = irradiance.astype(np.float32)
+        weather_class[hour_index] = _classify_weather(cloud, precipitation * 24.0, wind_speed)
+
+    return WeatherStore(
+        dynamic=dynamic,
+        weather_class=weather_class,
+        timestamps=timestamps,
+        channel_names=daily_weather.channel_names,
+        time_unit="hour",
+        start_day_of_year=int(daily_weather.timestamps[start_index]),
     )
 
 
@@ -186,6 +277,67 @@ def _seasonal_low_frequency_anomaly(days: int, rng: np.random.Generator) -> np.n
     if std > 1e-6:
         anomaly /= std
     return np.clip(anomaly, -1.8, 1.8).astype(np.float32)
+
+
+def _hourly_correlated_noise(hours: int, shape: tuple[int, int], rng: np.random.Generator, scale: float) -> np.ndarray:
+    values = rng.normal(0.0, scale, size=(hours, *shape)).astype(np.float32)
+    for index in range(1, hours):
+        values[index] = 0.62 * values[index - 1] + 0.38 * values[index]
+    return values
+
+
+def _hourly_correlated_scalar_noise(hours: int, rng: np.random.Generator, scale: float) -> np.ndarray:
+    values = rng.normal(0.0, scale, size=hours).astype(np.float32)
+    for index in range(1, hours):
+        values[index] = 0.58 * values[index - 1] + 0.42 * values[index]
+    return values
+
+
+def _hourly_weather_system(hours: int, shape: tuple[int, int], rng: np.random.Generator) -> np.ndarray:
+    coarse = rng.normal(0.0, 1.0, size=(hours, *shape)).astype(np.float32)
+    for index in range(hours):
+        coarse[index] = _smooth_signed_field(coarse[index], 4)
+    for index in range(1, hours):
+        coarse[index] = 0.80 * coarse[index - 1] + 0.20 * coarse[index]
+    return np.clip(0.5 + 0.5 * coarse, 0.0, 1.0).astype(np.float32)
+
+
+def _rain_event_gate(hours: int, rng: np.random.Generator, event_rate: float) -> np.ndarray:
+    gate = np.zeros(hours, dtype=np.float32)
+    index = 0
+    while index < hours:
+        if rng.random() < event_rate:
+            duration = int(rng.integers(2, 9))
+            peak = float(rng.uniform(0.45, 1.0))
+            window = np.sin(np.linspace(0.0, np.pi, duration, dtype=np.float32)) * peak
+            end = min(index + duration, hours)
+            gate[index:end] = np.maximum(gate[index:end], window[: end - index])
+            index += max(1, duration // 2)
+        else:
+            index += 1
+    return gate
+
+
+def _smooth_signed_field(values: np.ndarray, steps: int) -> np.ndarray:
+    field = values.astype(np.float32)
+    for _ in range(max(steps, 0)):
+        padded = np.pad(field, 1, mode="wrap")
+        field = (
+            padded[:-2, 1:-1]
+            + padded[1:-1, :-2]
+            + 2.0 * padded[1:-1, 1:-1]
+            + padded[1:-1, 2:]
+            + padded[2:, 1:-1]
+        ) / 6.0
+    std = float(np.std(field))
+    if std > 1e-6:
+        field = (field - float(np.mean(field))) / std
+    return np.clip(field, -2.5, 2.5).astype(np.float32)
+
+
+def _solar_hour_factor(local_hour: float) -> float:
+    phase = np.sin(np.pi * (local_hour - 6.0) / 12.0)
+    return float(np.maximum(phase, 0.0) ** 1.35)
 
 
 def _orographic_lift(terrain: TerrainFeatures, wind_u: np.ndarray, wind_v: np.ndarray) -> np.ndarray:

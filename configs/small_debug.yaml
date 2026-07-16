@@ -63,6 +63,13 @@ climate:
 weather:
   days: 365
   start_day_of_year: 0
+  hourly_week_days: 7
+  hourly_temperature_diurnal_c: 4.5
+  hourly_temperature_noise_c: 0.75
+  hourly_wind_variability: 0.14
+  hourly_cloud_variability: 0.16
+  hourly_storm_event_rate: 0.18
+  hourly_precipitation_burstiness: 2.2
   advection_rho: 0.92
   innovation_smoothing_steps: 5
   synoptic_shift_cells_per_day: 1.4
@@ -113,22 +120,30 @@ energy:
   pv_candidate_count: 8
   load_node_count: 18
   min_source_distance_km: 3.0
+  wind_min_source_distance_km: 4.0
   min_cross_source_distance_km: 1.5
   min_load_node_distance_km: 2.0
+  load_spread_radius_km: 6.0
+  load_spread_penalty_weight: 0.68
+  source_spread_radius_km: 5.0
+  source_spread_penalty_weight: 0.42
   source_relax_iterations: 3
   source_neighbor_repulsion_weight: 0.06
-  load_relax_iterations: 0
-  load_neighbor_repulsion_weight: 0.10
-  load_relax_max_step_cells: 1
+  wind_selection_radius_km: 1.5
+  pv_selection_radius_km: 1.2
+  wind_cluster_radius_km: 2.0
+  pv_cluster_radius_km: 1.5
+  wind_cluster_capacity_max_multiplier: 4.0
+  pv_cluster_capacity_max_multiplier: 3.2
   wind_min_city_distance_km: 3.0
   wind_city_half_distance_km: 12.0
   wind_flatness_weight: 0.55
   wind_roughness_penalty_weight: 0.45
   pv_min_city_distance_km: 1.5
-  wind_capacity_min_mw: 40.0
-  wind_capacity_max_mw: 180.0
-  pv_capacity_min_mw: 25.0
-  pv_capacity_max_mw: 140.0
+  wind_capacity_min_mw: 4.0
+  wind_capacity_max_mw: 18.0
+  pv_capacity_min_mw: 80.0
+  pv_capacity_max_mw: 260.0
   load_capacity_min_mw: 10.0
   load_capacity_max_mw: 120.0
 
@@ -139,7 +154,11 @@ power_grid:
   thermal_residential_buffer_km: 4.0
   thermal_capacity_min_mw: 80.0
   thermal_capacity_max_mw: 260.0
+  thermal_min_distance_km: 8.0
   thermal_min_generation_distance_km: 2.5
+  thermal_min_renewable_distance_km: 3.0
+  thermal_spread_radius_km: 8.0
+  thermal_spread_penalty_weight: 0.45
   thermal_relax_iterations: 2
   thermal_neighbor_repulsion_weight: 0.12
   candidate_knn: 8

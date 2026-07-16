@@ -1,0 +1,123 @@
+from __future__ import annotations
+
+import numpy as np
+
+from world_generator.core.datatypes import GridElectricalState, RefinedGridTopologyState, SourceLoadForecastStore, WeatherStore
+
+
+def generate_source_load_forecast(
+    hourly_weather: WeatherStore,
+    refined_topology: RefinedGridTopologyState,
+    electrical: GridElectricalState,
+    rng: np.random.Generator,
+) -> SourceLoadForecastStore:
+    buses = refined_topology.refined_buses
+    bus_params = {item.bus_id: item for item in electrical.bus_params}
+    hours = hourly_weather.dynamic.shape[0]
+    bus_count = len(buses)
+    p_load = np.zeros((hours, bus_count), dtype=np.float32)
+    p_available = np.zeros((hours, bus_count), dtype=np.float32)
+    p_scheduled = np.zeros((hours, bus_count), dtype=np.float32)
+    q_load = np.zeros((hours, bus_count), dtype=np.float32)
+    channels = {name: index for index, name in enumerate(hourly_weather.channel_names)}
+
+    for bus_index, bus in enumerate(buses):
+        row = int(np.clip(bus.row, 0, hourly_weather.dynamic.shape[2] - 1))
+        col = int(np.clip(bus.col, 0, hourly_weather.dynamic.shape[3] - 1))
+        weather_at_bus = hourly_weather.dynamic[:, :, row, col]
+        param = bus_params[bus.bus_id]
+        if bus.kind == "load_bus":
+            profile = _load_profile(weather_at_bus, channels, param.base_load_mw, bus.suitability, rng)
+            p_load[:, bus_index] = profile
+            q_load[:, bus_index] = profile * float(np.tan(np.arccos(np.clip(param.power_factor, 0.1, 1.0))))
+        elif bus.kind == "wind_bus":
+            p_available[:, bus_index] = _wind_available(weather_at_bus[:, channels["wind_speed"]], bus.capacity_mw)
+        elif bus.kind == "pv_bus":
+            p_available[:, bus_index] = _solar_available(
+                weather_at_bus[:, channels["irradiance"]],
+                weather_at_bus[:, channels["temperature"]],
+                bus.capacity_mw,
+            )
+        elif bus.kind == "thermal_bus":
+            p_available[:, bus_index] = float(max(bus.capacity_mw, 0.0))
+
+    p_scheduled[:] = p_available
+    _dispatch_thermal(p_load, p_available, p_scheduled, tuple(bus.kind for bus in buses))
+    return SourceLoadForecastStore(
+        timestamps=hourly_weather.timestamps.copy(),
+        bus_ids=np.asarray([bus.bus_id for bus in buses], dtype=np.int32),
+        bus_kinds=tuple(bus.kind for bus in buses),
+        p_load_mw=p_load,
+        p_gen_available_mw=p_available,
+        p_gen_scheduled_mw=p_scheduled,
+        q_load_mvar=q_load,
+        source_channels=("p_load_mw", "p_gen_available_mw", "p_gen_scheduled_mw", "q_load_mvar"),
+    )
+
+
+def _load_profile(
+    weather_at_bus: np.ndarray,
+    channels: dict[str, int],
+    base_load_mw: float,
+    suitability: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    hours = weather_at_bus.shape[0]
+    hour_of_day = np.arange(hours, dtype=np.float32) % 24.0
+    day_index = (np.arange(hours, dtype=np.int32) // 24) % 7
+    morning = np.exp(-((hour_of_day - 8.0) ** 2) / 18.0)
+    evening = np.exp(-((hour_of_day - 19.0) ** 2) / 14.0)
+    business = np.exp(-((hour_of_day - 14.0) ** 2) / 32.0)
+    weekend_factor = np.where(day_index >= 5, 0.92, 1.0).astype(np.float32)
+    temperature = weather_at_bus[:, channels["temperature"]]
+    cooling = np.clip((temperature - 24.0) / 12.0, 0.0, 1.2)
+    heating = np.clip((12.0 - temperature) / 10.0, 0.0, 0.8)
+    small_noise = rng.normal(0.0, 0.025, size=hours).astype(np.float32)
+    profile = (
+        0.64
+        + 0.16 * morning
+        + 0.24 * evening
+        + 0.12 * business
+        + 0.18 * cooling
+        + 0.10 * heating
+        + small_noise
+    )
+    profile *= weekend_factor
+    profile *= 0.92 + 0.18 * float(np.clip(suitability, 0.0, 1.0))
+    return np.clip(base_load_mw * profile, 0.08 * base_load_mw, None).astype(np.float32)
+
+
+def _wind_available(wind_speed: np.ndarray, capacity_mw: float) -> np.ndarray:
+    cut_in = 3.0
+    rated = 11.0
+    cut_out = 25.0
+    normalized = np.clip((wind_speed - cut_in) / (rated - cut_in), 0.0, 1.0)
+    speed_sensitive = normalized**2.0
+    fraction = np.where(wind_speed < cut_out, speed_sensitive, 0.0)
+    return (float(capacity_mw) * np.clip(fraction, 0.0, 1.0)).astype(np.float32)
+
+
+def _solar_available(irradiance: np.ndarray, temperature: np.ndarray, capacity_mw: float) -> np.ndarray:
+    irradiance_fraction = np.clip(irradiance / 420.0, 0.0, 1.05)
+    temperature_derate = np.clip(1.0 - 0.004 * np.maximum(temperature - 25.0, 0.0), 0.82, 1.0)
+    return (float(capacity_mw) * irradiance_fraction * temperature_derate).astype(np.float32)
+
+
+def _dispatch_thermal(
+    p_load: np.ndarray,
+    p_available: np.ndarray,
+    p_scheduled: np.ndarray,
+    bus_kinds: tuple[str, ...],
+) -> None:
+    thermal_indices = [index for index, kind in enumerate(bus_kinds) if kind == "thermal_bus"]
+    renewable_indices = [index for index, kind in enumerate(bus_kinds) if kind in {"wind_bus", "pv_bus"}]
+    p_scheduled[:, thermal_indices] = 0.0
+    if not thermal_indices:
+        return
+    total_load = p_load.sum(axis=1)
+    renewable = p_available[:, renewable_indices].sum(axis=1) if renewable_indices else np.zeros(p_load.shape[0], dtype=np.float32)
+    residual = np.maximum(total_load - renewable, 0.0)
+    thermal_capacity = p_available[:, thermal_indices]
+    total_thermal = np.maximum(thermal_capacity.sum(axis=1), 1e-6)
+    p_scheduled[:, thermal_indices] = thermal_capacity * (residual / total_thermal)[:, None]
+    p_scheduled[:, thermal_indices] = np.minimum(p_scheduled[:, thermal_indices], thermal_capacity)

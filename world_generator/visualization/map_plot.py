@@ -5,14 +5,16 @@ from pathlib import Path
 
 import numpy as np
 
-from world_generator.core.datatypes import WeatherStore
+from world_generator.core.datatypes import SourceLoadForecastStore, WeatherStore
 from world_generator.visualization.city_figures import save_city_figures
 from world_generator.visualization.climate_figures import save_climate_figures
+from world_generator.visualization.electrical_figures import save_electrical_figures
 from world_generator.visualization.energy_figures import save_energy_figures
 from world_generator.visualization.grid_node_figures import save_grid_node_figures
 from world_generator.visualization.grid_topology_figures import save_grid_topology_figures
 from world_generator.visualization.hydrology_figures import save_hydrology_figures
 from world_generator.visualization.land_use_figures import save_land_use_figures
+from world_generator.visualization.operation_figures import save_operation_figures
 from world_generator.visualization.refined_topology_figures import save_refined_topology_figures
 from world_generator.visualization.static_land_figures import save_static_land_figures
 from world_generator.visualization.terrain_figures import save_terrain_figures
@@ -23,6 +25,8 @@ def save_static_map_figures(
     static_maps: dict[str, np.ndarray],
     output_dir: str | Path,
     weather: WeatherStore | None = None,
+    hourly_weather: WeatherStore | None = None,
+    source_load_forecast: SourceLoadForecastStore | None = None,
 ) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -59,6 +63,16 @@ def save_static_map_figures(
 
     if "refined_line_route_map" in static_maps:
         manifest["stage_11_transit_buses"] = save_refined_topology_figures(static_maps, output_dir / "stage_11_transit_buses")
+
+    if "electrical_branches" in static_maps:
+        manifest["stage_12_electrical_parameters"] = save_electrical_figures(static_maps, output_dir / "stage_12_electrical_parameters")
+
+    if hourly_weather is not None and source_load_forecast is not None:
+        manifest["stage_13_hourly_operation"] = save_operation_figures(
+            hourly_weather,
+            source_load_forecast,
+            output_dir / "stage_13_hourly_operation",
+        )
 
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2),

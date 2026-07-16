@@ -4,7 +4,13 @@ from pathlib import Path
 
 import numpy as np
 
-from world_generator.visualization.common import add_deduped_legend, draw_elevation_with_water_overlay, draw_grid_edge_lines, save_single_map
+from world_generator.visualization.common import (
+    add_deduped_legend,
+    draw_built_environment_texture,
+    draw_elevation_with_water_overlay,
+    draw_grid_edge_lines,
+    save_single_map,
+)
 
 
 GRID_TOPOLOGY_FILES = [
@@ -42,6 +48,7 @@ def _save_grid_topology_overview(static_maps: dict[str, np.ndarray], path: Path)
 
     ax = axes[1, 0]
     image = draw_elevation_with_water_overlay(ax, static_maps)
+    draw_built_environment_texture(ax, static_maps)
     _draw_line_routes(ax, static_maps)
     _draw_bus_markers(ax, static_maps)
     add_deduped_legend(ax, static_maps)
@@ -68,6 +75,7 @@ def _save_line_routes_overlay(static_maps: dict[str, np.ndarray], path: Path) ->
 
     fig, ax = plt.subplots(figsize=(7, 6), constrained_layout=True)
     image = draw_elevation_with_water_overlay(ax, static_maps)
+    draw_built_environment_texture(ax, static_maps)
     _draw_line_routes(ax, static_maps)
     _draw_bus_markers(ax, static_maps)
     add_deduped_legend(ax, static_maps)

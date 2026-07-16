@@ -62,6 +62,42 @@ def draw_elevation_with_water_overlay(ax: object, static_maps: dict[str, np.ndar
     return image
 
 
+def draw_built_environment_texture(ax: object, static_maps: dict[str, np.ndarray], *, scale: int = 3) -> None:
+    from world_generator.visualization.land_use_figures import _building_texture_overlay
+
+    required = {
+        "land_use_zone",
+        "load_density_base",
+        "economic_activity",
+        "residential",
+        "commercial",
+        "industrial",
+        "agriculture",
+        "park_green",
+    }
+    if not required.issubset(static_maps):
+        return
+    overlay = _building_texture_overlay(
+        static_maps["land_use_zone"],
+        static_maps["load_density_base"],
+        static_maps["economic_activity"],
+        static_maps["residential"],
+        static_maps["commercial"],
+        static_maps["industrial"],
+        static_maps["agriculture"],
+        static_maps["park_green"],
+        scale=scale,
+    )
+    height, width = static_maps["land_use_zone"].shape
+    ax.imshow(
+        overlay,
+        origin="upper",
+        extent=(-0.5, width - 0.5, height - 0.5, -0.5),
+        interpolation="nearest",
+        zorder=1,
+    )
+
+
 def draw_grid_edge_lines(
     ax: object,
     buses: np.ndarray,

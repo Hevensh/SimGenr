@@ -117,19 +117,30 @@ def _select_thermal_buses(
     start_bus_id: int,
     existing_generation_buses: tuple[GridBus, ...],
 ) -> list[GridBus]:
-    flat_order = np.argsort(-suitability.ravel())
     selected: list[GridBus] = []
-    min_distance_cells = max(config.thermal_residential_buffer_km / max(grid.cell_size_km, 1e-6), 1.0)
-    generation_distance_cells = max(config.thermal_min_generation_distance_km / max(grid.cell_size_km, 1e-6), 1.0)
-    for flat_index in flat_order:
-        row, col = np.unravel_index(int(flat_index), suitability.shape)
+    rows, cols = np.indices(suitability.shape)
+    thermal_distance_cells = max(config.thermal_min_distance_km / max(grid.cell_size_km, 1e-6), 1.0)
+    renewable_distance_cells = max(config.thermal_min_renewable_distance_km / max(grid.cell_size_km, 1e-6), 1.0)
+    spread_radius_cells = max(config.thermal_spread_radius_km / max(grid.cell_size_km, 1e-6), thermal_distance_cells)
+    while len(selected) < config.thermal_candidate_count:
+        score_map = suitability - 0.18 * externality
+        hard_mask = np.zeros(suitability.shape, dtype=bool)
+        coverage = np.zeros(suitability.shape, dtype=np.float32)
+        for item in selected:
+            distance = np.hypot(rows - item.row, cols - item.col)
+            coverage = np.maximum(coverage, np.exp(-np.square(distance / max(spread_radius_cells, 1e-6))))
+            hard_mask |= distance < thermal_distance_cells
+        for item in existing_generation_buses:
+            distance = np.hypot(rows - item.row, cols - item.col)
+            hard_mask |= distance < renewable_distance_cells
+        if selected:
+            score_map *= 1.0 - config.thermal_spread_penalty_weight * coverage
+        score_map[hard_mask] = -1.0
+        score_map[suitability <= 1e-6] = -1.0
+        row, col = np.unravel_index(int(np.argmax(score_map)), suitability.shape)
         score = float(suitability[row, col])
-        if score <= 1e-6:
+        if score <= 1e-6 or float(score_map[row, col]) <= 0.0:
             break
-        if any(np.hypot(row - item.row, col - item.col) < min_distance_cells for item in selected):
-            continue
-        if any(np.hypot(row - item.row, col - item.col) < generation_distance_cells for item in existing_generation_buses):
-            continue
         capacity = config.thermal_capacity_min_mw + (config.thermal_capacity_max_mw - config.thermal_capacity_min_mw) * np.sqrt(score)
         selected.append(
             GridBus(
@@ -146,8 +157,6 @@ def _select_thermal_buses(
                 source_id=len(selected),
             )
         )
-        if len(selected) >= config.thermal_candidate_count:
-            break
     return _relax_thermal_buses(suitability, externality, selected, existing_generation_buses, config, grid)
 
 
@@ -161,21 +170,23 @@ def _relax_thermal_buses(
 ) -> list[GridBus]:
     if config.thermal_relax_iterations <= 0 or not buses:
         return buses
-    min_distance_cells = max(config.thermal_min_generation_distance_km / max(grid.cell_size_km, 1e-6), 1.0)
-    search_radius = max(int(np.ceil(min_distance_cells * 0.55)), 2)
+    thermal_distance_cells = max(config.thermal_min_distance_km / max(grid.cell_size_km, 1e-6), 1.0)
+    renewable_distance_cells = max(config.thermal_min_renewable_distance_km / max(grid.cell_size_km, 1e-6), 1.0)
+    search_radius = max(int(np.ceil(thermal_distance_cells * 0.55)), 2)
     relaxed = list(buses)
     for _ in range(config.thermal_relax_iterations):
         updated: list[GridBus] = []
         for index, bus in enumerate(relaxed):
-            others = tuple(updated) + tuple(relaxed[index + 1 :]) + existing_generation_buses
             row, col, score = _best_thermal_cell(
                 suitability,
                 externality,
                 bus.row,
                 bus.col,
-                others,
+                tuple(updated) + tuple(relaxed[index + 1 :]),
+                existing_generation_buses,
                 search_radius,
-                min_distance_cells,
+                thermal_distance_cells,
+                renewable_distance_cells,
                 config.thermal_neighbor_repulsion_weight,
             )
             capacity = config.thermal_capacity_min_mw + (config.thermal_capacity_max_mw - config.thermal_capacity_min_mw) * np.sqrt(score)
@@ -203,28 +214,34 @@ def _best_thermal_cell(
     externality: np.ndarray,
     row: int,
     col: int,
-    others: tuple[GridBus, ...],
+    thermal_others: tuple[GridBus, ...],
+    renewable_others: tuple[GridBus, ...],
     search_radius: int,
-    min_distance_cells: float,
+    thermal_distance_cells: float,
+    renewable_distance_cells: float,
     repulsion_weight: float,
 ) -> tuple[int, int, float]:
     best_row = row
     best_col = col
     best_utility = float(suitability[row, col])
     best_score = -np.inf
-    sigma = max(min_distance_cells, 1.0)
+    thermal_sigma = max(thermal_distance_cells, 1.0)
+    renewable_sigma = max(renewable_distance_cells, 1.0)
     for rr in range(max(row - search_radius, 0), min(row + search_radius + 1, suitability.shape[0])):
         for cc in range(max(col - search_radius, 0), min(col + search_radius + 1, suitability.shape[1])):
             utility = float(suitability[rr, cc])
             if utility <= 1e-6:
                 continue
-            distances = [float(np.hypot(rr - item.row, cc - item.col)) for item in others]
-            if any(distance < 1.0 for distance in distances):
+            thermal_distances = [float(np.hypot(rr - item.row, cc - item.col)) for item in thermal_others]
+            renewable_distances = [float(np.hypot(rr - item.row, cc - item.col)) for item in renewable_others]
+            if any(distance < thermal_distance_cells for distance in thermal_distances):
                 continue
-            soft_repulsion = sum(np.exp(-((distance / sigma) ** 2)) for distance in distances)
-            hard_penalty = sum((max(min_distance_cells - distance, 0.0) / min_distance_cells) ** 2 for distance in distances)
+            if any(distance < renewable_distance_cells for distance in renewable_distances):
+                continue
+            soft_repulsion = sum(np.exp(-((distance / thermal_sigma) ** 2)) for distance in thermal_distances)
+            soft_repulsion += sum(np.exp(-((distance / renewable_sigma) ** 2)) for distance in renewable_distances)
             move_penalty = 0.025 * float(np.hypot(rr - row, cc - col)) / max(search_radius, 1)
-            score = utility - 0.18 * float(externality[rr, cc]) - repulsion_weight * (0.45 * soft_repulsion + 2.0 * hard_penalty) - move_penalty
+            score = utility - 0.18 * float(externality[rr, cc]) - repulsion_weight * 0.45 * soft_repulsion - move_penalty
             if score > best_score:
                 best_score = score
                 best_row = int(rr)

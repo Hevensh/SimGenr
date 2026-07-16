@@ -113,6 +113,8 @@ class WeatherStore:
     weather_class: np.ndarray
     timestamps: np.ndarray
     channel_names: tuple[str, ...]
+    time_unit: str = "day"
+    start_day_of_year: int = 0
 
     def as_arrays(self) -> dict[str, np.ndarray]:
         return {
@@ -120,6 +122,48 @@ class WeatherStore:
             "weather_class": self.weather_class,
             "timestamps": self.timestamps,
             "channel_names": np.asarray(self.channel_names),
+            "time_unit": np.asarray(self.time_unit),
+            "start_day_of_year": np.asarray(self.start_day_of_year, dtype=np.int32),
+        }
+
+
+@dataclass(frozen=True)
+class SourceLoadForecastStore:
+    timestamps: np.ndarray
+    bus_ids: np.ndarray
+    bus_kinds: tuple[str, ...]
+    p_load_mw: np.ndarray
+    p_gen_available_mw: np.ndarray
+    p_gen_scheduled_mw: np.ndarray
+    q_load_mvar: np.ndarray
+    source_channels: tuple[str, ...]
+
+    def as_arrays(self) -> dict[str, np.ndarray]:
+        return {
+            "timestamps": self.timestamps,
+            "bus_ids": self.bus_ids,
+            "bus_kinds": np.asarray(self.bus_kinds),
+            "p_load_mw": self.p_load_mw,
+            "p_gen_available_mw": self.p_gen_available_mw,
+            "p_gen_scheduled_mw": self.p_gen_scheduled_mw,
+            "q_load_mvar": self.q_load_mvar,
+            "source_channels": np.asarray(self.source_channels),
+        }
+
+    def summary_dict(self) -> dict[str, float | int | list[str]]:
+        total_load = self.p_load_mw.sum(axis=1)
+        total_available = self.p_gen_available_mw.sum(axis=1)
+        total_scheduled = self.p_gen_scheduled_mw.sum(axis=1)
+        return {
+            "hours": int(self.p_load_mw.shape[0]),
+            "bus_count": int(self.p_load_mw.shape[1]),
+            "bus_kinds": sorted(set(self.bus_kinds)),
+            "peak_load_mw": float(np.max(total_load)),
+            "mean_load_mw": float(np.mean(total_load)),
+            "peak_available_generation_mw": float(np.max(total_available)),
+            "mean_available_generation_mw": float(np.mean(total_available)),
+            "peak_scheduled_generation_mw": float(np.max(total_scheduled)),
+            "mean_scheduled_generation_mw": float(np.mean(total_scheduled)),
         }
 
 
@@ -414,6 +458,51 @@ class RefinedGridTopologyState:
         }
 
 
+@dataclass(frozen=True)
+class BusElectricalParam:
+    bus_id: int
+    kind: str
+    nominal_kv: float
+    p_capacity_mw: float
+    q_capacity_mvar: float
+    base_load_mw: float
+    power_factor: float
+    voltage_setpoint_pu: float
+    control_mode: str
+
+
+@dataclass(frozen=True)
+class BranchElectricalParam:
+    edge_id: int
+    from_bus: int
+    to_bus: int
+    nominal_kv: float
+    length_km: float
+    r_ohm: float
+    x_ohm: float
+    b_us: float
+    rate_mva: float
+    is_redundant: bool
+
+
+@dataclass(frozen=True)
+class GridElectricalState:
+    bus_params: tuple[BusElectricalParam, ...]
+    branch_params: tuple[BranchElectricalParam, ...]
+
+    def as_arrays(self) -> dict[str, np.ndarray]:
+        return {
+            "electrical_buses": _bus_electrical_to_array(self.bus_params),
+            "electrical_branches": _branch_electrical_to_array(self.branch_params),
+        }
+
+    def as_dicts(self) -> dict[str, list[dict[str, float | int | bool | str]]]:
+        return {
+            "buses": [_bus_electrical_as_dict(item) for item in self.bus_params],
+            "branches": [_branch_electrical_as_dict(item) for item in self.branch_params],
+        }
+
+
 def _edge_as_dict(edge: GridEdge) -> dict[str, float | int | bool | list[int]]:
     return {
         "edge_id": edge.edge_id,
@@ -438,5 +527,69 @@ def _edges_to_array(edges: tuple[GridEdge, ...]) -> np.ndarray:
             float(item.is_redundant),
         ]
         for item in edges
+    ]
+    return np.asarray(rows, dtype=np.float32)
+
+
+def _bus_electrical_as_dict(bus: BusElectricalParam) -> dict[str, float | int | str]:
+    return {
+        "bus_id": bus.bus_id,
+        "kind": bus.kind,
+        "nominal_kv": bus.nominal_kv,
+        "p_capacity_mw": bus.p_capacity_mw,
+        "q_capacity_mvar": bus.q_capacity_mvar,
+        "base_load_mw": bus.base_load_mw,
+        "power_factor": bus.power_factor,
+        "voltage_setpoint_pu": bus.voltage_setpoint_pu,
+        "control_mode": bus.control_mode,
+    }
+
+
+def _branch_electrical_as_dict(branch: BranchElectricalParam) -> dict[str, float | int | bool]:
+    return {
+        "edge_id": branch.edge_id,
+        "from_bus": branch.from_bus,
+        "to_bus": branch.to_bus,
+        "nominal_kv": branch.nominal_kv,
+        "length_km": branch.length_km,
+        "r_ohm": branch.r_ohm,
+        "x_ohm": branch.x_ohm,
+        "b_us": branch.b_us,
+        "rate_mva": branch.rate_mva,
+        "is_redundant": branch.is_redundant,
+    }
+
+
+def _bus_electrical_to_array(buses: tuple[BusElectricalParam, ...]) -> np.ndarray:
+    rows = [
+        [
+            item.bus_id,
+            item.nominal_kv,
+            item.p_capacity_mw,
+            item.q_capacity_mvar,
+            item.base_load_mw,
+            item.power_factor,
+            item.voltage_setpoint_pu,
+        ]
+        for item in buses
+    ]
+    return np.asarray(rows, dtype=np.float32)
+
+
+def _branch_electrical_to_array(branches: tuple[BranchElectricalParam, ...]) -> np.ndarray:
+    rows = [
+        [
+            item.edge_id,
+            item.from_bus,
+            item.to_bus,
+            item.nominal_kv,
+            item.length_km,
+            item.r_ohm,
+            item.x_ohm,
+            item.b_us,
+            item.rate_mva,
+            float(item.is_redundant),
+        ]
+        for item in branches
     ]
     return np.asarray(rows, dtype=np.float32)

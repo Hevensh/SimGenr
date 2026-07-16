@@ -7,6 +7,7 @@ from world_generator.core.random_state import build_rng_registry
 from world_generator.climate.climate_generator import generate_climate_baseline
 from world_generator.city.city_generator import generate_initial_cities
 from world_generator.energy.energy_candidate_generator import generate_energy_candidates
+from world_generator.grid.electrical_builder import build_grid_electrical
 from world_generator.grid.node_builder import build_grid_nodes
 from world_generator.grid.refinement_builder import refine_grid_topology
 from world_generator.grid.topology_builder import build_grid_topology
@@ -16,6 +17,8 @@ from world_generator.land_use.land_use_generator import LAND_USE_ZONE, generate_
 from world_generator.terrain.derivatives import derive_terrain_features
 from world_generator.terrain.terrain_generator import generate_terrain_base
 from world_generator.weather.weather_generator import generate_daily_weather
+from world_generator.weather.weather_generator import generate_hourly_weather_week
+from world_generator.operation.source_load_forecast import generate_source_load_forecast
 
 
 def test_static_terrain_is_reproducible() -> None:
@@ -110,6 +113,39 @@ def test_daily_weather_shapes_and_basic_relationships() -> None:
     cloud = weather.dynamic[day, channel_index["cloud"]].ravel()
     irradiance = weather.dynamic[day, channel_index["irradiance"]].ravel()
     assert np.corrcoef(cloud, irradiance)[0, 1] < -0.5
+
+
+def test_hourly_weather_week_shapes_and_diurnal_signal() -> None:
+    config = WorldConfig()
+    rngs = build_rng_registry(config.seed)
+    base = generate_terrain_base(config.world, config.terrain, rngs.generator("terrain"))
+    terrain = derive_terrain_features(base, config.world)
+    hydrology = generate_hydrology(terrain, config.world, config.hydrology)
+    climate = generate_climate_baseline(
+        terrain,
+        hydrology,
+        config.world,
+        config.climate,
+        rngs.generator("weather"),
+    )
+    operation_rng = rngs.generator("operation")
+    daily = generate_daily_weather(terrain, hydrology, climate, config.world, config.weather, operation_rng)
+    hourly = generate_hourly_weather_week(daily, config.weather, operation_rng)
+    channel_index = {name: index for index, name in enumerate(hourly.channel_names)}
+
+    assert hourly.dynamic.shape == (
+        config.weather.hourly_week_days * 24,
+        len(hourly.channel_names),
+        config.world.height,
+        config.world.width,
+    )
+    assert hourly.time_unit == "hour"
+    assert np.isfinite(hourly.dynamic).all()
+
+    irradiance = hourly.dynamic[:, channel_index["irradiance"]].mean(axis=(1, 2))
+    midday = np.asarray([hour % 24 == 12 for hour in range(hourly.dynamic.shape[0])])
+    midnight = np.asarray([hour % 24 == 0 for hour in range(hourly.dynamic.shape[0])])
+    assert irradiance[midday].mean() > irradiance[midnight].mean() + 20.0
 
 
 def test_initial_cities_respect_core_constraints() -> None:
@@ -313,7 +349,7 @@ def test_grid_bus_candidates_include_sources_loads_and_thermal_buffers() -> None
     assert max(thermal_externalities) < 0.80
     generation_buses = [item for item in grid_nodes.buses if item.kind in {"wind_bus", "pv_bus"}]
     thermal_buses = [item for item in grid_nodes.buses if item.kind == "thermal_bus"]
-    min_generation_cells = config.power_grid.thermal_min_generation_distance_km / max(config.world.cell_size_km, 1e-6)
+    min_generation_cells = config.power_grid.thermal_min_renewable_distance_km / max(config.world.cell_size_km, 1e-6)
     for thermal in thermal_buses:
         for generator in generation_buses:
             assert np.hypot(thermal.row - generator.row, thermal.col - generator.col) >= min_generation_cells * 0.65
@@ -430,3 +466,109 @@ def test_refined_grid_topology_adds_transit_buses_and_limits_segment_length() ->
         assert edge.length_km <= config.power_grid.max_line_segment_km + config.world.cell_size_km
         parent[find(edge.to_bus)] = find(edge.from_bus)
     assert len({find(item) for item in refined_bus_ids}) == 1
+
+
+def test_grid_electrical_parameters_cover_refined_topology() -> None:
+    config = WorldConfig()
+    rngs = build_rng_registry(config.seed)
+    base = generate_terrain_base(config.world, config.terrain, rngs.generator("terrain"))
+    terrain = derive_terrain_features(base, config.world)
+    hydrology = generate_hydrology(terrain, config.world, config.hydrology)
+    land = generate_static_land(terrain, hydrology, config.world, config.land, rngs.generator("city"))
+    climate = generate_climate_baseline(
+        terrain,
+        hydrology,
+        config.world,
+        config.climate,
+        rngs.generator("weather"),
+    )
+    city = generate_initial_cities(
+        terrain,
+        hydrology,
+        land,
+        climate,
+        config.world,
+        config.city,
+        rngs.generator("evolution"),
+    )
+    land_use = generate_land_use_zones(terrain, hydrology, land, city, config.world, config.land_use)
+    energy = generate_energy_candidates(
+        terrain,
+        hydrology,
+        land,
+        city,
+        land_use,
+        climate.as_maps(),
+        config.world,
+        config.energy,
+    )
+    grid_nodes = build_grid_nodes(terrain, hydrology, land, land_use, energy, config.world, config.power_grid)
+    topology = build_grid_topology(terrain, hydrology, land, grid_nodes, config.world, config.power_grid)
+    refined = refine_grid_topology(grid_nodes, topology, config.world, config.power_grid)
+    electrical = build_grid_electrical(refined)
+
+    assert len(electrical.bus_params) == len(refined.refined_buses)
+    assert len(electrical.branch_params) == len(refined.refined_edges)
+    for bus in electrical.bus_params:
+        assert bus.nominal_kv in {110.0, 220.0}
+        assert 0.9 <= bus.power_factor <= 1.0
+        assert 0.98 <= bus.voltage_setpoint_pu <= 1.03
+    for branch in electrical.branch_params:
+        assert branch.nominal_kv in {110.0, 220.0}
+        assert branch.r_ohm > 0.0
+        assert branch.x_ohm > branch.r_ohm
+        assert branch.b_us > 0.0
+        assert branch.rate_mva > 0.0
+
+
+def test_source_load_forecast_matches_refined_buses() -> None:
+    config = WorldConfig()
+    rngs = build_rng_registry(config.seed)
+    base = generate_terrain_base(config.world, config.terrain, rngs.generator("terrain"))
+    terrain = derive_terrain_features(base, config.world)
+    hydrology = generate_hydrology(terrain, config.world, config.hydrology)
+    land = generate_static_land(terrain, hydrology, config.world, config.land, rngs.generator("city"))
+    climate = generate_climate_baseline(
+        terrain,
+        hydrology,
+        config.world,
+        config.climate,
+        rngs.generator("weather"),
+    )
+    operation_rng = rngs.generator("operation")
+    daily = generate_daily_weather(terrain, hydrology, climate, config.world, config.weather, operation_rng)
+    hourly = generate_hourly_weather_week(daily, config.weather, operation_rng)
+    city = generate_initial_cities(
+        terrain,
+        hydrology,
+        land,
+        climate,
+        config.world,
+        config.city,
+        rngs.generator("evolution"),
+    )
+    land_use = generate_land_use_zones(terrain, hydrology, land, city, config.world, config.land_use)
+    energy = generate_energy_candidates(
+        terrain,
+        hydrology,
+        land,
+        city,
+        land_use,
+        climate.as_maps(),
+        config.world,
+        config.energy,
+    )
+    grid_nodes = build_grid_nodes(terrain, hydrology, land, land_use, energy, config.world, config.power_grid)
+    topology = build_grid_topology(terrain, hydrology, land, grid_nodes, config.world, config.power_grid)
+    refined = refine_grid_topology(grid_nodes, topology, config.world, config.power_grid)
+    electrical = build_grid_electrical(refined)
+    forecast = generate_source_load_forecast(hourly, refined, electrical, operation_rng)
+
+    assert forecast.p_load_mw.shape == (config.weather.hourly_week_days * 24, len(refined.refined_buses))
+    assert forecast.p_gen_available_mw.shape == forecast.p_load_mw.shape
+    assert forecast.p_gen_scheduled_mw.shape == forecast.p_load_mw.shape
+    assert np.isfinite(forecast.p_load_mw).all()
+    assert np.isfinite(forecast.p_gen_available_mw).all()
+    assert forecast.p_load_mw.sum() > 0.0
+    assert forecast.p_gen_available_mw.sum() > 0.0
+    assert forecast.p_gen_scheduled_mw.sum() > 0.0

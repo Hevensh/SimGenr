@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from world_generator.visualization.common import draw_elevation_with_water_overlay, save_single_map
+from world_generator.visualization.common import draw_built_environment_texture, draw_elevation_with_water_overlay, save_single_map
 
 
 ENERGY_FILES = [
@@ -45,6 +45,7 @@ def _save_energy_candidate_overview(static_maps: dict[str, np.ndarray], path: Pa
 
     ax = axes[1, 1]
     image = draw_elevation_with_water_overlay(ax, static_maps)
+    draw_built_environment_texture(ax, static_maps)
     _draw_candidates(ax, static_maps)
     ax.set_title("Candidate sites over terrain/hydrology")
     ax.set_xticks([])
@@ -59,6 +60,7 @@ def _save_candidate_sites_overlay(static_maps: dict[str, np.ndarray], path: Path
 
     fig, ax = plt.subplots(figsize=(7, 6), constrained_layout=True)
     image = draw_elevation_with_water_overlay(ax, static_maps)
+    draw_built_environment_texture(ax, static_maps)
     _draw_candidates(ax, static_maps)
     ax.set_title("Energy and load candidate sites")
     ax.set_xticks([])
