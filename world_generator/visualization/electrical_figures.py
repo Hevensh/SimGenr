@@ -4,8 +4,8 @@ from pathlib import Path
 
 import numpy as np
 
-from world_generator.visualization.common import add_deduped_legend, draw_built_environment_texture, draw_elevation_with_water_overlay
-from world_generator.visualization.refined_topology_figures import _draw_buses
+from world_generator.visualization.common import add_deduped_legend, draw_built_environment_texture, draw_elevation_with_water_overlay, edge_line_xy
+from world_generator.visualization.grid_topology_figures import _draw_buses
 
 
 ELECTRICAL_FILES = [
@@ -54,15 +54,16 @@ def _draw_electrical_panel(static_maps: dict[str, np.ndarray], ax: object, field
     buses = np.atleast_2d(static_maps["refined_grid_buses"])
     branches = np.atleast_2d(static_maps["electrical_branches"])
     bus_by_id = {int(row[0]): row for row in buses}
+    edge_paths = static_maps.get("refined_grid_edge_paths")
     segments = []
     values = []
     widths = []
     for branch in branches:
-        from_bus = bus_by_id.get(int(branch[1]))
-        to_bus = bus_by_id.get(int(branch[2]))
-        if from_bus is None or to_bus is None:
+        line = edge_line_xy(branch, bus_by_id, edge_paths)
+        if line is None:
             continue
-        segments.append([(float(from_bus[2]), float(from_bus[1])), (float(to_bus[2]), float(to_bus[1]))])
+        xs, ys = line
+        segments.append(list(zip(xs, ys)))
         values.append(float(branch[8] if field == "rate" else branch[3]))
         widths.append(1.4 if branch[9] >= 0.5 else 2.0)
     if segments:

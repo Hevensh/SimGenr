@@ -24,11 +24,14 @@ from world_generator.grid.topology_builder import build_grid_topology
 from world_generator.hydrology.hydrology_generator import generate_hydrology
 from world_generator.land.land_generator import generate_static_land
 from world_generator.land_use.land_use_generator import generate_land_use_zones
+from world_generator.operation.grid_upgrade import build_grid_upgrade_plan
+from world_generator.operation.grid_update_loop import run_grid_update_loop
+from world_generator.operation.power_flow import solve_dc_power_flow
 from world_generator.operation.source_load_forecast import generate_source_load_forecast
 from world_generator.terrain.derivatives import derive_terrain_features
 from world_generator.terrain.terrain_generator import generate_terrain_base
 from world_generator.visualization.map_plot import save_static_map_figures
-from world_generator.weather.weather_generator import generate_daily_weather, generate_hourly_weather_week
+from world_generator.weather.weather_generator import generate_daily_weather, generate_hourly_weather_week_from_baseline
 
 
 def main() -> None:
@@ -36,6 +39,7 @@ def main() -> None:
     parser.add_argument("--config", default="configs/small_debug.yaml")
     parser.add_argument("--output", default=None)
     parser.add_argument("--seed", type=int, default=None, help="Override the seed from the config file.")
+    parser.add_argument("--skip-weather-gif", action="store_true", help="Skip the hourly weather GIF when rerunning later stages.")
     args = parser.parse_args()
 
     config = load_world_config(args.config)
@@ -45,8 +49,9 @@ def main() -> None:
     output_root = Path(args.output or config.output.root)
     world_id = f"{config.output.world_name}_seed{config.seed}"
     output_dir = output_root / world_id
+    data_dir = output_dir / "data"
     figure_dir = output_dir / "figures"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
 
     terrain_base = generate_terrain_base(config.world, config.terrain, rngs.generator("terrain"))
     terrain_features = derive_terrain_features(terrain_base, config.world)
@@ -67,6 +72,14 @@ def main() -> None:
     )
     operation_rng = rngs.generator("operation")
     weather = generate_daily_weather(
+        terrain_features,
+        hydrology,
+        climate,
+        config.world,
+        config.weather,
+        operation_rng,
+    )
+    hourly_weather = generate_hourly_weather_week_from_baseline(
         terrain_features,
         hydrology,
         climate,
@@ -120,18 +133,41 @@ def main() -> None:
         config.power_grid,
     )
     refined_topology = refine_grid_topology(
+        terrain_features,
+        hydrology,
+        land,
         grid_nodes,
         grid_topology,
         config.world,
         config.power_grid,
     )
     grid_electrical = build_grid_electrical(refined_topology)
-    hourly_weather = generate_hourly_weather_week(weather, config.weather, operation_rng)
     source_load_forecast = generate_source_load_forecast(
         hourly_weather,
         refined_topology,
         grid_electrical,
         operation_rng,
+    )
+    power_flow = solve_dc_power_flow(
+        source_load_forecast,
+        refined_topology,
+        grid_electrical,
+    )
+    upgrade_plan = build_grid_upgrade_plan(
+        power_flow,
+        grid_electrical,
+        power_grid=config.power_grid,
+    )
+    update_loop = run_grid_update_loop(
+        source_load_forecast,
+        refined_topology,
+        grid_topology,
+        grid_electrical,
+        terrain_features,
+        hydrology,
+        land,
+        config.world,
+        config.power_grid,
     )
     static_maps = (
         terrain_features.as_maps()
@@ -150,17 +186,19 @@ def main() -> None:
         | grid_electrical.as_arrays()
     )
 
-    np.savez_compressed(output_dir / "static_maps.npz", **static_maps)
-    np.savez_compressed(output_dir / "daily_weather.npz", **weather.as_arrays())
-    np.savez_compressed(output_dir / "hourly_weather_week.npz", **hourly_weather.as_arrays())
-    np.savez_compressed(output_dir / "source_load_forecast.npz", **source_load_forecast.as_arrays())
-    np.savez_compressed(output_dir / "source_load_candidates.npz", **energy.candidates_as_arrays())
-    np.savez_compressed(output_dir / "grid_nodes.npz", **grid_nodes.buses_as_arrays())
-    np.savez_compressed(output_dir / "grid_topology.npz", **grid_topology.edges_as_arrays())
-    np.savez_compressed(output_dir / "refined_grid_topology.npz", **refined_topology.as_arrays())
-    np.savez_compressed(output_dir / "grid_electrical.npz", **grid_electrical.as_arrays())
-    dump_config_snapshot(config, output_dir / "config_snapshot.yaml")
-    (output_dir / "metadata.json").write_text(
+    np.savez_compressed(data_dir / "static_maps.npz", **static_maps)
+    np.savez_compressed(data_dir / "daily_weather.npz", **weather.as_arrays())
+    np.savez_compressed(data_dir / "hourly_weather_week.npz", **hourly_weather.as_arrays())
+    np.savez_compressed(data_dir / "source_load_forecast.npz", **source_load_forecast.as_arrays())
+    np.savez_compressed(data_dir / "power_flow_hourly.npz", **power_flow.as_arrays())
+    np.savez_compressed(data_dir / "grid_upgrade_plan.npz", **upgrade_plan.as_arrays())
+    np.savez_compressed(data_dir / "source_load_candidates.npz", **energy.candidates_as_arrays())
+    np.savez_compressed(data_dir / "grid_nodes.npz", **grid_nodes.buses_as_arrays())
+    np.savez_compressed(data_dir / "grid_topology.npz", **grid_topology.edges_as_arrays())
+    np.savez_compressed(data_dir / "refined_grid_topology.npz", **refined_topology.as_arrays())
+    np.savez_compressed(data_dir / "grid_electrical.npz", **grid_electrical.as_arrays())
+    dump_config_snapshot(config, data_dir / "config_snapshot.yaml")
+    (data_dir / "metadata.json").write_text(
         json.dumps(
             {
                 "world_id": world_id,
@@ -187,52 +225,92 @@ def main() -> None:
                     "start_day_of_year": hourly_weather.start_day_of_year,
                 },
                 "source_load_forecast": source_load_forecast.summary_dict(),
+                "power_flow": power_flow.summary_dict(),
+                "grid_upgrade_plan": upgrade_plan.summary_dict(),
+                "grid_update_loop": update_loop.summary_dict(),
             },
             indent=2,
         ),
         encoding="utf-8",
     )
-    (output_dir / "energy_sites.json").write_text(
+    (data_dir / "energy_sites.json").write_text(
         json.dumps(energy.candidates_as_dicts(), indent=2),
         encoding="utf-8",
     )
-    (output_dir / "bus_sites.json").write_text(
+    (data_dir / "bus_sites.json").write_text(
         json.dumps(grid_nodes.buses_as_dicts(), indent=2),
         encoding="utf-8",
     )
-    (output_dir / "grid_edges.json").write_text(
+    (data_dir / "grid_edges.json").write_text(
         json.dumps(grid_topology.edges_as_dicts(), indent=2),
         encoding="utf-8",
     )
-    (output_dir / "refined_bus_sites.json").write_text(
+    (data_dir / "refined_bus_sites.json").write_text(
         json.dumps(refined_topology.buses_as_dicts(), indent=2),
         encoding="utf-8",
     )
-    (output_dir / "refined_grid_edges.json").write_text(
+    (data_dir / "refined_grid_edges.json").write_text(
         json.dumps(refined_topology.edges_as_dicts(), indent=2),
         encoding="utf-8",
     )
-    (output_dir / "grid_electrical.json").write_text(
+    (data_dir / "grid_electrical.json").write_text(
         json.dumps(grid_electrical.as_dicts(), indent=2),
         encoding="utf-8",
     )
-    (output_dir / "source_load_forecast.json").write_text(
+    (data_dir / "source_load_forecast.json").write_text(
         json.dumps(source_load_forecast.summary_dict(), indent=2),
         encoding="utf-8",
     )
-    save_static_map_figures(static_maps, figure_dir, weather, hourly_weather, source_load_forecast)
+    (data_dir / "power_flow_hourly.json").write_text(
+        json.dumps(power_flow.summary_dict(), indent=2),
+        encoding="utf-8",
+    )
+    (data_dir / "grid_upgrade_plan.json").write_text(
+        json.dumps(
+            {
+                "summary": upgrade_plan.summary_dict(),
+                "branches": upgrade_plan.as_dicts(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (data_dir / "grid_update_loop.json").write_text(
+        json.dumps(update_loop.summary_dict(), indent=2),
+        encoding="utf-8",
+    )
+    figure_maps = dict(static_maps)
+    figure_maps["grid_edge_paths"] = {
+        int(edge.edge_id): (edge.path_rows, edge.path_cols) for edge in grid_topology.edges
+    }
+    figure_maps["refined_grid_edge_paths"] = {
+        int(edge.edge_id): (edge.path_rows, edge.path_cols) for edge in refined_topology.refined_edges
+    }
+    save_static_map_figures(
+        figure_maps,
+        figure_dir,
+        weather,
+        hourly_weather,
+        source_load_forecast,
+        power_flow,
+        upgrade_plan,
+        update_loop,
+        render_weather_gif=not args.skip_weather_gif,
+    )
 
     print(f"Generated static world: {output_dir}")
-    print(f"Saved maps: {output_dir / 'static_maps.npz'}")
-    print(f"Saved daily weather: {output_dir / 'daily_weather.npz'}")
-    print(f"Saved hourly weather week: {output_dir / 'hourly_weather_week.npz'}")
-    print(f"Saved source/load forecast: {output_dir / 'source_load_forecast.npz'}")
-    print(f"Saved source/load candidates: {output_dir / 'source_load_candidates.npz'}")
-    print(f"Saved energy candidates: {output_dir / 'energy_sites.json'}")
-    print(f"Saved grid buses: {output_dir / 'bus_sites.json'}")
-    print(f"Saved grid edges: {output_dir / 'grid_edges.json'}")
-    print(f"Saved refined grid topology: {output_dir / 'refined_grid_topology.npz'}")
-    print(f"Saved grid electrical parameters: {output_dir / 'grid_electrical.npz'}")
+    print(f"Saved maps: {data_dir / 'static_maps.npz'}")
+    print(f"Saved daily weather: {data_dir / 'daily_weather.npz'}")
+    print(f"Saved hourly weather week: {data_dir / 'hourly_weather_week.npz'}")
+    print(f"Saved source/load forecast: {data_dir / 'source_load_forecast.npz'}")
+    print(f"Saved hourly power flow: {data_dir / 'power_flow_hourly.npz'}")
+    print(f"Saved grid upgrade plan: {data_dir / 'grid_upgrade_plan.npz'}")
+    print(f"Saved source/load candidates: {data_dir / 'source_load_candidates.npz'}")
+    print(f"Saved energy candidates: {data_dir / 'energy_sites.json'}")
+    print(f"Saved grid buses: {data_dir / 'bus_sites.json'}")
+    print(f"Saved grid edges: {data_dir / 'grid_edges.json'}")
+    print(f"Saved refined grid topology: {data_dir / 'refined_grid_topology.npz'}")
+    print(f"Saved grid electrical parameters: {data_dir / 'grid_electrical.npz'}")
     print(f"Saved figures: {figure_dir}")
 
 

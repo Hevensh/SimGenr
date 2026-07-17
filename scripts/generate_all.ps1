@@ -2,7 +2,8 @@ param(
     [string[]] $Configs = @("configs/small_debug.yaml"),
     [int[]] $Seeds = @(42, 123),
     [string] $PythonBin = "C:\Users\Lenovo\.conda\envs\myEnv\python.exe",
-    [string] $OutputRoot = ""
+    [string] $OutputRoot = "",
+    [switch] $SkipWeatherGif
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,6 +25,9 @@ foreach ($config in $Configs) {
         )
         if ($OutputRoot) {
             $args += @("--output", $OutputRoot)
+        }
+        if ($SkipWeatherGif) {
+            $args += @("--skip-weather-gif")
         }
         & $PythonBin @args
     }

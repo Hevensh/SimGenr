@@ -4,50 +4,29 @@ from pathlib import Path
 
 import numpy as np
 
-from world_generator.core.datatypes import SourceLoadForecastStore, WeatherStore
+from world_generator.core.datatypes import SourceLoadForecastStore
+from world_generator.visualization.common import format_hour_timestamp
 
 
 OPERATION_FILES = [
-    "hourly_weather_week_overview.png",
     "source_load_timeseries.png",
     "bus_forecast_heatmap.png",
 ]
 
 
-def save_operation_figures(hourly_weather: WeatherStore, forecast: SourceLoadForecastStore, output_dir: Path) -> list[str]:
+def save_operation_figures(
+    forecast: SourceLoadForecastStore,
+    output_dir: Path,
+) -> list[str]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    _save_hourly_weather_week_overview(hourly_weather, output_dir / "hourly_weather_week_overview.png")
     _save_source_load_timeseries(forecast, output_dir / "source_load_timeseries.png")
     _save_bus_forecast_heatmap(forecast, output_dir / "bus_forecast_heatmap.png")
     return OPERATION_FILES
 
 
-def _save_hourly_weather_week_overview(weather: WeatherStore, path: Path) -> None:
-    import matplotlib.pyplot as plt
-
-    channels = {name: index for index, name in enumerate(weather.channel_names)}
-    t = np.arange(weather.dynamic.shape[0])
-    series = {
-        "Temperature (C)": weather.dynamic[:, channels["temperature"]].mean(axis=(1, 2)),
-        "Wind speed (m/s)": weather.dynamic[:, channels["wind_speed"]].mean(axis=(1, 2)),
-        "Cloud": weather.dynamic[:, channels["cloud"]].mean(axis=(1, 2)),
-        "Irradiance (W/m2)": weather.dynamic[:, channels["irradiance"]].mean(axis=(1, 2)),
-        "Precipitation (mm/h)": weather.dynamic[:, channels["precipitation"]].mean(axis=(1, 2)),
-        "Humidity": weather.dynamic[:, channels["humidity"]].mean(axis=(1, 2)),
-    }
-    fig, axes = plt.subplots(3, 2, figsize=(12, 8), constrained_layout=True)
-    for ax, (label, values) in zip(axes.flat, series.items()):
-        ax.plot(t, values, linewidth=1.2)
-        ax.set_title(label)
-        ax.set_xlabel("Hour")
-        ax.grid(True, alpha=0.25)
-    fig.suptitle(f"Hourly weather week, start day {weather.start_day_of_year}")
-    fig.savefig(path, dpi=180)
-    plt.close(fig)
-
-
 def _save_source_load_timeseries(forecast: SourceLoadForecastStore, path: Path) -> None:
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import FixedLocator, FixedFormatter
 
     t = np.arange(forecast.p_load_mw.shape[0])
     kinds = np.asarray(forecast.bus_kinds)
@@ -57,8 +36,20 @@ def _save_source_load_timeseries(forecast: SourceLoadForecastStore, path: Path) 
     thermal_available = forecast.p_gen_available_mw[:, kinds == "thermal_bus"].sum(axis=1)
     thermal_scheduled = forecast.p_gen_scheduled_mw[:, kinds == "thermal_bus"].sum(axis=1)
     renewable_available = wind + solar
+    dispatchable_supply = thermal_available + renewable_available
+    storage_needed = load > dispatchable_supply
 
     fig, ax = plt.subplots(figsize=(15, 4.8), constrained_layout=True)
+    ax.fill_between(
+        t,
+        dispatchable_supply,
+        load,
+        where=storage_needed,
+        color="#f7b7d8",
+        alpha=0.38,
+        interpolate=True,
+        label="storage needed",
+    )
     ax.plot(t, load, color="#ff4fa3", linewidth=1.8, label="load")
     ax.plot(
         t,
@@ -94,9 +85,13 @@ def _save_source_load_timeseries(forecast: SourceLoadForecastStore, path: Path) 
     ax.plot(t, thermal_scheduled, color="#f25f2c", linewidth=1.35, label="thermal scheduled")
     ax.plot(t, thermal_available, color="#f25f2c", linewidth=1.0, linestyle="--", alpha=0.55, label="thermal capacity")
     ax.set_title("Hourly source-load forecast")
-    ax.set_xlabel("Hour")
+    tick_positions = np.arange(0, forecast.p_load_mw.shape[0], 24)
+    tick_labels = [format_hour_timestamp(int(forecast.timestamps[int(position)])).rsplit(" ", 1)[0] for position in tick_positions]
+    ax.xaxis.set_major_locator(FixedLocator(tick_positions))
+    ax.xaxis.set_major_formatter(FixedFormatter(tick_labels))
+    ax.set_xlabel("Date")
     ax.set_ylabel("MW")
-    ax.legend(loc="upper right", ncol=2)
+    ax.legend(loc="upper right", ncol=1)
     ax.grid(True, alpha=0.25)
     fig.savefig(path, dpi=180)
     plt.close(fig)

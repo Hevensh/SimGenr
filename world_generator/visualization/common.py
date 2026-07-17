@@ -107,6 +107,7 @@ def draw_grid_edge_lines(
     redundant_color: str = "#006f8f",
     linewidth: float = 1.7,
     alpha: float = 0.76,
+    edge_paths: object | None = None,
 ) -> None:
     if buses.size == 0 or edges.size == 0:
         return
@@ -118,16 +119,16 @@ def draw_grid_edge_lines(
             is_redundant = bool(edge[5] >= 0.5)
             if is_redundant != redundant:
                 continue
-            from_bus = bus_by_id.get(int(edge[1]))
-            to_bus = bus_by_id.get(int(edge[2]))
-            if from_bus is None or to_bus is None:
+            line = edge_line_xy(edge, bus_by_id, edge_paths)
+            if line is None:
                 continue
+            xs, ys = line
             line_color = redundant_color if is_redundant else color
             line_width = linewidth * (0.88 if is_redundant else 1.0)
             label = "redundant line" if is_redundant else "confirmed line"
             ax.plot(
-                [float(from_bus[2]), float(to_bus[2])],
-                [float(from_bus[1]), float(to_bus[1])],
+                xs,
+                ys,
                 color=line_color,
                 linewidth=line_width,
                 alpha=alpha,
@@ -136,6 +137,53 @@ def draw_grid_edge_lines(
                 zorder=2,
             )
             labels_used[is_redundant] = True
+
+
+def edge_line_xy(
+    edge: np.ndarray,
+    bus_by_id: dict[int, np.ndarray],
+    edge_paths: object | None = None,
+) -> tuple[list[float], list[float]] | None:
+    edge_id = int(edge[0]) if edge.size >= 1 else -1
+    if isinstance(edge_paths, dict) and edge_id in edge_paths:
+        rows, cols = edge_paths[edge_id]
+        if len(rows) >= 2 and len(cols) >= 2:
+            return [float(col) for col in cols], [float(row) for row in rows]
+    if edge.size < 3:
+        return None
+    from_bus = bus_by_id.get(int(edge[1]))
+    to_bus = bus_by_id.get(int(edge[2]))
+    if from_bus is None or to_bus is None:
+        return None
+    return [float(from_bus[2]), float(to_bus[2])], [float(from_bus[1]), float(to_bus[1])]
+
+
+def edge_midpoint_xy(
+    edge: np.ndarray,
+    bus_by_id: dict[int, np.ndarray],
+    edge_paths: object | None = None,
+) -> tuple[float, float] | None:
+    line = edge_line_xy(edge, bus_by_id, edge_paths)
+    if line is None:
+        return None
+    xs, ys = line
+    mid = len(xs) // 2
+    return float(xs[mid]), float(ys[mid])
+
+
+def edge_capacity_multipliers(static_maps: dict[str, np.ndarray], edge_ids: np.ndarray) -> np.ndarray:
+    branches = np.atleast_2d(static_maps.get("electrical_branches", np.empty((0, 0))))
+    if branches.size == 0 or branches.shape[1] < 9:
+        return np.ones(edge_ids.shape, dtype=np.float32)
+    multiplier_by_id = {
+        int(branch[0]): float(branch[8]) / (260.0 if float(branch[3]) >= 200.0 else 120.0)
+        for branch in branches
+    }
+    return np.asarray([multiplier_by_id.get(int(edge_id), 1.0) for edge_id in edge_ids], dtype=np.float32)
+
+
+def line_width_for_multiplier(multiplier: float) -> float:
+    return float(0.8 + 1.25 * np.sqrt(np.clip(multiplier, 0.25, 4.0)))
 
 
 def add_deduped_legend(
@@ -270,3 +318,18 @@ def land_terrain_cmap() -> object:
         (1.00, (0.94, 0.94, 0.91)),
     ]
     return LinearSegmentedColormap.from_list("land_terrain_no_water", colors, N=256)
+
+
+def format_hour_timestamp(hour_timestamp: int) -> str:
+    month_days = (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+    month_names = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    day_of_year = int(hour_timestamp // 24) % 365
+    hour = int(hour_timestamp % 24)
+    month_index = 0
+    day_in_month = day_of_year + 1
+    for days in month_days:
+        if day_in_month <= days:
+            break
+        day_in_month -= days
+        month_index += 1
+    return f"{month_names[month_index]} {day_in_month:02d} {hour:02d}:00"

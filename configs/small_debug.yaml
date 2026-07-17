@@ -70,6 +70,12 @@ weather:
   hourly_cloud_variability: 0.16
   hourly_storm_event_rate: 0.18
   hourly_precipitation_burstiness: 2.2
+  hourly_cloud_system_count: 9
+  hourly_cloudlet_count: 11
+  hourly_cloud_radius_min_km: 8.0
+  hourly_cloud_radius_max_km: 22.0
+  hourly_cloud_motion_km_per_hour: 1.15
+  hourly_raining_cloud_fraction: 0.42
   advection_rho: 0.92
   innovation_smoothing_steps: 5
   synoptic_shift_cells_per_day: 1.4
@@ -134,7 +140,7 @@ energy:
   wind_cluster_radius_km: 2.0
   pv_cluster_radius_km: 1.5
   wind_cluster_capacity_max_multiplier: 4.0
-  pv_cluster_capacity_max_multiplier: 3.2
+  pv_cluster_capacity_max_multiplier: 2.3
   wind_min_city_distance_km: 3.0
   wind_city_half_distance_km: 12.0
   wind_flatness_weight: 0.55
@@ -142,8 +148,8 @@ energy:
   pv_min_city_distance_km: 1.5
   wind_capacity_min_mw: 4.0
   wind_capacity_max_mw: 18.0
-  pv_capacity_min_mw: 80.0
-  pv_capacity_max_mw: 260.0
+  pv_capacity_min_mw: 20.0
+  pv_capacity_max_mw: 75.0
   load_capacity_min_mw: 10.0
   load_capacity_max_mw: 120.0
 
@@ -173,7 +179,17 @@ power_grid:
   line_protected_penalty: 3.5
   line_slope_penalty: 1.6
   line_terrain_cost_penalty: 1.2
-  max_line_segment_km: 8.0
+  transit_flood_penalty: 4.0
+  transit_water_penalty: 8.0
+  transit_protected_penalty: 8.0
+  transit_slope_penalty: 1.8
+  transit_terrain_cost_penalty: 1.4
+  line_multiplier_step: 0.125
+  min_line_multiplier: 0.125
+  max_upgrade_factor: 4.0
+  merged_line_target_loading: 0.80
+  low_utilization_peak_ratio: 0.45
+  downgrade_max_network_loading: 0.90
 
 output:
   root: outputs

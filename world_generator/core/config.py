@@ -86,6 +86,12 @@ class WeatherConfig:
     hourly_cloud_variability: float = 0.16
     hourly_storm_event_rate: float = 0.18
     hourly_precipitation_burstiness: float = 2.2
+    hourly_cloud_system_count: int = 9
+    hourly_cloudlet_count: int = 11
+    hourly_cloud_radius_min_km: float = 8.0
+    hourly_cloud_radius_max_km: float = 22.0
+    hourly_cloud_motion_km_per_hour: float = 1.15
+    hourly_raining_cloud_fraction: float = 0.42
     advection_rho: float = 0.92
     innovation_smoothing_steps: int = 5
     synoptic_shift_cells_per_day: float = 1.4
@@ -156,7 +162,7 @@ class EnergyConfig:
     wind_cluster_radius_km: float = 2.0
     pv_cluster_radius_km: float = 1.5
     wind_cluster_capacity_max_multiplier: float = 4.0
-    pv_cluster_capacity_max_multiplier: float = 3.2
+    pv_cluster_capacity_max_multiplier: float = 2.3
     wind_min_city_distance_km: float = 3.0
     wind_city_half_distance_km: float = 12.0
     wind_flatness_weight: float = 0.55
@@ -164,8 +170,8 @@ class EnergyConfig:
     pv_min_city_distance_km: float = 1.5
     wind_capacity_min_mw: float = 4.0
     wind_capacity_max_mw: float = 18.0
-    pv_capacity_min_mw: float = 80.0
-    pv_capacity_max_mw: float = 260.0
+    pv_capacity_min_mw: float = 20.0
+    pv_capacity_max_mw: float = 75.0
     load_capacity_min_mw: float = 10.0
     load_capacity_max_mw: float = 120.0
 
@@ -197,7 +203,17 @@ class PowerGridConfig:
     line_protected_penalty: float = 3.5
     line_slope_penalty: float = 1.6
     line_terrain_cost_penalty: float = 1.2
-    max_line_segment_km: float = 8.0
+    transit_flood_penalty: float = 4.0
+    transit_water_penalty: float = 8.0
+    transit_protected_penalty: float = 8.0
+    transit_slope_penalty: float = 1.8
+    transit_terrain_cost_penalty: float = 1.4
+    line_multiplier_step: float = 0.125
+    min_line_multiplier: float = 0.125
+    max_upgrade_factor: float = 2.8
+    merged_line_target_loading: float = 0.80
+    low_utilization_peak_ratio: float = 0.45
+    downgrade_max_network_loading: float = 0.90
 
 
 @dataclass(frozen=True)

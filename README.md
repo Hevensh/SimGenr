@@ -10,19 +10,19 @@ outputs/small_debug_seed42/
 
 Each output run contains:
 
-- `static_maps.npz`: static raster layers, such as elevation, rivers, cities, land use, and base load density.
-- `daily_weather.npz`: daily dynamic weather tensor and weather-class maps.
-- `source_load_candidates.npz`: numeric wind, photovoltaic, and load-node candidate arrays.
-- `grid_nodes.npz`: numeric bus candidate array.
-- `grid_topology.npz`: numeric grid edge array.
-- `refined_grid_topology.npz`: refined bus and branch arrays after transit bus insertion.
-- `metadata.json`: world id, seed, module seeds, map shapes, weather channels, and city metadata.
-- `energy_sites.json`: wind, photovoltaic, and load-node candidate metadata.
-- `bus_sites.json`: load, wind, PV, and thermal bus candidate metadata.
-- `grid_edges.json`: initial line edge metadata with sampled route cells.
-- `refined_bus_sites.json`: bus metadata after transit bus insertion.
-- `refined_grid_edges.json`: branch metadata after long-line segmentation.
-- `config_snapshot.yaml`: the exact config used for this run.
+- `data/static_maps.npz`: static raster layers, such as elevation, rivers, cities, land use, and base load density.
+- `data/daily_weather.npz`: daily dynamic weather tensor and weather-class maps.
+- `data/source_load_candidates.npz`: numeric wind, photovoltaic, and load-node candidate arrays.
+- `data/grid_nodes.npz`: numeric bus candidate array.
+- `data/grid_topology.npz`: numeric grid edge array.
+- `data/refined_grid_topology.npz`: A* routed bus and branch arrays.
+- `data/metadata.json`: world id, seed, module seeds, map shapes, weather channels, and city metadata.
+- `data/energy_sites.json`: wind, photovoltaic, and load-node candidate metadata.
+- `data/bus_sites.json`: load, wind, PV, and thermal bus candidate metadata.
+- `data/grid_edges.json`: initial line edge metadata with sampled route cells.
+- `data/refined_bus_sites.json`: bus metadata used by the A* routed topology.
+- `data/refined_grid_edges.json`: A* branch metadata, including route cells.
+- `data/config_snapshot.yaml`: the exact config used for this run.
 - `figures/`: staged visualization outputs for inspection.
 
 ## Run
@@ -89,7 +89,7 @@ Folder: `outputs/<world_id>/figures/stage_05_daily_weather/`
 - `seasonal_irradiance.png`: representative seasonal irradiance maps.
 - `annual_weather_summary.png`: annual summary curves and distributions.
 
-The dynamic weather tensor in `daily_weather.npz` currently uses these channels:
+The dynamic weather tensor in `data/daily_weather.npz` currently uses these channels:
 
 ```text
 wind_u, wind_v, wind_speed, temperature, humidity, pressure, cloud, precipitation, irradiance

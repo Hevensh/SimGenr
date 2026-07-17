@@ -6,6 +6,7 @@ import numpy as np
 
 from world_generator.core.config import PowerGridConfig, WorldGridConfig
 from world_generator.core.datatypes import GridBus, GridEdge, GridNodeState, GridTopologyState, HydrologyState, StaticLandState, TerrainFeatures
+from world_generator.grid.corridor import line_cells, normalize01
 
 
 def build_grid_topology(
@@ -47,7 +48,7 @@ def _routing_cost_surface(
 ) -> np.ndarray:
     water = (hydrology.river | hydrology.lake).astype(np.float32)
     protected = land.protected.astype(np.float32)
-    slope = _normalize01(terrain.slope)
+    slope = normalize01(terrain.slope)
     terrain_cost = np.clip(land.terrain_cost, 0.0, 1.0)
     cost = (
         1.0
@@ -56,7 +57,7 @@ def _routing_cost_surface(
         + config.line_slope_penalty * slope
         + config.line_terrain_cost_penalty * terrain_cost
     )
-    return _normalize01(cost)
+    return normalize01(cost)
 
 
 def _candidate_edges(
@@ -96,7 +97,7 @@ def _make_candidate_edge(
     priority: str = "normal",
     metadata: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    path_rows, path_cols = _line_cells(bus_a.row, bus_a.col, bus_b.row, bus_b.col)
+    path_rows, path_cols = line_cells(bus_a.row, bus_a.col, bus_b.row, bus_b.col)
     length_km = float(np.hypot(bus_a.row - bus_b.row, bus_a.col - bus_b.col) * grid.cell_size_km)
     route_cost = float(length_km * (1.0 + np.mean(routing_cost[path_rows, path_cols])))
     edge: dict[str, object] = {
@@ -710,17 +711,3 @@ def _edge_maps(shape: tuple[int, int], edges: list[GridEdge]) -> tuple[np.ndarra
 def _edge_pair(edge: dict[str, object]) -> tuple[int, int]:
     return tuple(sorted((int(edge["from_bus"]), int(edge["to_bus"]))))
 
-
-def _line_cells(row0: int, col0: int, row1: int, col1: int) -> tuple[np.ndarray, np.ndarray]:
-    steps = max(abs(row1 - row0), abs(col1 - col0), 1) + 1
-    rows = np.rint(np.linspace(row0, row1, steps)).astype(np.int16)
-    cols = np.rint(np.linspace(col0, col1, steps)).astype(np.int16)
-    return rows, cols
-
-
-def _normalize01(values: np.ndarray) -> np.ndarray:
-    vmin = float(np.nanmin(values))
-    vmax = float(np.nanmax(values))
-    if vmax - vmin < 1e-12:
-        return np.zeros_like(values, dtype=np.float32)
-    return ((values - vmin) / (vmax - vmin)).astype(np.float32)

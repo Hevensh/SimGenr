@@ -64,15 +64,14 @@ def _load_profile(
 ) -> np.ndarray:
     hours = weather_at_bus.shape[0]
     hour_of_day = np.arange(hours, dtype=np.float32) % 24.0
-    day_index = (np.arange(hours, dtype=np.int32) // 24) % 7
-    morning = np.exp(-((hour_of_day - 8.0) ** 2) / 18.0)
-    evening = np.exp(-((hour_of_day - 19.0) ** 2) / 14.0)
-    business = np.exp(-((hour_of_day - 14.0) ** 2) / 32.0)
-    weekend_factor = np.where(day_index >= 5, 0.92, 1.0).astype(np.float32)
+    morning = np.exp(-(_cyclic_hour_distance(hour_of_day, 8.0) ** 2) / 18.0)
+    evening = np.exp(-(_cyclic_hour_distance(hour_of_day, 19.0) ** 2) / 14.0)
+    business = np.exp(-(_cyclic_hour_distance(hour_of_day, 14.0) ** 2) / 32.0)
     temperature = weather_at_bus[:, channels["temperature"]]
     cooling = np.clip((temperature - 24.0) / 12.0, 0.0, 1.2)
     heating = np.clip((12.0 - temperature) / 10.0, 0.0, 0.8)
-    small_noise = rng.normal(0.0, 0.025, size=hours).astype(np.float32)
+    small_noise = _correlated_hourly_noise(hours, rng, 0.018)
+    daily_scale = _smooth_daily_load_scale(hours, rng)
     profile = (
         0.64
         + 0.16 * morning
@@ -82,9 +81,30 @@ def _load_profile(
         + 0.10 * heating
         + small_noise
     )
-    profile *= weekend_factor
+    profile *= daily_scale
     profile *= 0.92 + 0.18 * float(np.clip(suitability, 0.0, 1.0))
     return np.clip(base_load_mw * profile, 0.08 * base_load_mw, None).astype(np.float32)
+
+
+def _cyclic_hour_distance(hour_of_day: np.ndarray, center_hour: float) -> np.ndarray:
+    distance = np.abs(hour_of_day - float(center_hour))
+    return np.minimum(distance, 24.0 - distance)
+
+
+def _correlated_hourly_noise(hours: int, rng: np.random.Generator, scale: float) -> np.ndarray:
+    noise = rng.normal(0.0, scale, size=hours).astype(np.float32)
+    for index in range(1, hours):
+        noise[index] = 0.78 * noise[index - 1] + 0.22 * noise[index]
+    return noise
+
+
+def _smooth_daily_load_scale(hours: int, rng: np.random.Generator) -> np.ndarray:
+    days = int(np.ceil(hours / 24.0))
+    anchors = rng.normal(1.0, 0.025, size=days + 3).astype(np.float32)
+    anchors = (np.roll(anchors, 1) + 2.0 * anchors + np.roll(anchors, -1)) / 4.0
+    anchor_hours = (np.arange(days + 3, dtype=np.float32) - 1.0) * 24.0
+    hour_axis = np.arange(hours, dtype=np.float32)
+    return np.interp(hour_axis, anchor_hours, anchors).astype(np.float32)
 
 
 def _wind_available(wind_speed: np.ndarray, capacity_mw: float) -> np.ndarray:
@@ -98,9 +118,10 @@ def _wind_available(wind_speed: np.ndarray, capacity_mw: float) -> np.ndarray:
 
 
 def _solar_available(irradiance: np.ndarray, temperature: np.ndarray, capacity_mw: float) -> np.ndarray:
-    irradiance_fraction = np.clip(irradiance / 420.0, 0.0, 1.05)
+    performance_ratio = 0.86
+    irradiance_fraction = np.clip(irradiance / 1000.0, 0.0, 1.05)
     temperature_derate = np.clip(1.0 - 0.004 * np.maximum(temperature - 25.0, 0.0), 0.82, 1.0)
-    return (float(capacity_mw) * irradiance_fraction * temperature_derate).astype(np.float32)
+    return (float(capacity_mw) * irradiance_fraction * performance_ratio * temperature_derate).astype(np.float32)
 
 
 def _dispatch_thermal(

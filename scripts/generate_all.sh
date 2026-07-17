@@ -22,6 +22,9 @@ for config in ${CONFIGS}; do
     if [[ -n "${OUTPUT_ROOT:-}" ]]; then
       args+=("--output" "${OUTPUT_ROOT}")
     fi
+    if [[ "${SKIP_WEATHER_GIF:-0}" == "1" ]]; then
+      args+=("--skip-weather-gif")
+    fi
     "${PYTHON_BIN}" "${args[@]}"
   done
 done

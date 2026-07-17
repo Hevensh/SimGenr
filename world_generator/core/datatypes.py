@@ -168,6 +168,111 @@ class SourceLoadForecastStore:
 
 
 @dataclass(frozen=True)
+class PowerFlowStore:
+    timestamps: np.ndarray
+    bus_ids: np.ndarray
+    branch_ids: np.ndarray
+    bus_angle_rad: np.ndarray
+    bus_p_injection_mw: np.ndarray
+    served_load_mw: np.ndarray
+    dispatched_generation_mw: np.ndarray
+    unserved_load_mw: np.ndarray
+    curtailed_generation_mw: np.ndarray
+    line_flow_mw: np.ndarray
+    line_loading_ratio: np.ndarray
+    slack_bus_id: int
+
+    def as_arrays(self) -> dict[str, np.ndarray]:
+        return {
+            "timestamps": self.timestamps,
+            "bus_ids": self.bus_ids,
+            "branch_ids": self.branch_ids,
+            "bus_angle_rad": self.bus_angle_rad,
+            "bus_p_injection_mw": self.bus_p_injection_mw,
+            "served_load_mw": self.served_load_mw,
+            "dispatched_generation_mw": self.dispatched_generation_mw,
+            "unserved_load_mw": self.unserved_load_mw,
+            "curtailed_generation_mw": self.curtailed_generation_mw,
+            "line_flow_mw": self.line_flow_mw,
+            "line_loading_ratio": self.line_loading_ratio,
+            "slack_bus_id": np.asarray(self.slack_bus_id, dtype=np.int32),
+        }
+
+    def summary_dict(self) -> dict[str, float | int]:
+        peak_loading = self.line_loading_ratio.max(axis=0) if self.line_loading_ratio.size else np.asarray([], dtype=np.float32)
+        return {
+            "hours": int(self.bus_p_injection_mw.shape[0]),
+            "bus_count": int(self.bus_p_injection_mw.shape[1]),
+            "branch_count": int(self.line_flow_mw.shape[1]),
+            "slack_bus_id": int(self.slack_bus_id),
+            "peak_line_loading_ratio": float(np.max(peak_loading)) if peak_loading.size else 0.0,
+            "line_hours_over_80pct": int((self.line_loading_ratio > 0.80).sum()),
+            "line_hours_over_100pct": int((self.line_loading_ratio > 1.00).sum()),
+            "total_unserved_load_mwh": float(np.sum(self.unserved_load_mw)),
+            "total_curtailed_generation_mwh": float(np.sum(self.curtailed_generation_mw)),
+        }
+
+
+@dataclass(frozen=True)
+class GridUpgradePlanStore:
+    branch_ids: np.ndarray
+    current_rate_mva: np.ndarray
+    recommended_rate_mva: np.ndarray
+    upgrade_factor: np.ndarray
+    peak_loading_ratio: np.ndarray
+    p95_loading_ratio: np.ndarray
+    hours_over_80pct: np.ndarray
+    hours_over_100pct: np.ndarray
+    overload_mwh_proxy: np.ndarray
+    priority_score: np.ndarray
+
+    def as_arrays(self) -> dict[str, np.ndarray]:
+        return {
+            "branch_ids": self.branch_ids,
+            "current_rate_mva": self.current_rate_mva,
+            "recommended_rate_mva": self.recommended_rate_mva,
+            "upgrade_factor": self.upgrade_factor,
+            "peak_loading_ratio": self.peak_loading_ratio,
+            "p95_loading_ratio": self.p95_loading_ratio,
+            "hours_over_80pct": self.hours_over_80pct,
+            "hours_over_100pct": self.hours_over_100pct,
+            "overload_mwh_proxy": self.overload_mwh_proxy,
+            "priority_score": self.priority_score,
+        }
+
+    def as_dicts(self) -> list[dict[str, float | int]]:
+        rows = []
+        order = np.argsort(-self.priority_score)
+        for index in order:
+            rows.append(
+                {
+                    "branch_id": int(self.branch_ids[index]),
+                    "current_rate_mva": float(self.current_rate_mva[index]),
+                    "recommended_rate_mva": float(self.recommended_rate_mva[index]),
+                    "upgrade_factor": float(self.upgrade_factor[index]),
+                    "peak_loading_ratio": float(self.peak_loading_ratio[index]),
+                    "p95_loading_ratio": float(self.p95_loading_ratio[index]),
+                    "hours_over_80pct": int(self.hours_over_80pct[index]),
+                    "hours_over_100pct": int(self.hours_over_100pct[index]),
+                    "overload_mwh_proxy": float(self.overload_mwh_proxy[index]),
+                    "priority_score": float(self.priority_score[index]),
+                }
+            )
+        return rows
+
+    def summary_dict(self) -> dict[str, float | int]:
+        needs_upgrade = self.upgrade_factor > 1.01
+        return {
+            "branch_count": int(self.branch_ids.size),
+            "recommended_upgrade_count": int(needs_upgrade.sum()),
+            "max_upgrade_factor": float(self.upgrade_factor.max()) if self.upgrade_factor.size else 1.0,
+            "mean_upgrade_factor_for_recommended": float(self.upgrade_factor[needs_upgrade].mean()) if needs_upgrade.any() else 1.0,
+            "total_added_rate_mva": float(np.maximum(self.recommended_rate_mva - self.current_rate_mva, 0.0).sum()),
+            "top_priority_score": float(self.priority_score.max()) if self.priority_score.size else 0.0,
+        }
+
+
+@dataclass(frozen=True)
 class CityNode:
     city_id: int
     row: int
