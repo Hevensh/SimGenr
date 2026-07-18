@@ -5,7 +5,7 @@ import numpy as np
 from world_generator.core.config import PowerGridConfig, WorldConfig
 from world_generator.core.random_state import build_rng_registry
 from world_generator.climate.climate_generator import generate_climate_baseline
-from world_generator.city.city_generator import generate_initial_cities
+from world_generator.city.city_generator import _edge_buffer, generate_initial_cities
 from world_generator.energy.energy_candidate_generator import generate_energy_candidates
 from world_generator.grid.electrical_builder import build_grid_electrical
 from world_generator.grid.node_builder import build_grid_nodes
@@ -24,7 +24,7 @@ from world_generator.operation.grid_upgrade import build_grid_upgrade_plan
 from world_generator.operation.grid_update_loop import (
     _apply_bypass_actions,
     _merge_collinear_branches,
-    _next_line_rate,
+    _expected_line_rate,
     _resize_branch_multiplier,
     _suitable_line_multiplier_for_voltage,
     run_grid_update_loop,
@@ -51,6 +51,21 @@ def test_static_terrain_is_reproducible() -> None:
     terrain_b = generate_terrain_base(config.world, config.terrain, rngs_b.generator("terrain"))
 
     np.testing.assert_array_equal(terrain_a.elevation, terrain_b.elevation)
+
+
+def test_city_edge_buffer_keeps_boundary_candidates_viable() -> None:
+    config = WorldConfig()
+    edge_factor = _edge_buffer(
+        (9, 9),
+        config.world,
+        config.city.edge_buffer_km,
+        config.city.edge_buffer_min_factor,
+    )
+    floor = config.city.edge_buffer_min_factor
+    assert np.isclose(edge_factor[0, 4], floor)
+    expected_one_cell = floor + (1.0 - floor) * min(config.world.cell_size_km / config.city.edge_buffer_km, 1.0)
+    assert np.isclose(edge_factor[1, 4], expected_one_cell)
+    assert edge_factor[2, 4] == 1.0
 
 
 def test_terrain_feature_shapes_and_finiteness() -> None:
@@ -746,6 +761,8 @@ def test_dc_power_flow_matches_forecast_and_refined_edges() -> None:
 
 
 def _action_edges_for_test(action: dict[str, object]) -> list[tuple[int, int]]:
+    if action.get("action") == "downgrade_low_utilization_line":
+        return []
     if "logical_edges" in action:
         return [(int(edge[0]), int(edge[1])) for edge in action["logical_edges"]]
     if action.get("action") == "swap_crossing_lines":
@@ -1280,12 +1297,12 @@ def test_stage12_line_multiplier_uses_actual_peak_flow() -> None:
     assert _suitable_line_multiplier_for_voltage(np.asarray([390.0, 410.0]), 220.0, constrained) == 1.5
 
 
-def test_stage12_bypass_capacity_advances_by_line_multiplier_step() -> None:
+def test_stage12_bypass_capacity_uses_expected_upgrade_factor() -> None:
     config = PowerGridConfig(line_multiplier_step=0.125, min_line_multiplier=0.125, max_upgrade_factor=2.8)
-    rate, multiplier = _next_line_rate(120.0, 110.0, config)
-    assert rate == 135.0
-    assert multiplier == 1.125
-    capped_rate, capped_multiplier = _next_line_rate(336.0, 110.0, config)
+    rate, multiplier = _expected_line_rate(120.0, 110.0, 1.38, config)
+    assert rate == 180.0
+    assert multiplier == 1.5
+    capped_rate, capped_multiplier = _expected_line_rate(336.0, 110.0, 1.25, config)
     assert capped_rate == 336.0
     assert capped_multiplier == 2.8
 

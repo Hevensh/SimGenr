@@ -197,6 +197,7 @@ def _select_bypass_actions(
             grid,
             power_grid,
             trial_existing,
+            factor,
             float(plan.priority_score[index]),
             float(plan.peak_loading_ratio[index]),
             int(plan.hours_over_100pct[index]),
@@ -750,7 +751,6 @@ def _merge_collinear_branches(
             grid,
             power_grid,
             power_flow,
-            allow_shared_prefix=merge_pass == 0,
         )
         if not actions:
             break
@@ -769,8 +769,6 @@ def _merge_collinear_branches_pass(
     grid: WorldGridConfig,
     power_grid: PowerGridConfig,
     power_flow: PowerFlowStore | None,
-    *,
-    allow_shared_prefix: bool,
 ) -> tuple[RefinedGridTopologyState, GridElectricalState, list[dict[str, float | int | str]]]:
     buses = list(topology.refined_buses)
     edges = list(topology.refined_edges)
@@ -805,7 +803,7 @@ def _merge_collinear_branches_pass(
                             same_direction,
                         )
                     )
-        if not allow_shared_prefix or len(shared) != 1:
+        if len(shared) != 1:
             continue
         shared_bus = shared.pop()
         first_other = int(first.to_bus) if int(first.from_bus) == shared_bus else int(first.from_bus)
@@ -1327,23 +1325,24 @@ def _base_line_rate_mva(nominal_kv: float) -> float:
     return 260.0 if float(nominal_kv) >= 200.0 else 120.0
 
 
-def _next_line_rate(
+def _expected_line_rate(
     reference_rate_mva: float,
     nominal_kv: float,
+    expected_upgrade_factor: float,
     power_grid: PowerGridConfig,
 ) -> tuple[float, float]:
     base_rate = _base_line_rate_mva(nominal_kv)
-    step = float(power_grid.line_multiplier_step)
+    upgrade_step = 2.0 * float(power_grid.line_multiplier_step)
     reference_multiplier = float(reference_rate_mva) / base_rate
-    aligned_multiplier = np.ceil(reference_multiplier / step) * step
-    next_multiplier = float(
+    expected_multiplier = reference_multiplier * max(float(expected_upgrade_factor), 1.0)
+    target_multiplier = float(
         np.clip(
-            aligned_multiplier + step,
+            np.ceil(expected_multiplier / upgrade_step) * upgrade_step,
             power_grid.min_line_multiplier,
             power_grid.max_upgrade_factor,
         )
     )
-    return float(base_rate * next_multiplier), next_multiplier
+    return float(base_rate * target_multiplier), target_multiplier
 
 
 def _downgrade_low_utilization_lines(
@@ -1383,10 +1382,16 @@ def _downgrade_low_utilization_lines(
             branch_params=trial_branches,
         )
         trial_flow = solve_dc_power_flow(forecast, topology, trial_electrical)
+        current_summary = current_flow.summary_dict()
         trial_summary = trial_flow.summary_dict()
         if (
-            int(trial_summary["line_hours_over_100pct"]) > 0
-            or float(trial_summary["peak_line_loading_ratio"]) > power_grid.downgrade_max_network_loading
+            int(trial_summary["line_hours_over_100pct"]) > int(current_summary["line_hours_over_100pct"])
+            or float(trial_summary["peak_line_loading_ratio"])
+            > max(
+                float(current_summary["peak_line_loading_ratio"]),
+                float(power_grid.downgrade_max_network_loading),
+            )
+            + 1e-6
         ):
             continue
         trial_index = {int(edge_id): index for index, edge_id in enumerate(trial_flow.branch_ids)}[branch_id]
@@ -1552,6 +1557,7 @@ def _best_trial_bypass_action(
     grid: WorldGridConfig,
     power_grid: PowerGridConfig,
     existing_corridors: set[tuple[int, int]],
+    expected_upgrade_factor: float,
     priority_score: float,
     peak_loading_ratio: float,
     hours_over_100pct: int,
@@ -1568,6 +1574,7 @@ def _best_trial_bypass_action(
             refined_topology,
             existing_corridors,
             power_grid,
+            expected_upgrade_factor,
             priority_score,
             peak_loading_ratio,
             hours_over_100pct,
@@ -1622,13 +1629,24 @@ def _candidate_action_variants(
     refined_topology: RefinedGridTopologyState,
     existing_corridors: set[tuple[int, int]],
     power_grid: PowerGridConfig,
+    expected_upgrade_factor: float,
     priority_score: float,
     peak_loading_ratio: float,
     hours_over_100pct: int,
     *,
     mode: str = "bypass",
 ) -> list[dict[str, float | int | str]]:
-    direct = _make_bypass_action(source_branch, from_bus, to_bus, kind, power_grid, priority_score, peak_loading_ratio, hours_over_100pct)
+    direct = _make_bypass_action(
+        source_branch,
+        from_bus,
+        to_bus,
+        kind,
+        power_grid,
+        expected_upgrade_factor,
+        priority_score,
+        peak_loading_ratio,
+        hours_over_100pct,
+    )
     if mode == "reroute":
         direct = _make_reroute_action(direct, source_branch)
         if _has_too_acute_candidate_edges(
@@ -1661,6 +1679,7 @@ def _candidate_action_variants(
         refined_topology,
         existing_corridors,
         power_grid,
+        expected_upgrade_factor,
         priority_score,
         peak_loading_ratio,
         hours_over_100pct,
@@ -1687,14 +1706,16 @@ def _make_bypass_action(
     to_bus: int,
     kind: str,
     power_grid: PowerGridConfig,
+    expected_upgrade_factor: float,
     priority_score: float,
     peak_loading_ratio: float,
     hours_over_100pct: int,
 ) -> dict[str, float | int | str]:
     length = max(float(source_branch.length_km), 1e-6)
-    bypass_rate_mva, bypass_multiplier = _next_line_rate(
+    bypass_rate_mva, bypass_multiplier = _expected_line_rate(
         source_branch.rate_mva,
         source_branch.nominal_kv,
+        expected_upgrade_factor,
         power_grid,
     )
     return {
@@ -1706,6 +1727,7 @@ def _make_bypass_action(
         "to_bus": int(to_bus),
         "bypass_rate_mva": bypass_rate_mva,
         "bypass_multiplier": bypass_multiplier,
+        "expected_upgrade_factor": float(expected_upgrade_factor),
         "nominal_kv": float(source_branch.nominal_kv),
         "source_r_ohm_per_km": float(source_branch.r_ohm / length),
         "source_x_ohm_per_km": float(source_branch.x_ohm / length),
@@ -1744,6 +1766,7 @@ def _make_swap_actions(
     refined_topology: RefinedGridTopologyState,
     existing_corridors: set[tuple[int, int]],
     power_grid: PowerGridConfig,
+    expected_upgrade_factor: float,
     priority_score: float,
     peak_loading_ratio: float,
     hours_over_100pct: int,
@@ -1780,6 +1803,7 @@ def _make_swap_actions(
                 kind,
                 swap_kind,
                 power_grid,
+                expected_upgrade_factor,
                 priority_score,
                 peak_loading_ratio,
                 hours_over_100pct,
@@ -1797,6 +1821,7 @@ def _make_swap_action(
     bypass_kind: str,
     swap_kind: str,
     power_grid: PowerGridConfig,
+    expected_upgrade_factor: float,
     priority_score: float,
     peak_loading_ratio: float,
     hours_over_100pct: int,
@@ -1804,9 +1829,10 @@ def _make_swap_action(
 ) -> dict[str, float | int | str]:
     length = max(float(source_branch.length_km), 1e-6)
     nominal_kv = float(max(source_branch.nominal_kv, crossed_branch.nominal_kv))
-    bypass_rate_mva, bypass_multiplier = _next_line_rate(
+    bypass_rate_mva, bypass_multiplier = _expected_line_rate(
         max(source_branch.rate_mva, crossed_branch.rate_mva),
         nominal_kv,
+        expected_upgrade_factor,
         power_grid,
     )
     return {
@@ -1824,6 +1850,7 @@ def _make_swap_action(
         "edge2_to_bus": int(edge2[1]),
         "bypass_rate_mva": bypass_rate_mva,
         "bypass_multiplier": bypass_multiplier,
+        "expected_upgrade_factor": float(expected_upgrade_factor),
         "nominal_kv": nominal_kv,
         "source_r_ohm_per_km": float(source_branch.r_ohm / length),
         "source_x_ohm_per_km": float(source_branch.x_ohm / length),

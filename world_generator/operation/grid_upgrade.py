@@ -41,7 +41,7 @@ def build_grid_upgrade_plan(
     )
     raw_factor_by_flow_order = np.where(hours_over_80 > 0, raw_factor_by_flow_order, 1.0)
     upgrade_factor_by_flow_order = np.clip(
-        _round_upgrade_factor(raw_factor_by_flow_order),
+        _round_upgrade_factor(raw_factor_by_flow_order, 2.0 * power_grid.line_multiplier_step),
         1.0,
         float(power_grid.max_upgrade_factor),
     ).astype(np.float32)
@@ -69,11 +69,9 @@ def build_grid_upgrade_plan(
     )
 
 
-def _round_upgrade_factor(values: np.ndarray) -> np.ndarray:
-    steps = np.asarray([1.0, 1.25, 1.5, 1.75, 2.0, 2.4, 2.8], dtype=np.float32)
-    indices = np.searchsorted(steps, values, side="left")
-    indices = np.clip(indices, 0, len(steps) - 1)
-    return steps[indices]
+def _round_upgrade_factor(values: np.ndarray, step: float) -> np.ndarray:
+    step = max(float(step), 1e-6)
+    return (np.ceil(np.asarray(values, dtype=np.float32) / step) * step).astype(np.float32)
 
 
 def _rates_by_branch_id(source_ids: np.ndarray, source_values: np.ndarray, target_ids: np.ndarray) -> np.ndarray:

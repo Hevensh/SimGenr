@@ -49,7 +49,12 @@ def generate_initial_cities(
     urban_core_suitability = city_suitability.copy()
     urban_core_suitability[hydrology.distance_to_water < config.core_water_min_distance_km] *= 0.30
     urban_core_suitability[flood > config.max_core_flood_risk] *= 0.15
-    urban_core_suitability *= _edge_buffer(urban_core_suitability.shape, grid, config.edge_buffer_km)
+    urban_core_suitability *= _edge_buffer(
+        urban_core_suitability.shape,
+        grid,
+        config.edge_buffer_km,
+        config.edge_buffer_min_factor,
+    )
     urban_core_suitability[water | protected] = 0.0
     urban_core_suitability = _normalize01(urban_core_suitability)
 
@@ -133,11 +138,18 @@ def _select_city_centers(
     return centers
 
 
-def _edge_buffer(shape: tuple[int, int], grid: WorldGridConfig, buffer_km: float) -> np.ndarray:
+def _edge_buffer(
+    shape: tuple[int, int],
+    grid: WorldGridConfig,
+    buffer_km: float,
+    min_factor: float,
+) -> np.ndarray:
     rows, cols = np.indices(shape)
     edge_cells = np.minimum.reduce([rows, cols, shape[0] - 1 - rows, shape[1] - 1 - cols]).astype(np.float32)
     buffer_cells = max(buffer_km / max(grid.cell_size_km, 1e-6), 1e-6)
-    return np.clip(edge_cells / buffer_cells, 0.0, 1.0).astype(np.float32)
+    progress = np.clip(edge_cells / buffer_cells, 0.0, 1.0)
+    floor = float(np.clip(min_factor, 0.0, 1.0))
+    return (floor + (1.0 - floor) * progress).astype(np.float32)
 
 
 def _build_city_nodes(

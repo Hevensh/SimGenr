@@ -108,12 +108,13 @@ def draw_grid_edge_lines(
     linewidth: float = 1.7,
     alpha: float = 0.76,
     edge_paths: object | None = None,
+    unified_legend_label: str | None = None,
 ) -> None:
     if buses.size == 0 or edges.size == 0:
         return
     bus_by_id = {int(row[0]): row for row in np.atleast_2d(buses)}
     edge_rows = np.atleast_2d(edges)
-    labels_used = {False: False, True: False}
+    labels_used: set[str] = set()
     for redundant in (False, True):
         for edge in edge_rows:
             is_redundant = bool(edge[5] >= 0.5)
@@ -125,7 +126,7 @@ def draw_grid_edge_lines(
             xs, ys = line
             line_color = redundant_color if is_redundant else color
             line_width = linewidth * (0.88 if is_redundant else 1.0)
-            label = "redundant line" if is_redundant else "confirmed line"
+            label = unified_legend_label or ("redundant line" if is_redundant else "confirmed line")
             ax.plot(
                 xs,
                 ys,
@@ -133,10 +134,10 @@ def draw_grid_edge_lines(
                 linewidth=line_width,
                 alpha=alpha,
                 solid_capstyle="round",
-                label=label if not labels_used[is_redundant] else "_nolegend_",
+                label=label if label not in labels_used else "_nolegend_",
                 zorder=2,
             )
-            labels_used[is_redundant] = True
+            labels_used.add(label)
 
 
 def edge_line_xy(
@@ -183,7 +184,7 @@ def edge_capacity_multipliers(static_maps: dict[str, np.ndarray], edge_ids: np.n
 
 
 def line_width_for_multiplier(multiplier: float) -> float:
-    return float(0.8 + 1.25 * np.sqrt(np.clip(multiplier, 0.25, 4.0)))
+    return float(0.4 + 3.2 * np.sqrt(multiplier))
 
 
 def add_deduped_legend(

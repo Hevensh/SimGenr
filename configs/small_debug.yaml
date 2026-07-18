@@ -105,6 +105,7 @@ city:
   waterfront_sigma_km: 0.9
   max_core_flood_risk: 0.58
   edge_buffer_km: 3.0
+  edge_buffer_min_factor: 0.40
   urban_radius_min_km: 2.5
   urban_radius_max_km: 8.0
   city_size_alpha: 1.25
@@ -188,8 +189,8 @@ power_grid:
   min_line_multiplier: 0.125
   max_upgrade_factor: 4.0
   merged_line_target_loading: 0.80
-  low_utilization_peak_ratio: 0.45
-  downgrade_max_network_loading: 0.90
+  low_utilization_peak_ratio: 0.48
+  downgrade_max_network_loading: 0.96
 
 output:
   root: outputs

@@ -210,7 +210,7 @@ def _save_hourly_weather_gif(static_maps: dict[str, np.ndarray], weather: Weathe
         return tuple(image for image, _, _ in images) + (suptitle,)
 
     animation = FuncAnimation(fig, update, frames=weather.dynamic.shape[0], interval=200, blit=False)
-    animation.save(path, writer=PillowWriter(fps=5), dpi=120)
+    animation.save(path, writer=PillowWriter(fps=4), dpi=120)
     plt.close(fig)
 
 

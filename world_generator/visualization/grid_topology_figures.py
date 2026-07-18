@@ -60,7 +60,13 @@ def _save_grid_topology_overview(static_maps: dict[str, np.ndarray], path: Path)
     for ax, values, title, cmap in panels:
         image = ax.imshow(values, cmap=cmap, origin="upper", vmin=0.0, vmax=1.0)
         if ax is axes[1, 1]:
-            _draw_routes(ax, static_maps, color="#22c7df", redundant_color="#22c7df")
+            _draw_routes(
+                ax,
+                static_maps,
+                color="#22c7df",
+                redundant_color="#22c7df",
+                unified_legend_label="transmission line",
+            )
         _draw_buses(ax, static_maps)
         ax.set_title(title)
         ax.set_xticks([])
@@ -95,6 +101,7 @@ def _draw_routes(
     *,
     color: str = "#151515",
     redundant_color: str = "#006f8f",
+    unified_legend_label: str | None = None,
 ) -> None:
     buses = static_maps.get("refined_grid_buses", static_maps.get("grid_buses"))
     edges = static_maps.get("refined_grid_edges", static_maps.get("grid_edges"))
@@ -110,6 +117,7 @@ def _draw_routes(
         linewidth=1.55,
         alpha=0.74,
         edge_paths=edge_paths,
+        unified_legend_label=unified_legend_label,
     )
 
 

@@ -123,6 +123,7 @@ class CityConfig:
     waterfront_sigma_km: float = 0.9
     max_core_flood_risk: float = 0.58
     edge_buffer_km: float = 3.0
+    edge_buffer_min_factor: float = 0.40
     urban_radius_min_km: float = 2.5
     urban_radius_max_km: float = 8.0
     city_size_alpha: float = 1.25
@@ -210,7 +211,7 @@ class PowerGridConfig:
     transit_terrain_cost_penalty: float = 1.4
     line_multiplier_step: float = 0.125
     min_line_multiplier: float = 0.125
-    max_upgrade_factor: float = 2.8
+    max_upgrade_factor: float = 4.0
     merged_line_target_loading: float = 0.80
     low_utilization_peak_ratio: float = 0.45
     downgrade_max_network_loading: float = 0.90

@@ -367,7 +367,7 @@ def save_line_loading_gif(
         return tuple(changed)
 
     animation = FuncAnimation(fig, update, frames=frame_count, interval=200, blit=False)
-    animation.save(path, writer=PillowWriter(fps=5), dpi=120)
+    animation.save(path, writer=PillowWriter(fps=4), dpi=120)
     plt.close(fig)
 
 
