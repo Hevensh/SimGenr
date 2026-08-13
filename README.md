@@ -2,7 +2,7 @@
 
 This project builds a reproducible synthetic world for multimodal source-load-grid experiments. The current pipeline starts from terrain, then derives hydrology, static land constraints, climate background, daily weather, initial cities, and land-use/load zones.
 
-Private project repository: <https://github.com/Hevensh/SimGenr>
+Project repository: <https://github.com/Hevensh/SimGenr>
 
 ## Generate One Seed
 
