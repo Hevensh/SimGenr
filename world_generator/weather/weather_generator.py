@@ -238,7 +238,6 @@ def generate_hourly_weather_week_from_baseline(
             + temperature_noise[hour_index]
             - 2.15 * cloud_cooling_memory
             - 0.75 * rain_core
-            - 0.006 * terrain.elevation
         )
         pressure = (
             config.pressure_base_hpa

@@ -1,5 +1,13 @@
 # Generated outputs
 outputs/
+checkpoints/
+/report_generation/
+datasets/*/samples/
+datasets/*/manifest.json
+datasets/*/schema.json
+datasets/*/README.md
+datasets/*/inspection_summary.md
+datasets/*/generation_report.json
 
 # Python caches
 __pycache__/

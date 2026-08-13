@@ -10,26 +10,88 @@ outputs/small_debug_seed42/
 
 Each output run contains:
 
-- `data/static_maps.npz`: static raster layers, such as elevation, rivers, cities, land use, and base load density.
-- `data/daily_weather.npz`: daily dynamic weather tensor and weather-class maps.
-- `data/source_load_candidates.npz`: numeric wind, photovoltaic, and load-node candidate arrays.
-- `data/grid_nodes.npz`: numeric bus candidate array.
-- `data/grid_topology.npz`: numeric grid edge array.
-- `data/refined_grid_topology.npz`: A* routed bus and branch arrays.
-- `data/metadata.json`: world id, seed, module seeds, map shapes, weather channels, and city metadata.
-- `data/energy_sites.json`: wind, photovoltaic, and load-node candidate metadata.
-- `data/bus_sites.json`: load, wind, PV, and thermal bus candidate metadata.
-- `data/grid_edges.json`: initial line edge metadata with sampled route cells.
-- `data/refined_bus_sites.json`: bus metadata used by the A* routed topology.
-- `data/refined_grid_edges.json`: A* branch metadata, including route cells.
+- `data/stage_05_weather/`: daily and hourly weather arrays.
+- `data/stage_08_energy_sites/`: wind, photovoltaic, and load candidate arrays and metadata.
+- `data/stage_09_grid_buses/`: load, wind, PV, and thermal bus candidates.
+- `data/stage_10_grid_topology/`: integrated static maps, A* topology, and initial electrical parameters.
+- `data/stage_11_operation/`: source/load forecast, baseline power flow, and upgrade proposal.
+- `data/stage_12_grid_update/`: final updated topology, electrical state, and power flow.
+- `data/stage_13_storage_planning/`: storage need analysis and selected sites.
+- `data/stage_14_storage_dispatch/`: final dispatch, expansion, SOC, and network operation.
+- `data/metadata.json`: world-wide dimensions, module seeds, and summaries.
 - `data/config_snapshot.yaml`: the exact config used for this run.
 - `figures/`: staged visualization outputs for inspection.
 
+Legacy flat outputs can be reorganized without recomputation using `python scripts/migrate_output_layout.py`.
+
 ## Run
 
-```powershell
-& 'C:\Users\Lenovo\.conda\envs\myEnv\python.exe' scripts\generate_static_world.py --config configs\small_debug.yaml
+```bash
+python scripts/generate_static_world.py --config configs/small_debug.yaml
 ```
+
+To rerun Stage 13 and all later stages from the cached final Stage 12 state:
+
+```bash
+python scripts/generate_static_world.py --config configs/small_debug.yaml --seed 42 --from-stage 13
+```
+
+The batch script forwards the same argument to every configured seed:
+
+```bash
+bash scripts/generate_all.sh --from-stage 13
+```
+
+To retain the existing storage plan and rerun only Stage 14 dispatch:
+
+```bash
+python scripts/generate_static_world.py --config configs/small_debug.yaml --seed 42 --from-stage 14
+```
+
+Use `--skip-storage-animation` when only the numeric dispatch and static figures are needed. The previous
+`--skip-storage-gif` spelling remains available as a compatibility alias.
+
+Hourly weather, line-loading, and storage-dispatch animations are written as animated WebP files at 4 fps.
+Use `--skip-weather-animation` to omit the weather and line-loading animations on later reruns.
+
+## Dataset packaging
+
+Package generated worlds into aligned static, dynamic, graph, and operation samples with:
+
+```bash
+python scripts/build_dataset.py
+```
+
+Each world seed is stored as one compressed file such as `samples/seed42.npz`. Metadata and the exact
+configuration snapshot are embedded in the same file; rendered PNG/WebP figures are excluded.
+
+Generate the default seed 1-50 dataset without figures, with resumable tqdm progress and a prime-seed
+validation/test split:
+
+```bash
+python scripts/generate_dataset.py
+```
+
+See `datasets/DATASET_USAGE.md` for generation and loading examples. Field definitions, units, graph semantics,
+and the observable-data inclusion policy are documented separately in `datasets/DATA_DESCRIPTION.md`.
+
+For model training, `scripts/train_physics_gst.py` preloads all selected train and validation worlds directly
+onto the target device by default. It caches world-level typed graph indices, bidirectional edges, static
+normalization results, and masks. Temporal windows remain lightweight indices and are prepared on demand rather
+than retained on CUDA. Use `runtime.preload_to_device: false` when the selected worlds do not fit in GPU memory.
+Checkpoints default to `checkpoints/<model>/seed_<seed>/<horizon>.pt`.
+All model, loss, window, optimizer, runtime, seed, and output settings live under `configs/models/`.
+
+Example: use one day to forecast the following day:
+
+```bash
+python scripts/train_physics_gst.py \
+  --config configs/models/physics_gst_24to24.yaml
+```
+
+Stage 14 solves a 168-hour multi-period DC optimal power flow. It enforces nodal active-power balance, DC branch flow and 90% operating limits, thermal capacity and hourly ramp limits, storage power/energy bounds, 20% minimum SOC, and equal SOC at the beginning and end of the week. If the existing system cannot serve all load, the same optimization plans minimum-cost thermal, storage, and line-capacity additions while keeping unserved load at zero.
+
+Both full and resumed runs show a stage-level `tqdm` progress bar.
 
 ## Figure Outputs
 
@@ -38,6 +100,17 @@ The figure outputs are split by generation stage so the intermediate products ca
 ### Stage 01: Terrain
 
 Folder: `outputs/<world_id>/figures/stage_01_terrain/`
+
+`configs/small_debug.yaml` uses the coordinate-stable `multiscale_v2` terrain. Noise is sampled in kilometer world coordinates with fixed continental, erosion, ridge, detail, and domain-warp wavelengths. Increasing the grid extent therefore reveals new terrain instead of rescaling the same normalized map. The legacy generator remains available with `terrain.algorithm: legacy`.
+
+Chunk consistency and the 64/128 km hydrology comparison can be regenerated with:
+
+```bash
+python scripts/compare_multiscale_terrain.py \
+  --config configs/small_debug.yaml \
+  --seed 42 \
+  --output outputs/terrain_v2_comparison_seed42
+```
 
 - `terrain_overview.png`: compact overview of elevation, slope, roughness, and curvature.
 - `elevation.png`: base terrain elevation in meters.
@@ -48,6 +121,8 @@ Folder: `outputs/<world_id>/figures/stage_01_terrain/`
 ### Stage 02: Hydrology
 
 Folder: `outputs/<world_id>/figures/stage_02_hydrology/`
+
+The `conditioned_v2` hydrology path fills closed DEM depressions for drainage, identifies bounded depression lakes, extracts streams from physical upstream catchment area, and scales river width from catchment size. The legacy quantile-based path remains available with `hydrology.algorithm: legacy`.
 
 - `hydrology_overview.png`: combined hydrology summary with terrain, water, flow accumulation, water distance, and flood risk.
 - `hydrology_elevation.png`: terrain elevation with river and lake overlays.
@@ -89,7 +164,7 @@ Folder: `outputs/<world_id>/figures/stage_05_daily_weather/`
 - `seasonal_irradiance.png`: representative seasonal irradiance maps.
 - `annual_weather_summary.png`: annual summary curves and distributions.
 
-The dynamic weather tensor in `data/daily_weather.npz` currently uses these channels:
+The dynamic weather tensor in `data/stage_05_weather/daily_weather.npz` currently uses these channels:
 
 ```text
 wind_u, wind_v, wind_speed, temperature, humidity, pressure, cloud, precipitation, irradiance

@@ -58,8 +58,9 @@ def generate_initial_cities(
     urban_core_suitability[water | protected] = 0.0
     urban_core_suitability = _normalize01(urban_core_suitability)
 
-    centers = _select_city_centers(urban_core_suitability, grid, config, rng)
-    cities = _build_city_nodes(centers, urban_core_suitability, grid, config, rng)
+    city_count, total_population = _resolve_city_targets(land, hydrology, grid, config, rng)
+    centers = _select_city_centers(urban_core_suitability, grid, config, rng, city_count)
+    cities = _build_city_nodes(centers, urban_core_suitability, grid, config, rng, total_population)
     population_density, economic_activity, urban_density, city_id_map = _spread_city_fields(
         cities,
         buildability,
@@ -110,6 +111,7 @@ def _select_city_centers(
     grid: WorldGridConfig,
     config: CityConfig,
     rng: np.random.Generator,
+    city_count: int,
 ) -> list[tuple[int, int]]:
     min_distance_cells = max(config.min_city_distance_km / max(grid.cell_size_km, 1e-6), 1.0)
     row_col = np.argwhere(suitability > np.quantile(suitability, 0.72))
@@ -123,9 +125,9 @@ def _select_city_centers(
         row, col = int(row_col[index, 0]), int(row_col[index, 1])
         if all(np.hypot(row - r0, col - c0) >= min_distance_cells for r0, c0 in centers):
             centers.append((row, col))
-            if len(centers) >= config.city_count:
+            if len(centers) >= city_count:
                 break
-    if len(centers) < config.city_count:
+    if len(centers) < city_count:
         fallback = np.argsort(-suitability.ravel())
         for flat_index in fallback:
             row, col = np.unravel_index(int(flat_index), suitability.shape)
@@ -133,9 +135,50 @@ def _select_city_centers(
                 break
             if all(np.hypot(row - r0, col - c0) >= min_distance_cells * 0.72 for r0, c0 in centers):
                 centers.append((int(row), int(col)))
-                if len(centers) >= config.city_count:
+                if len(centers) >= city_count:
                     break
     return centers
+
+
+def _resolve_city_targets(
+    land: StaticLandState,
+    hydrology: HydrologyState,
+    grid: WorldGridConfig,
+    config: CityConfig,
+    rng: np.random.Generator,
+) -> tuple[int, float]:
+    mode = config.scaling_mode.lower().strip()
+    if mode == "fixed":
+        return config.city_count, config.total_population
+    if mode != "scale_aware":
+        raise ValueError(f"Unsupported city scaling mode: {config.scaling_mode}")
+
+    effective_area_km2 = _effective_developable_area_km2(land, hydrology, grid)
+    area_ratio = max(effective_area_km2 / max(config.reference_effective_area_km2, 1e-6), 1e-6)
+
+    expected_count = max(
+        float(config.min_scaled_city_count),
+        float(config.city_count) * area_ratio ** config.city_count_area_exponent,
+    )
+    lower_count = int(np.floor(expected_count))
+    city_count = lower_count + int(rng.random() < expected_count - lower_count)
+    city_count = max(city_count, config.min_scaled_city_count)
+    total_population = float(config.total_population) * area_ratio ** config.population_area_exponent
+    return city_count, total_population
+
+
+def _effective_developable_area_km2(
+    land: StaticLandState,
+    hydrology: HydrologyState,
+    grid: WorldGridConfig,
+) -> float:
+    developable = np.clip(land.buildability, 0.0, 1.0) * (
+        1.0 - 0.75 * np.clip(hydrology.flood_risk, 0.0, 1.0)
+    )
+    blocked = hydrology.river | hydrology.lake | land.protected.astype(bool)
+    developable[blocked] = 0.0
+    cell_area_km2 = max(float(grid.cell_size_km), 1e-6) ** 2
+    return float(developable.sum()) * cell_area_km2
 
 
 def _edge_buffer(
@@ -158,6 +201,7 @@ def _build_city_nodes(
     grid: WorldGridConfig,
     config: CityConfig,
     rng: np.random.Generator,
+    total_population: float,
 ) -> list[CityNode]:
     if not centers:
         return []
@@ -165,7 +209,7 @@ def _build_city_nodes(
     ranks = np.argsort(np.argsort(-center_scores))
     size_weights = (len(centers) - ranks).astype(np.float32) ** config.city_size_alpha
     size_weights *= rng.uniform(0.85, 1.18, size=size_weights.shape).astype(np.float32)
-    populations = config.total_population * size_weights / max(float(size_weights.sum()), 1e-6)
+    populations = total_population * size_weights / max(float(size_weights.sum()), 1e-6)
     score_n = _normalize01(center_scores)
     cities = []
     for city_id, ((row, col), population, score) in enumerate(zip(centers, populations, score_n)):

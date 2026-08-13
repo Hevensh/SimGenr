@@ -42,7 +42,7 @@ def generate_source_load_forecast(
             p_available[:, bus_index] = float(max(bus.capacity_mw, 0.0))
 
     p_scheduled[:] = p_available
-    _dispatch_thermal(p_load, p_available, p_scheduled, tuple(bus.kind for bus in buses))
+    _dispatch_thermal(p_load, p_available, p_scheduled, buses)
     return SourceLoadForecastStore(
         timestamps=hourly_weather.timestamps.copy(),
         bus_ids=np.asarray([bus.bus_id for bus in buses], dtype=np.int32),
@@ -128,9 +128,11 @@ def _dispatch_thermal(
     p_load: np.ndarray,
     p_available: np.ndarray,
     p_scheduled: np.ndarray,
-    bus_kinds: tuple[str, ...],
+    buses: tuple[object, ...],
 ) -> None:
+    bus_kinds = tuple(str(bus.kind) for bus in buses)
     thermal_indices = [index for index, kind in enumerate(bus_kinds) if kind == "thermal_bus"]
+    load_indices = [index for index, kind in enumerate(bus_kinds) if kind == "load_bus"]
     renewable_indices = [index for index, kind in enumerate(bus_kinds) if kind in {"wind_bus", "pv_bus"}]
     p_scheduled[:, thermal_indices] = 0.0
     if not thermal_indices:
@@ -139,6 +141,54 @@ def _dispatch_thermal(
     renewable = p_available[:, renewable_indices].sum(axis=1) if renewable_indices else np.zeros(p_load.shape[0], dtype=np.float32)
     residual = np.maximum(total_load - renewable, 0.0)
     thermal_capacity = p_available[:, thermal_indices]
-    total_thermal = np.maximum(thermal_capacity.sum(axis=1), 1e-6)
-    p_scheduled[:, thermal_indices] = thermal_capacity * (residual / total_thermal)[:, None]
-    p_scheduled[:, thermal_indices] = np.minimum(p_scheduled[:, thermal_indices], thermal_capacity)
+    locality = _thermal_locality_weights(buses, thermal_indices, load_indices, renewable_indices)
+    for hour in range(p_load.shape[0]):
+        local_load = locality[0] @ p_load[hour, load_indices] if load_indices else np.zeros(len(thermal_indices))
+        local_renewable = (
+            locality[1] @ p_available[hour, renewable_indices]
+            if renewable_indices
+            else np.zeros(len(thermal_indices))
+        )
+        local_need = np.maximum(local_load - local_renewable, 0.0)
+        capacities = thermal_capacity[hour].astype(np.float64, copy=False)
+        priority = capacities * (0.15 + 0.85 * local_need / max(float(local_need.max()), 1e-6))
+        p_scheduled[hour, thermal_indices] = _allocate_with_capacity_limit(
+            float(residual[hour]),
+            capacities,
+            priority,
+        )
+
+
+def _thermal_locality_weights(
+    buses: tuple[object, ...],
+    thermal_indices: list[int],
+    load_indices: list[int],
+    renewable_indices: list[int],
+    half_distance_cells: float = 12.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    thermal_coords = np.asarray([(buses[index].row, buses[index].col) for index in thermal_indices], dtype=np.float64)
+    decay = max(float(half_distance_cells) / np.log(2.0), 1e-6)
+
+    def weights(indices: list[int]) -> np.ndarray:
+        if not indices:
+            return np.zeros((len(thermal_indices), 0), dtype=np.float64)
+        coords = np.asarray([(buses[index].row, buses[index].col) for index in indices], dtype=np.float64)
+        distance = np.linalg.norm(thermal_coords[:, None, :] - coords[None, :, :], axis=2)
+        return np.exp(-distance / decay)
+
+    return weights(load_indices), weights(renewable_indices)
+
+
+def _allocate_with_capacity_limit(target: float, capacities: np.ndarray, priority: np.ndarray) -> np.ndarray:
+    allocation = np.zeros_like(capacities, dtype=np.float64)
+    remaining = min(max(float(target), 0.0), float(np.sum(capacities)))
+    available = capacities > 1e-9
+    while remaining > 1e-7 and np.any(available):
+        weights = np.where(available, np.maximum(priority, 1e-9), 0.0)
+        proposal = remaining * weights / max(float(weights.sum()), 1e-9)
+        headroom = np.maximum(capacities - allocation, 0.0)
+        addition = np.minimum(proposal, headroom)
+        allocation += addition
+        remaining -= float(addition.sum())
+        available &= headroom - addition > 1e-7
+    return allocation.astype(np.float32)

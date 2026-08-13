@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import heapq
+
 import numpy as np
 
 from world_generator.core.config import HydrologyConfig, WorldGridConfig
@@ -28,6 +30,11 @@ def generate_hydrology(
     grid: WorldGridConfig,
     config: HydrologyConfig,
 ) -> HydrologyState:
+    if config.algorithm == "conditioned_v2":
+        return _generate_conditioned_hydrology(terrain, grid, config)
+    if config.algorithm != "legacy":
+        raise ValueError(f"Unknown hydrology algorithm: {config.algorithm}")
+
     elevation = terrain.elevation
     flow_elevation = _smooth_for_flow(elevation, config.flow_smoothing_steps)
     flow_direction = _compute_d8_flow_direction(flow_elevation, grid.cell_size_km)
@@ -72,6 +79,184 @@ def generate_hydrology(
         distance_to_water=distance_to_water.astype(np.float32),
         flood_risk=flood_risk.astype(np.float32),
     )
+
+
+def _generate_conditioned_hydrology(
+    terrain: TerrainFeatures,
+    grid: WorldGridConfig,
+    config: HydrologyConfig,
+) -> HydrologyState:
+    elevation = terrain.elevation.astype(np.float32)
+    flow_elevation = _smooth_for_flow(elevation, config.flow_smoothing_steps)
+    conditioned_elevation = _priority_flood_fill(
+        flow_elevation,
+        epsilon_m=max(float(config.depression_fill_epsilon_m), 0.0),
+    )
+    depression_depth = np.maximum(conditioned_elevation - flow_elevation, 0.0)
+    flow_direction = _compute_d8_flow_direction(conditioned_elevation, grid.cell_size_km)
+    flow_accumulation = _compute_flow_accumulation(conditioned_elevation, flow_direction)
+    catchment_area_km2 = flow_accumulation * float(grid.cell_size_km) ** 2
+    river_centerline = (
+        (catchment_area_km2 >= max(float(config.river_min_catchment_km2), 0.0))
+        & (flow_direction >= 0)
+    )
+    lake = _extract_depression_lakes(
+        depression_depth,
+        river_centerline,
+        cell_area_km2=float(grid.cell_size_km) ** 2,
+        config=config,
+    )
+    river = _expand_rivers_by_catchment(
+        river_centerline,
+        catchment_area_km2,
+        cell_size_km=float(grid.cell_size_km),
+        max_radius_cells=config.river_max_dilation_cells,
+        reference_catchment_km2=config.river_width_reference_catchment_km2,
+        exponent=config.river_width_exponent,
+    )
+    river &= ~lake
+    water = river | lake
+    water_depth = _assign_water_depth(river, lake, flow_accumulation, config)
+    if lake.any():
+        lake_depth = np.clip(depression_depth, 1.0, max(float(config.lake_depth_m), 1.0))
+        water_depth[lake] = np.maximum(water_depth[lake], lake_depth[lake])
+    hydrology_elevation = _carve_hydrology_elevation(elevation, water_depth)
+    distance_to_water = _distance_to_mask(water, grid.cell_size_km)
+    watershed_id = _label_watersheds(flow_direction)
+    flood_risk = _estimate_flood_risk(
+        elevation=elevation,
+        slope=terrain.slope,
+        flow_accumulation=flow_accumulation,
+        distance_to_water=distance_to_water,
+        decay_km=config.flood_water_decay_km,
+    )
+    return HydrologyState(
+        flow_direction=flow_direction.astype(np.int8),
+        flow_accumulation=flow_accumulation.astype(np.float32),
+        river_centerline=river_centerline,
+        river=river,
+        lake=lake,
+        water_depth=water_depth.astype(np.float32),
+        hydrology_elevation=hydrology_elevation.astype(np.float32),
+        watershed_id=watershed_id.astype(np.int32),
+        distance_to_water=distance_to_water.astype(np.float32),
+        flood_risk=flood_risk.astype(np.float32),
+    )
+
+
+def _priority_flood_fill(elevation: np.ndarray, epsilon_m: float) -> np.ndarray:
+    height, width = elevation.shape
+    if height == 0 or width == 0:
+        return elevation.astype(np.float32).copy()
+    filled = elevation.astype(np.float64).copy()
+    visited = np.zeros((height, width), dtype=bool)
+    queue: list[tuple[float, int, int]] = []
+
+    for row in range(height):
+        for col in (0, width - 1):
+            if not visited[row, col]:
+                visited[row, col] = True
+                heapq.heappush(queue, (float(filled[row, col]), row, col))
+    for col in range(width):
+        for row in (0, height - 1):
+            if not visited[row, col]:
+                visited[row, col] = True
+                heapq.heappush(queue, (float(filled[row, col]), row, col))
+
+    epsilon = max(float(epsilon_m), 0.0)
+    while queue:
+        current_height, row, col = heapq.heappop(queue)
+        for dr, dc in D8_OFFSETS:
+            rr = row + int(dr)
+            cc = col + int(dc)
+            if rr < 0 or rr >= height or cc < 0 or cc >= width or visited[rr, cc]:
+                continue
+            visited[rr, cc] = True
+            next_height = max(float(filled[rr, cc]), current_height + epsilon)
+            filled[rr, cc] = next_height
+            heapq.heappush(queue, (next_height, rr, cc))
+    return filled.astype(np.float32)
+
+
+def _extract_depression_lakes(
+    depression_depth: np.ndarray,
+    river_centerline: np.ndarray,
+    cell_area_km2: float,
+    config: HydrologyConfig,
+) -> np.ndarray:
+    lake = depression_depth >= max(float(config.lake_min_depth_m), 0.0)
+    lake = _filter_lake_components(
+        lake,
+        min_cells=config.lake_min_cells,
+        max_cells=max(int(np.floor(config.lake_max_area_km2 / max(cell_area_km2, 1e-9))), 1),
+    )
+    if not lake.any():
+        return lake
+    # Keep lakes as continuous basins. River centerlines may pass underneath but
+    # the rendered and categorical water surface remains the lake.
+    return lake
+
+
+def _filter_lake_components(mask: np.ndarray, min_cells: int, max_cells: int) -> np.ndarray:
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    kept = np.zeros_like(mask, dtype=bool)
+    for row in range(height):
+        for col in range(width):
+            if visited[row, col] or not mask[row, col]:
+                continue
+            stack = [(row, col)]
+            component: list[tuple[int, int]] = []
+            visited[row, col] = True
+            while stack:
+                rr, cc = stack.pop()
+                component.append((rr, cc))
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        if dr == 0 and dc == 0:
+                            continue
+                        nr = rr + dr
+                        nc = cc + dc
+                        if nr < 0 or nr >= height or nc < 0 or nc >= width:
+                            continue
+                        if visited[nr, nc] or not mask[nr, nc]:
+                            continue
+                        visited[nr, nc] = True
+                        stack.append((nr, nc))
+            if min_cells <= len(component) <= max_cells:
+                for rr, cc in component:
+                    kept[rr, cc] = True
+    return kept
+
+
+def _expand_rivers_by_catchment(
+    river_centerline: np.ndarray,
+    catchment_area_km2: np.ndarray,
+    cell_size_km: float,
+    max_radius_cells: int,
+    reference_catchment_km2: float,
+    exponent: float,
+) -> np.ndarray:
+    expanded = river_centerline.copy()
+    if max_radius_cells <= 0 or not river_centerline.any():
+        return expanded
+    reference = max(float(reference_catchment_km2), cell_size_km * cell_size_km)
+    power = max(float(exponent), 0.0)
+    height, width = river_centerline.shape
+    for row, col in np.argwhere(river_centerline):
+        relative_width = (float(catchment_area_km2[row, col]) / reference) ** power
+        radius = min(max_radius_cells, max(0, int(np.floor(relative_width))))
+        if radius <= 0:
+            continue
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                if np.hypot(dr, dc) > radius + 0.15:
+                    continue
+                rr = row + dr
+                cc = col + dc
+                if 0 <= rr < height and 0 <= cc < width:
+                    expanded[rr, cc] = True
+    return expanded
 
 
 def _compute_d8_flow_direction(elevation: np.ndarray, cell_size_km: float) -> np.ndarray:

@@ -1,0 +1,19 @@
+benchmark:
+  device: cuda
+  seed: 1
+  window_index: 0
+  warmup_iterations: 3
+  measured_iterations: 10
+  module_warmup_iterations: 20
+  module_measured_iterations: 100
+  output_dir: checkpoints/results/inference_speed
+
+models:
+  - config: configs/models/gru_gnn_physics_24to24.yaml
+    checkpoint: null
+  - config: configs/models/attn_gnn_physics_24to24.yaml
+    checkpoint: null
+  - config: configs/models/lstm_24to24.yaml
+    checkpoint: null
+  - config: configs/models/gru_24to24.yaml
+    checkpoint: null

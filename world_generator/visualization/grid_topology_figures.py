@@ -133,4 +133,4 @@ def _scatter_mask(ax: object, mask: np.ndarray, marker: str, color: str, size: i
     rows, cols = np.where(mask)
     if rows.size == 0:
         return
-    ax.scatter(cols, rows, s=size, c=color, edgecolors="black", linewidths=0.65, marker=marker, label=label, zorder=5)
+    ax.scatter(cols, rows, s=size, c=color, edgecolors="black", linewidths=0.5, marker=marker, label=label, zorder=5)

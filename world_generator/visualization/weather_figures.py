@@ -22,7 +22,7 @@ WEATHER_FILES = [
 
 HOURLY_WEATHER_FILES = [
     "hourly/hourly_weather_week_overview.png",
-    "hourly/hourly_weather_fields.gif",
+    "hourly/hourly_weather_fields.webp",
 ]
 
 
@@ -32,7 +32,7 @@ def save_weather_figures(
     hourly_weather: WeatherStore | None = None,
     static_maps: dict[str, np.ndarray] | None = None,
     *,
-    render_hourly_gif: bool = True,
+    render_hourly_animation: bool = True,
 ) -> list[str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     daily_dir = output_dir / "daily"
@@ -60,9 +60,9 @@ def save_weather_figures(
         hourly_dir.mkdir(parents=True, exist_ok=True)
         _save_hourly_weather_week_overview(hourly_weather, hourly_dir / "hourly_weather_week_overview.png")
         files.append("hourly/hourly_weather_week_overview.png")
-        if static_maps is not None and render_hourly_gif:
-            _save_hourly_weather_gif(static_maps, hourly_weather, hourly_dir / "hourly_weather_fields.gif")
-            files.append("hourly/hourly_weather_fields.gif")
+        if static_maps is not None and render_hourly_animation:
+            _save_hourly_weather_animation(static_maps, hourly_weather, hourly_dir / "hourly_weather_fields.webp")
+            files.append("hourly/hourly_weather_fields.webp")
     return files
 
 
@@ -163,9 +163,9 @@ def _save_hourly_weather_week_overview(weather: WeatherStore, path: Path) -> Non
     plt.close(fig)
 
 
-def _save_hourly_weather_gif(static_maps: dict[str, np.ndarray], weather: WeatherStore, path: Path) -> None:
+def _save_hourly_weather_animation(static_maps: dict[str, np.ndarray], weather: WeatherStore, path: Path) -> None:
     import matplotlib.pyplot as plt
-    from matplotlib.animation import FuncAnimation, PillowWriter
+    from matplotlib.animation import FuncAnimation
     from matplotlib.cm import ScalarMappable
     from matplotlib.colors import Normalize
 
@@ -210,7 +210,9 @@ def _save_hourly_weather_gif(static_maps: dict[str, np.ndarray], weather: Weathe
         return tuple(image for image, _, _ in images) + (suptitle,)
 
     animation = FuncAnimation(fig, update, frames=weather.dynamic.shape[0], interval=200, blit=False)
-    animation.save(path, writer=PillowWriter(fps=4), dpi=120)
+    from world_generator.visualization.common import save_animation_webp
+
+    save_animation_webp(animation, path, fps=4, dpi=130)
     plt.close(fig)
 
 

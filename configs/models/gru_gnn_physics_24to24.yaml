@@ -1,0 +1,56 @@
+experiment:
+  name: gru_gnn_physics
+
+model:
+  type: gru_gnn
+  parameters:
+    hidden_dim: 512
+    attention_heads: 8
+    graph_layers: 1
+    graph_gate_init: -2.0
+    dropout: 0.10
+
+loss:
+  physics_enabled: true
+  balance_weight: 0.01
+  loading_weight: 0.25
+  ramp_weight: 0.02
+  nonnegative_weight: 0.0
+  line_capacity_weight: 0.0
+  loading_consistency_weight: 0.0
+
+normalization:
+  method: quantile
+  left_quantile: 5
+  right_quantile: 95
+  left_clip: 1
+  right_clip: 1
+  max_samples: 500000
+
+data:
+  dataset: datasets/seed_1_50
+  history_hours: 24
+  forecast_hours: 24
+  stride: 24
+
+training:
+  epochs: 20
+  gradient_clip_norm: 1.0
+  max_train_windows: 0
+  max_eval_windows: 0
+
+optimizer:
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+
+evaluation:
+  selection_loss: total
+  evaluate_test: true
+
+runtime:
+  device: cuda
+  preload_to_device: true
+  initialization_seed: 2026
+
+output:
+  path: null

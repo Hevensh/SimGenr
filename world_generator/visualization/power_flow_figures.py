@@ -13,6 +13,7 @@ from world_generator.visualization.common import (
     edge_line_xy,
     format_hour_timestamp,
     line_width_for_multiplier,
+    save_animation_webp,
 )
 from world_generator.visualization.weather_figures import _cloud_rgba
 
@@ -22,6 +23,9 @@ POWER_FLOW_FILES = [
     "line_loading_mean.png",
     "grid_operation_timeseries.png",
 ]
+
+DEFAULT_NODE_EDGE_WIDTH = 0.5
+DEFAULT_TRANSIT_MARKER_SIZE = 36.9
 
 
 def save_power_flow_figures(
@@ -182,7 +186,10 @@ def _transit_node_styles(
         mean_color = np.mean(np.stack(colors), axis=0)
         mean_multiplier = float(np.mean(multipliers_by_bus[bus_id]))
         marker_size = float(np.clip(34.0 * mean_multiplier, 23.9, 69.3))
-        marker_edge_width = 0.30 * line_width_for_multiplier(mean_multiplier)
+        marker_edge_width = DEFAULT_NODE_EDGE_WIDTH * min(
+            1.0,
+            np.sqrt(marker_size / DEFAULT_TRANSIT_MARKER_SIZE),
+        )
         styles[bus_id] = (tuple(float(value) for value in mean_color), marker_size, marker_edge_width)
     return styles
 
@@ -202,7 +209,7 @@ def _draw_operation_nodes(
         "wind": ("wind_bus", "#36d7ff", "^", 46.8),
         "solar": ("pv_bus", "#ffcf33", "s", 43.2),
         "thermal": ("thermal_bus", "#ff7a33", "D", 46.8),
-        "transit": ("transit_bus", "#fff4a8", "P", 36.9),
+        "transit": ("transit_bus", "#fff4a8", "P", DEFAULT_TRANSIT_MARKER_SIZE),
     }
     bus_kind = _bus_kind_lookup(buses, static_maps)
     artists: dict[str, object] = {}
@@ -213,9 +220,9 @@ def _draw_operation_nodes(
         values = np.asarray(rows)
         colors = color
         sizes: float | list[float] = size
-        edge_widths: float | list[float] = 0.585
+        edge_widths: float | list[float] = DEFAULT_NODE_EDGE_WIDTH
         if kind == "transit_bus" and transit_styles:
-            fallback = ((1.0, 0.96, 0.66, 1.0), size, 0.585)
+            fallback = ((1.0, 0.96, 0.66, 1.0), size, DEFAULT_NODE_EDGE_WIDTH)
             colors = [transit_styles.get(int(row[0]), fallback)[0] for row in rows]
             sizes = [transit_styles.get(int(row[0]), fallback)[1] for row in rows]
             edge_widths = [transit_styles.get(int(row[0]), fallback)[2] for row in rows]
@@ -258,7 +265,7 @@ def _draw_operation_nodes(
     return artists
 
 
-def save_line_loading_gif(
+def save_line_loading_animation(
     static_maps: dict[str, np.ndarray],
     power_flow: PowerFlowStore,
     hourly_weather: WeatherStore,
@@ -267,7 +274,7 @@ def save_line_loading_gif(
     show_weather: bool = True,
 ) -> None:
     import matplotlib.pyplot as plt
-    from matplotlib.animation import FuncAnimation, PillowWriter
+    from matplotlib.animation import FuncAnimation
     from matplotlib.cm import ScalarMappable
     from matplotlib.colors import Normalize
 
@@ -288,19 +295,17 @@ def save_line_loading_gif(
     fig, ax = plt.subplots(figsize=(7.2, 6.2), constrained_layout=True)
     draw_elevation_with_water_overlay(ax, static_maps)
     draw_built_environment_texture(ax, static_maps, scale=3)
-    light_artist = None
-    cloud_artist = None
+    weather_artist = None
+    weather_overlays = None
     if show_weather:
-        initial_hour = int(hourly_weather.timestamps[0]) % 24
-        initial_shade = _twilight_shade_rgba(cloud[0].shape, initial_hour)
-        light_artist = ax.imshow(
-            initial_shade,
-            origin="upper",
-            interpolation="nearest",
-            zorder=2.8,
+        weather_overlays = np.stack(
+            [
+                _weather_overlay_rgba(cloud[frame], int(hourly_weather.timestamps[frame]) % 24)
+                for frame in range(frame_count)
+            ]
         )
-        cloud_artist = ax.imshow(
-            _tinted_cloud_rgba(cloud[0], initial_shade[0, 0]),
+        weather_artist = ax.imshow(
+            weather_overlays[0],
             origin="upper",
             interpolation="nearest",
             zorder=3,
@@ -344,30 +349,45 @@ def save_line_loading_gif(
             if artist is not None:
                 artist.set_color(color)
                 changed.append(artist)
-        if light_artist is not None and cloud_artist is not None:
-            local_hour = int(hourly_weather.timestamps[frame]) % 24
-            shade = _twilight_shade_rgba(cloud[frame].shape, local_hour)
-            light_artist.set_data(shade)
-            cloud_artist.set_data(_tinted_cloud_rgba(cloud[frame], shade[0, 0]))
-            changed.extend((light_artist, cloud_artist))
+        if weather_artist is not None and weather_overlays is not None:
+            weather_artist.set_data(weather_overlays[frame])
+            changed.append(weather_artist)
         title.set_text(format_hour_timestamp(int(hourly_weather.timestamps[frame])))
         transit_artist = node_artists.get("transit_bus")
         if transit_artist is not None and transit_rows:
             styles = _transit_node_styles(edges, colors, capacity_multipliers)
             transit_artist.set_facecolors(
-                [styles.get(int(row[0]), ((1.0, 0.96, 0.66, 1.0), 36.9, 0.585))[0] for row in transit_rows]
+                [
+                    styles.get(
+                        int(row[0]),
+                        ((1.0, 0.96, 0.66, 1.0), DEFAULT_TRANSIT_MARKER_SIZE, DEFAULT_NODE_EDGE_WIDTH),
+                    )[0]
+                    for row in transit_rows
+                ]
             )
             transit_artist.set_sizes(
-                [styles.get(int(row[0]), ((1.0, 0.96, 0.66, 1.0), 36.9, 0.585))[1] for row in transit_rows]
+                [
+                    styles.get(
+                        int(row[0]),
+                        ((1.0, 0.96, 0.66, 1.0), DEFAULT_TRANSIT_MARKER_SIZE, DEFAULT_NODE_EDGE_WIDTH),
+                    )[1]
+                    for row in transit_rows
+                ]
             )
             transit_artist.set_linewidths(
-                [styles.get(int(row[0]), ((1.0, 0.96, 0.66, 1.0), 36.9, 0.585))[2] for row in transit_rows]
+                [
+                    styles.get(
+                        int(row[0]),
+                        ((1.0, 0.96, 0.66, 1.0), DEFAULT_TRANSIT_MARKER_SIZE, DEFAULT_NODE_EDGE_WIDTH),
+                    )[2]
+                    for row in transit_rows
+                ]
             )
             changed.append(transit_artist)
         return tuple(changed)
 
-    animation = FuncAnimation(fig, update, frames=frame_count, interval=200, blit=False)
-    animation.save(path, writer=PillowWriter(fps=4), dpi=120)
+    animation = FuncAnimation(fig, update, frames=frame_count, interval=250, blit=True)
+    save_animation_webp(animation, path, fps=4, dpi=130)
     plt.close(fig)
 
 
@@ -408,6 +428,25 @@ def _tinted_cloud_rgba(cloud: np.ndarray, shade: np.ndarray) -> np.ndarray:
     tint_weight = np.clip(float(shade[3]) / 0.50, 0.0, 1.0) / 3.0
     rgba[..., :3] = (1.0 - tint_weight) * rgba[..., :3] + tint_weight * shade[:3]
     return rgba
+
+
+def _weather_overlay_rgba(cloud: np.ndarray, local_hour: int) -> np.ndarray:
+    shade = _twilight_shade_rgba(cloud.shape, local_hour)
+    cloud_rgba = _tinted_cloud_rgba(cloud, shade[0, 0])
+    top_alpha = cloud_rgba[..., 3:4]
+    bottom_alpha = shade[..., 3:4]
+    out_alpha = top_alpha + bottom_alpha * (1.0 - top_alpha)
+    premultiplied = (
+        cloud_rgba[..., :3] * top_alpha
+        + shade[..., :3] * bottom_alpha * (1.0 - top_alpha)
+    )
+    rgb = np.divide(
+        premultiplied,
+        np.maximum(out_alpha, 1e-8),
+        out=np.zeros_like(premultiplied),
+        where=out_alpha > 1e-8,
+    )
+    return np.concatenate((rgb, out_alpha), axis=-1).astype(np.float32)
 
 
 def _smoothstep(value: float) -> float:

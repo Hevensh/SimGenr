@@ -30,6 +30,13 @@ def build_grid_topology(
     )
     redundant_edges = _prune_bad_redundant_edges(tree_edges, redundant_edges, grid_nodes.buses)
     redundant_edges = _top_up_redundant_edges(candidates, tree_edges, redundant_edges, grid_nodes.buses, config)
+    redundant_edges = _flow_top_up_edges(
+        candidates,
+        tree_edges,
+        redundant_edges,
+        grid_nodes.buses,
+        config,
+    )
     edges = _make_edges(tree_edges, redundant_edges)
     line_route_map, grid_edge_map = _edge_maps(routing_cost.shape, edges)
     return GridTopologyState(
@@ -79,7 +86,8 @@ def _candidate_edges(
 
     _add_load_cluster_generation_edges(candidates, buses, routing_cost, grid, config)
 
-    if len(candidates) < max(len(buses) - 1, 1):
+    candidate_list = sorted(candidates.values(), key=lambda item: float(item["route_cost"]))
+    if len(_minimum_spanning_edges(candidate_list, len(buses))) < max(len(buses) - 1, 0):
         for a, b in itertools.combinations(range(len(buses)), 2):
             key = (a, b)
             if key in candidates:
@@ -572,6 +580,214 @@ def _top_up_redundant_edges(
         _increment_external_generation_degree(edge, bus_by_id, external_degree)
         available = [item for item in available if _edge_pair(item) not in selected_pairs]
     return redundant_edges
+
+
+def _flow_top_up_edges(
+    candidates: list[dict[str, object]],
+    tree_edges: list[dict[str, object]],
+    redundant_edges: list[dict[str, object]],
+    buses: tuple[GridBus, ...],
+    config: PowerGridConfig,
+) -> list[dict[str, object]]:
+    max_edges = max(int(config.flow_topup_max_edges), 0)
+    if max_edges == 0 or len(buses) < 2:
+        return redundant_edges
+
+    selected = list(tree_edges) + list(redundant_edges)
+    selected_pairs = {_edge_pair(edge) for edge in selected}
+    bus_by_id = {bus.bus_id: bus for bus in buses}
+    available = [edge for edge in candidates if _edge_pair(edge) not in selected_pairs]
+
+    for _ in range(max_edges):
+        current_peak, current_objective = _representative_flow_score(selected, buses)
+        if current_peak <= float(config.flow_topup_target_loading):
+            break
+        viable = [
+            edge
+            for edge in available
+            if not _is_bad_redundant_edge(edge, selected_pairs | {_edge_pair(edge)}, bus_by_id)
+            and not any(_edges_cross(edge, other) for other in selected)
+        ]
+        best_edge: dict[str, object] | None = None
+        best_utility = 0.0
+        best_peak_relief = 0.0
+        for edge in viable:
+            new_peak, new_objective = _representative_flow_score(selected + [edge], buses)
+            peak_relief = current_peak - new_peak
+            objective_relief = current_objective - new_objective
+            cost = max(float(edge["route_cost"]), 1e-6)
+            utility = (objective_relief + max(peak_relief, 0.0)) / cost
+            if peak_relief >= float(config.flow_topup_min_relief) and utility > best_utility:
+                best_edge = edge
+                best_utility = utility
+                best_peak_relief = peak_relief
+        if best_edge is None or best_peak_relief < float(config.flow_topup_min_relief):
+            break
+        redundant_edges.append(best_edge)
+        selected.append(best_edge)
+        selected_pairs.add(_edge_pair(best_edge))
+        available = [edge for edge in available if _edge_pair(edge) not in selected_pairs]
+    return redundant_edges
+
+
+def _representative_flow_score(
+    edges: list[dict[str, object]],
+    buses: tuple[GridBus, ...],
+) -> tuple[float, float]:
+    if not edges:
+        return float("inf"), float("inf")
+    scenarios = (
+        (0.70, 0.10, 0.00),
+        (0.62, 0.70, 0.08),
+        (0.62, 0.25, 0.65),
+        (0.60, 0.30, 0.25),
+    )
+    peak = 0.0
+    overload = 0.0
+    for load_fraction, wind_fraction, solar_fraction in scenarios:
+        injections = _representative_injections(
+            buses,
+            load_fraction,
+            wind_fraction,
+            solar_fraction,
+        )
+        loading = _dc_edge_loading(edges, buses, injections)
+        if loading.size:
+            peak = max(peak, float(np.max(loading)))
+            overload += float(np.sum(np.maximum(loading - 1.0, 0.0) ** 2))
+    return peak, peak + 0.25 * overload
+
+
+def _representative_injections(
+    buses: tuple[GridBus, ...],
+    load_fraction: float,
+    wind_fraction: float,
+    solar_fraction: float,
+) -> np.ndarray:
+    injections = np.zeros(len(buses), dtype=np.float64)
+    load_indices = [index for index, bus in enumerate(buses) if bus.kind == "load_bus"]
+    thermal_indices = [index for index, bus in enumerate(buses) if bus.kind == "thermal_bus"]
+    renewable_indices = [index for index, bus in enumerate(buses) if bus.kind in {"wind_bus", "pv_bus"}]
+    for index, bus in enumerate(buses):
+        if bus.kind == "load_bus":
+            injections[index] = -load_fraction * float(bus.capacity_mw)
+        elif bus.kind == "wind_bus":
+            injections[index] = wind_fraction * float(bus.capacity_mw)
+        elif bus.kind == "pv_bus":
+            injections[index] = solar_fraction * float(bus.capacity_mw)
+
+    residual = max(float(-np.sum(injections)), 0.0)
+    if thermal_indices and residual > 0.0:
+        weights = _thermal_dispatch_weights(buses, thermal_indices, load_indices, renewable_indices)
+        capacities = np.asarray([buses[index].capacity_mw for index in thermal_indices], dtype=np.float64)
+        thermal_output = _capacity_limited_allocation(residual, weights, capacities)
+        injections[np.asarray(thermal_indices, dtype=np.int32)] += thermal_output
+
+    imbalance = float(np.sum(injections))
+    slack_candidates = thermal_indices or renewable_indices
+    if slack_candidates:
+        slack = max(slack_candidates, key=lambda index: float(buses[index].capacity_mw))
+        injections[slack] -= imbalance
+    return injections
+
+
+def _thermal_dispatch_weights(
+    buses: tuple[GridBus, ...],
+    thermal_indices: list[int],
+    load_indices: list[int],
+    renewable_indices: list[int],
+) -> np.ndarray:
+    if not thermal_indices:
+        return np.zeros(0, dtype=np.float64)
+    half_distance_cells = 12.0
+    weights = np.zeros(len(thermal_indices), dtype=np.float64)
+    for output_index, thermal_index in enumerate(thermal_indices):
+        thermal = buses[thermal_index]
+        nearby_load = sum(
+            float(buses[index].capacity_mw)
+            * np.exp(-np.hypot(buses[index].row - thermal.row, buses[index].col - thermal.col) / half_distance_cells)
+            for index in load_indices
+        )
+        nearby_renewable = sum(
+            float(buses[index].capacity_mw)
+            * np.exp(-np.hypot(buses[index].row - thermal.row, buses[index].col - thermal.col) / half_distance_cells)
+            for index in renewable_indices
+        )
+        weights[output_index] = max(nearby_load - 0.35 * nearby_renewable, 0.0)
+    if float(weights.sum()) <= 1e-9:
+        weights[:] = 1.0
+    return weights
+
+
+def _capacity_limited_allocation(total: float, weights: np.ndarray, capacities: np.ndarray) -> np.ndarray:
+    output = np.zeros_like(capacities, dtype=np.float64)
+    remaining = max(float(total), 0.0)
+    active = capacities > 1e-9
+    while remaining > 1e-9 and np.any(active):
+        active_weights = np.where(active, np.maximum(weights, 0.0), 0.0)
+        if float(active_weights.sum()) <= 1e-9:
+            active_weights = active.astype(np.float64)
+        proposal = remaining * active_weights / float(active_weights.sum())
+        room = np.maximum(capacities - output, 0.0)
+        addition = np.minimum(proposal, room)
+        output += addition
+        delivered = float(addition.sum())
+        remaining -= delivered
+        active = room - addition > 1e-9
+        if delivered <= 1e-9:
+            break
+    return output
+
+
+def _dc_edge_loading(
+    edges: list[dict[str, object]],
+    buses: tuple[GridBus, ...],
+    injections: np.ndarray,
+) -> np.ndarray:
+    bus_index = {bus.bus_id: index for index, bus in enumerate(buses)}
+    matrix = np.zeros((len(buses), len(buses)), dtype=np.float64)
+    susceptances = np.zeros(len(edges), dtype=np.float64)
+    ratings = np.zeros(len(edges), dtype=np.float64)
+    for edge_index, edge in enumerate(edges):
+        first = bus_index[int(edge["from_bus"])]
+        second = bus_index[int(edge["to_bus"])]
+        first_bus, second_bus = buses[first], buses[second]
+        voltage = _surrogate_line_voltage(float(edge["length_km"]), first_bus, second_bus)
+        x_per_km = 0.32 if voltage >= 200.0 else 0.40
+        x_pu = max(x_per_km * float(edge["length_km"]) / (voltage**2 / 100.0), 1e-6)
+        susceptance = 100.0 / x_pu
+        susceptances[edge_index] = susceptance
+        matrix[first, first] += susceptance
+        matrix[second, second] += susceptance
+        matrix[first, second] -= susceptance
+        matrix[second, first] -= susceptance
+        base_rating = 260.0 if voltage >= 200.0 else 120.0
+        capacity_floor = 1.35 * max(float(first_bus.capacity_mw), float(second_bus.capacity_mw))
+        ratings[edge_index] = max(base_rating, capacity_floor)
+
+    generator_indices = [index for index, bus in enumerate(buses) if bus.kind in {"thermal_bus", "wind_bus", "pv_bus"}]
+    slack = max(generator_indices, key=lambda index: float(buses[index].capacity_mw)) if generator_indices else 0
+    keep = np.asarray([index for index in range(len(buses)) if index != slack], dtype=np.int32)
+    angles = np.zeros(len(buses), dtype=np.float64)
+    if keep.size:
+        reduced = matrix[np.ix_(keep, keep)]
+        try:
+            angles[keep] = np.linalg.solve(reduced, injections[keep])
+        except np.linalg.LinAlgError:
+            return np.full(len(edges), np.inf, dtype=np.float64)
+    flows = np.zeros(len(edges), dtype=np.float64)
+    for edge_index, edge in enumerate(edges):
+        first = bus_index[int(edge["from_bus"])]
+        second = bus_index[int(edge["to_bus"])]
+        flows[edge_index] = susceptances[edge_index] * (angles[first] - angles[second])
+    return np.abs(flows) / np.maximum(ratings, 1e-6)
+
+
+def _surrogate_line_voltage(length_km: float, first: GridBus, second: GridBus) -> float:
+    endpoint_capacity = max(float(first.capacity_mw), float(second.capacity_mw))
+    if first.kind == "thermal_bus" or second.kind == "thermal_bus" or length_km >= 6.0 or endpoint_capacity >= 150.0:
+        return 220.0
+    return 110.0
 
 
 def _is_bad_redundant_edge(

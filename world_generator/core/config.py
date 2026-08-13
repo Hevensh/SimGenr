@@ -10,23 +10,35 @@ class WorldGridConfig:
     height: int = 64
     width: int = 64
     cell_size_km: float = 2.0
+    origin_x_km: float = 0.0
+    origin_y_km: float = 0.0
 
 
 @dataclass(frozen=True)
 class TerrainConfig:
+    algorithm: str = "legacy"
     octaves: int = 6
     mountain_ridges: int = 4
     basins: int = 2
-    elevation_min_m: float = 0.0
-    elevation_max_m: float = 2500.0
+    lowland_elevation_min_m: float = 100.0
+    lowland_elevation_max_m: float = 800.0
+    relief_mean_m: float = 2500.0
+    relief_std_m: float = 500.0
     plainness: float = 0.35
     ridge_strength: float = 0.42
     basin_strength: float = 0.22
     boundary_falloff: float = 0.08
+    continent_wavelength_km: float = 192.0
+    erosion_wavelength_km: float = 64.0
+    ridge_wavelength_km: float = 36.0
+    detail_wavelength_km: float = 18.0
+    domain_warp_wavelength_km: float = 96.0
+    domain_warp_amplitude_km: float = 14.0
 
 
 @dataclass(frozen=True)
 class HydrologyConfig:
+    algorithm: str = "legacy"
     river_threshold_quantile: float = 0.98
     river_max_dilation_cells: int = 1
     river_dilation_min_strength: float = 0.72
@@ -41,6 +53,12 @@ class HydrologyConfig:
     river_depth_max_m: float = 28.0
     lake_depth_m: float = 18.0
     flood_water_decay_km: float = 4.0
+    river_min_catchment_km2: float = 32.0
+    river_width_reference_catchment_km2: float = 128.0
+    river_width_exponent: float = 0.35
+    lake_min_depth_m: float = 6.0
+    lake_max_area_km2: float = 80.0
+    depression_fill_epsilon_m: float = 0.02
 
 
 @dataclass(frozen=True)
@@ -113,9 +131,14 @@ class WeatherConfig:
 
 @dataclass(frozen=True)
 class CityConfig:
+    scaling_mode: str = "fixed"
     city_count: int = 8
     min_city_distance_km: float = 8.0
     total_population: float = 1_200_000.0
+    reference_effective_area_km2: float = 1_400.0
+    city_count_area_exponent: float = 0.80
+    population_area_exponent: float = 0.90
+    min_scaled_city_count: int = 1
     core_water_min_distance_km: float = 1.0
     water_access_optimal_km: float = 4.0
     water_access_sigma_km: float = 3.0
@@ -185,6 +208,9 @@ class PowerGridConfig:
     thermal_residential_buffer_km: float = 4.0
     thermal_capacity_min_mw: float = 80.0
     thermal_capacity_max_mw: float = 260.0
+    thermal_adequacy_load_fraction: float = 0.68
+    thermal_wind_capacity_credit: float = 0.10
+    thermal_solar_capacity_credit: float = 0.12
     thermal_min_distance_km: float = 8.0
     thermal_min_generation_distance_km: float = 2.5
     thermal_min_renewable_distance_km: float = 3.0
@@ -200,6 +226,9 @@ class PowerGridConfig:
     load_cluster_generation_links: int = 2
     load_cluster_external_degree_penalty: float = 0.70
     generation_cluster_external_degree_penalty: float = 0.55
+    flow_topup_max_edges: int = 6
+    flow_topup_target_loading: float = 0.95
+    flow_topup_min_relief: float = 0.02
     line_water_penalty: float = 2.8
     line_protected_penalty: float = 3.5
     line_slope_penalty: float = 1.6
@@ -213,8 +242,54 @@ class PowerGridConfig:
     min_line_multiplier: float = 0.125
     max_upgrade_factor: float = 4.0
     merged_line_target_loading: float = 0.80
+    near_parallel_max_distance_km: float = 2.0
+    near_parallel_max_angle_deg: float = 20.0
+    near_parallel_min_length_km: float = 4.0
+    near_parallel_corridor_radius_km: float = 2.0
+    near_parallel_min_cost_improvement: float = 0.05
     low_utilization_peak_ratio: float = 0.45
     downgrade_max_network_loading: float = 0.90
+
+
+@dataclass(frozen=True)
+class StorageConfig:
+    congestion_trigger_ratio: float = 0.90
+    congestion_decay_hops: float = 2.0
+    minimum_duration_hours: float = 2.0
+    maximum_duration_hours: float = 8.0
+    congestion_storage_max_active_fraction: float = 0.35
+    map_spread_radius_km: float = 4.0
+    site_max_count: int = 5
+    site_min_need_score: float = 0.55
+    site_coverage_decay_hops: float = 1.8
+    site_max_service_hops: int = 4
+    site_min_residual_fraction: float = 0.12
+    capacity_reserve_margin: float = 1.15
+    initial_soc_fraction: float = 0.50
+    charge_efficiency: float = 0.95
+    discharge_efficiency: float = 0.95
+    minimum_soc_fraction: float = 0.20
+    maximum_soc_fraction: float = 0.90
+    preferred_soc_lower_fraction: float = 0.40
+    preferred_soc_upper_fraction: float = 0.70
+    normal_dispatch_c_rate: float = 0.20
+    storage_power_ramp_fraction_per_hour: float = 0.25
+    thermal_ramp_fraction_per_hour: float = 0.30
+    thermal_operating_limit_ratio: float = 0.90
+    line_operating_limit_ratio: float = 0.90
+    max_thermal_expansion_mw_per_bus: float = 100.0
+    max_storage_power_expansion_fraction: float = 1.0
+    max_storage_energy_expansion_fraction: float = 1.0
+    max_line_expansion_fraction: float = 1.0
+    thermal_capacity_cost: float = 1000.0
+    storage_power_cost: float = 350.0
+    storage_energy_cost: float = 240.0
+    line_capacity_cost_per_mva_km: float = 4.0
+    thermal_dispatch_cost: float = 1.0
+    storage_cycle_cost: float = 0.50
+    emergency_discharge_cost: float = 4.0
+    soc_band_penalty: float = 2.0
+    renewable_dispatch_credit: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -236,6 +311,7 @@ class WorldConfig:
     land_use: LandUseConfig = field(default_factory=LandUseConfig)
     energy: EnergyConfig = field(default_factory=EnergyConfig)
     power_grid: PowerGridConfig = field(default_factory=PowerGridConfig)
+    storage: StorageConfig = field(default_factory=StorageConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
 
     def to_dict(self) -> dict[str, Any]:
@@ -256,6 +332,7 @@ def load_world_config(path: str | Path) -> WorldConfig:
         land_use=LandUseConfig(**data.get("land_use", {})),
         energy=EnergyConfig(**data.get("energy", {})),
         power_grid=PowerGridConfig(**data.get("power_grid", {})),
+        storage=StorageConfig(**data.get("storage", {})),
         output=OutputConfig(**data.get("output", {})),
     )
 

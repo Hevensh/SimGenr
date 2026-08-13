@@ -62,7 +62,7 @@ def generate_static_land(
     terrain_cost[water] = 1.0
 
     buildability = 1.0 - terrain_cost
-    buildability[terrain.slope >= config.steep_slope_threshold] *= 0.35
+    buildability *= _steep_slope_multiplier(terrain.slope, config.steep_slope_threshold)
     buildability[flood >= config.high_flood_threshold] *= 0.45
     buildability[water | protected] = 0.0
     buildability = np.clip(buildability, 0.0, 1.0).astype(np.float32)
@@ -145,3 +145,13 @@ def _normalize01(values: np.ndarray) -> np.ndarray:
     if vmax - vmin < 1e-12:
         return np.zeros_like(values, dtype=np.float32)
     return ((values - vmin) / (vmax - vmin)).astype(np.float32)
+
+
+def _steep_slope_multiplier(slope: np.ndarray, threshold: float) -> np.ndarray:
+    if threshold <= 0.0:
+        return np.full_like(slope, 0.35, dtype=np.float32)
+    lower = 0.75 * float(threshold)
+    upper = 1.25 * float(threshold)
+    progress = np.clip((slope - lower) / max(upper - lower, 1e-6), 0.0, 1.0)
+    eased = 0.5 - 0.5 * np.cos(np.pi * progress)
+    return (1.0 - 0.65 * eased).astype(np.float32)

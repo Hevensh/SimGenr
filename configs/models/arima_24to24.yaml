@@ -1,0 +1,25 @@
+model:
+  type: arima
+  order: [2, 0, 1]
+  max_train_series_per_entity: 128
+
+normalization:
+  method: quantile
+  left_quantile: 5
+  right_quantile: 95
+  left_clip: 1
+  right_clip: 1
+  max_samples: 500000
+
+data:
+  dataset: datasets/seed_1_50
+  history_hours: 24
+  forecast_hours: 24
+  stride: 24
+
+evaluation:
+  partitions: [val, test]
+  max_windows_per_partition: 0
+
+output:
+  path: null

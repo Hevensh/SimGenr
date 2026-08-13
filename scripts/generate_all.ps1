@@ -3,7 +3,10 @@ param(
     [int[]] $Seeds = @(42, 123),
     [string] $PythonBin = "C:\Users\Lenovo\.conda\envs\myEnv\python.exe",
     [string] $OutputRoot = "",
-    [switch] $SkipWeatherGif
+    [Alias("SkipWeatherGif")]
+    [switch] $SkipWeatherAnimation,
+    [Alias("SkipStorageGif")]
+    [switch] $SkipStorageAnimation
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,8 +29,11 @@ foreach ($config in $Configs) {
         if ($OutputRoot) {
             $args += @("--output", $OutputRoot)
         }
-        if ($SkipWeatherGif) {
-            $args += @("--skip-weather-gif")
+        if ($SkipWeatherAnimation) {
+            $args += @("--skip-weather-animation")
+        }
+        if ($SkipStorageAnimation) {
+            $args += @("--skip-storage-animation")
         }
         & $PythonBin @args
     }

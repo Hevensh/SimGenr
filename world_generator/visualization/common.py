@@ -5,6 +5,33 @@ from pathlib import Path
 import numpy as np
 
 
+def save_animation_webp(
+    animation: object,
+    path: Path,
+    *,
+    fps: int = 4,
+    dpi: int = 130,
+    quality: int = 88,
+    method: int = 4,
+) -> None:
+    from matplotlib.animation import PillowWriter
+
+    class AnimatedWebPWriter(PillowWriter):
+        def finish(self) -> None:
+            self._frames[0].save(
+                self.outfile,
+                save_all=True,
+                append_images=self._frames[1:],
+                duration=round(1000 / fps),
+                loop=0,
+                format="WEBP",
+                quality=quality,
+                method=method,
+            )
+
+    animation.save(path, writer=AnimatedWebPWriter(fps=fps), dpi=dpi)
+
+
 def save_single_map(
     values: np.ndarray,
     path: Path,
@@ -57,7 +84,7 @@ def draw_elevation_with_water_overlay(ax: object, static_maps: dict[str, np.ndar
     water_overlay[river_centerline] = [0.0, 0.38, 0.95, 0.78]
     water_overlay[lake_core] = [0.0, 0.58, 0.78, 0.78]
 
-    image = ax.imshow(elevation, cmap=land_terrain_cmap(), vmin=0.0, origin="upper")
+    image = ax.imshow(elevation, cmap=land_terrain_cmap(), origin="upper")
     ax.imshow(water_overlay, origin="upper")
     return image
 

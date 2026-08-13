@@ -214,6 +214,306 @@ class PowerFlowStore:
 
 
 @dataclass(frozen=True)
+class StorageNeedStore:
+    timestamps: np.ndarray
+    bus_ids: np.ndarray
+    rows: np.ndarray
+    cols: np.ndarray
+    support_requirement_mw: np.ndarray
+    unserved_load_mw: np.ndarray
+    congestion_support_mw: np.ndarray
+    peak_support_mw: np.ndarray
+    total_support_energy_mwh: np.ndarray
+    max_event_energy_mwh: np.ndarray
+    positive_ramp_p95_mw: np.ndarray
+    congestion_exposure_hours: np.ndarray
+    suggested_power_mw: np.ndarray
+    suggested_energy_mwh: np.ndarray
+    need_score: np.ndarray
+    need_score_map: np.ndarray
+
+    def as_arrays(self) -> dict[str, np.ndarray]:
+        return {
+            "timestamps": self.timestamps,
+            "bus_ids": self.bus_ids,
+            "rows": self.rows,
+            "cols": self.cols,
+            "support_requirement_mw": self.support_requirement_mw,
+            "unserved_load_mw": self.unserved_load_mw,
+            "congestion_support_mw": self.congestion_support_mw,
+            "peak_support_mw": self.peak_support_mw,
+            "total_support_energy_mwh": self.total_support_energy_mwh,
+            "max_event_energy_mwh": self.max_event_energy_mwh,
+            "positive_ramp_p95_mw": self.positive_ramp_p95_mw,
+            "congestion_exposure_hours": self.congestion_exposure_hours,
+            "suggested_power_mw": self.suggested_power_mw,
+            "suggested_energy_mwh": self.suggested_energy_mwh,
+            "need_score": self.need_score,
+            "need_score_map": self.need_score_map,
+        }
+
+    def as_dicts(self) -> list[dict[str, float | int]]:
+        order = np.argsort(-self.need_score)
+        return [
+            {
+                "bus_id": int(self.bus_ids[index]),
+                "row": int(self.rows[index]),
+                "col": int(self.cols[index]),
+                "need_score": float(self.need_score[index]),
+                "suggested_power_mw": float(self.suggested_power_mw[index]),
+                "suggested_energy_mwh": float(self.suggested_energy_mwh[index]),
+                "peak_support_mw": float(self.peak_support_mw[index]),
+                "total_support_energy_mwh": float(self.total_support_energy_mwh[index]),
+                "max_event_energy_mwh": float(self.max_event_energy_mwh[index]),
+                "positive_ramp_p95_mw": float(self.positive_ramp_p95_mw[index]),
+                "congestion_exposure_hours": float(self.congestion_exposure_hours[index]),
+                "unserved_energy_mwh": float(self.unserved_load_mw[:, index].sum()),
+            }
+            for index in order
+        ]
+
+    def summary_dict(self) -> dict[str, float | int]:
+        return {
+            "load_bus_count": int(self.bus_ids.size),
+            "hours": int(self.timestamps.size),
+            "total_suggested_power_mw": float(self.suggested_power_mw.sum()),
+            "total_suggested_energy_mwh": float(self.suggested_energy_mwh.sum()),
+            "total_unserved_energy_mwh": float(self.unserved_load_mw.sum()),
+            "total_congestion_support_mwh": float(self.congestion_support_mw.sum()),
+            "peak_aggregate_support_mw": float(self.support_requirement_mw.sum(axis=1).max(initial=0.0)),
+        }
+
+
+@dataclass(frozen=True)
+class StorageSite:
+    site_id: int
+    bus_id: int
+    row: int
+    col: int
+    covered_bus_ids: tuple[int, ...]
+    power_mw: float
+    energy_mwh: float
+    initial_soc_mwh: float
+    need_score: float
+
+
+@dataclass(frozen=True)
+class StoragePlanStore:
+    timestamps: np.ndarray
+    load_bus_ids: np.ndarray
+    assigned_site_ids: np.ndarray
+    site_support_requirement_mw: np.ndarray
+    sites: tuple[StorageSite, ...]
+
+    def as_arrays(self) -> dict[str, np.ndarray]:
+        site_rows = np.asarray(
+            [
+                [
+                    site.site_id,
+                    site.bus_id,
+                    site.row,
+                    site.col,
+                    site.power_mw,
+                    site.energy_mwh,
+                    site.initial_soc_mwh,
+                    site.need_score,
+                    len(site.covered_bus_ids),
+                ]
+                for site in self.sites
+            ],
+            dtype=np.float32,
+        ).reshape(-1, 9)
+        return {
+            "timestamps": self.timestamps,
+            "load_bus_ids": self.load_bus_ids,
+            "assigned_site_ids": self.assigned_site_ids,
+            "site_support_requirement_mw": self.site_support_requirement_mw,
+            "storage_sites": site_rows,
+        }
+
+    def as_dicts(self) -> list[dict[str, float | int | list[int]]]:
+        return [
+            {
+                "site_id": site.site_id,
+                "bus_id": site.bus_id,
+                "row": site.row,
+                "col": site.col,
+                "covered_bus_ids": list(site.covered_bus_ids),
+                "power_mw": site.power_mw,
+                "energy_mwh": site.energy_mwh,
+                "initial_soc_mwh": site.initial_soc_mwh,
+                "need_score": site.need_score,
+            }
+            for site in self.sites
+        ]
+
+    def summary_dict(self) -> dict[str, float | int]:
+        return {
+            "site_count": len(self.sites),
+            "covered_load_bus_count": int(np.sum(self.assigned_site_ids >= 0)),
+            "total_power_mw": float(sum(site.power_mw for site in self.sites)),
+            "total_energy_mwh": float(sum(site.energy_mwh for site in self.sites)),
+            "total_initial_soc_mwh": float(sum(site.initial_soc_mwh for site in self.sites)),
+        }
+
+
+@dataclass(frozen=True)
+class StorageDispatchStore:
+    timestamps: np.ndarray
+    site_ids: np.ndarray
+    site_bus_ids: np.ndarray
+    site_power_capacity_mw: np.ndarray
+    site_energy_capacity_mwh: np.ndarray
+    storage_power_expansion_mw: np.ndarray
+    storage_energy_expansion_mwh: np.ndarray
+    charge_mw: np.ndarray
+    discharge_mw: np.ndarray
+    emergency_discharge_mw: np.ndarray
+    soc_mwh: np.ndarray
+    target_soc_mwh: np.ndarray
+    cycle_boundary_soc_mwh: np.ndarray
+    minimum_soc_fraction: float
+    maximum_soc_fraction: float
+    preferred_soc_lower_fraction: float
+    preferred_soc_upper_fraction: float
+    total_load_mw: np.ndarray
+    renewable_available_mw: np.ndarray
+    baseline_thermal_mw: np.ndarray
+    scheduled_thermal_mw: np.ndarray
+    baseline_unserved_mw: np.ndarray
+    dispatched_unserved_mw: np.ndarray
+    baseline_curtailed_mw: np.ndarray
+    dispatched_curtailed_mw: np.ndarray
+    branch_ids: np.ndarray
+    line_capacity_expansion_mva: np.ndarray
+    thermal_bus_ids: np.ndarray
+    thermal_capacity_expansion_mw: np.ndarray
+    baseline_line_loading_ratio: np.ndarray
+    dispatched_line_loading_ratio: np.ndarray
+
+    def as_arrays(self) -> dict[str, np.ndarray]:
+        return {
+            "timestamps": self.timestamps,
+            "site_ids": self.site_ids,
+            "site_bus_ids": self.site_bus_ids,
+            "site_power_capacity_mw": self.site_power_capacity_mw,
+            "site_energy_capacity_mwh": self.site_energy_capacity_mwh,
+            "storage_power_expansion_mw": self.storage_power_expansion_mw,
+            "storage_energy_expansion_mwh": self.storage_energy_expansion_mwh,
+            "charge_mw": self.charge_mw,
+            "discharge_mw": self.discharge_mw,
+            "emergency_discharge_mw": self.emergency_discharge_mw,
+            "soc_mwh": self.soc_mwh,
+            "target_soc_mwh": self.target_soc_mwh,
+            "cycle_boundary_soc_mwh": self.cycle_boundary_soc_mwh,
+            "minimum_soc_fraction": np.asarray(self.minimum_soc_fraction, dtype=np.float32),
+            "maximum_soc_fraction": np.asarray(self.maximum_soc_fraction, dtype=np.float32),
+            "preferred_soc_lower_fraction": np.asarray(self.preferred_soc_lower_fraction, dtype=np.float32),
+            "preferred_soc_upper_fraction": np.asarray(self.preferred_soc_upper_fraction, dtype=np.float32),
+            "total_load_mw": self.total_load_mw,
+            "renewable_available_mw": self.renewable_available_mw,
+            "baseline_thermal_mw": self.baseline_thermal_mw,
+            "scheduled_thermal_mw": self.scheduled_thermal_mw,
+            "baseline_unserved_mw": self.baseline_unserved_mw,
+            "dispatched_unserved_mw": self.dispatched_unserved_mw,
+            "baseline_curtailed_mw": self.baseline_curtailed_mw,
+            "dispatched_curtailed_mw": self.dispatched_curtailed_mw,
+            "branch_ids": self.branch_ids,
+            "line_capacity_expansion_mva": self.line_capacity_expansion_mva,
+            "thermal_bus_ids": self.thermal_bus_ids,
+            "thermal_capacity_expansion_mw": self.thermal_capacity_expansion_mw,
+            "baseline_line_loading_ratio": self.baseline_line_loading_ratio,
+            "dispatched_line_loading_ratio": self.dispatched_line_loading_ratio,
+        }
+
+    def summary_dict(self) -> dict[str, float | int]:
+        baseline_overload = int(np.sum(self.baseline_line_loading_ratio > 1.0))
+        dispatched_overload = int(np.sum(self.dispatched_line_loading_ratio > 1.0))
+        baseline_unserved = float(np.sum(self.baseline_unserved_mw))
+        dispatched_unserved = float(np.sum(self.dispatched_unserved_mw))
+        charged_energy = float(np.sum(self.charge_mw))
+        discharged_energy = float(np.sum(self.discharge_mw))
+        stored_energy_change = (
+            float(np.sum(self.soc_mwh[-1]) - np.sum(self.soc_mwh[0]))
+            if self.soc_mwh.size
+            else 0.0
+        )
+        installed_energy = max(float(self.site_energy_capacity_mwh.sum()), 1e-6)
+        baseline_thermal = float(np.sum(self.baseline_thermal_mw))
+        scheduled_thermal = float(np.sum(self.scheduled_thermal_mw))
+        return {
+            "hours": int(self.timestamps.size),
+            "site_count": int(self.site_ids.size),
+            "charged_energy_mwh": charged_energy,
+            "discharged_energy_mwh": discharged_energy,
+            "fast_reserve_discharge_energy_mwh": float(np.sum(self.emergency_discharge_mw)),
+            "fast_reserve_discharge_hours": int(np.sum(self.emergency_discharge_mw.sum(axis=1) > 1e-4)),
+            "soc_time_in_preferred_band_fraction": float(
+                np.mean(
+                    (self.soc_mwh >= self.preferred_soc_lower_fraction * self.site_energy_capacity_mwh[None, :])
+                    & (self.soc_mwh <= self.preferred_soc_upper_fraction * self.site_energy_capacity_mwh[None, :])
+                )
+            ) if self.soc_mwh.size else 0.0,
+            "storage_conversion_loss_mwh": charged_energy - discharged_energy - stored_energy_change,
+            "equivalent_full_cycles": discharged_energy / installed_energy,
+            "baseline_thermal_energy_mwh": baseline_thermal,
+            "scheduled_thermal_energy_mwh": scheduled_thermal,
+            "additional_thermal_energy_mwh": scheduled_thermal - baseline_thermal,
+            "baseline_unserved_energy_mwh": baseline_unserved,
+            "dispatched_unserved_energy_mwh": dispatched_unserved,
+            "unserved_energy_reduction_mwh": baseline_unserved - dispatched_unserved,
+            "baseline_curtailed_energy_mwh": float(np.sum(self.baseline_curtailed_mw)),
+            "dispatched_curtailed_energy_mwh": float(np.sum(self.dispatched_curtailed_mw)),
+            "baseline_line_hours_over_100pct": baseline_overload,
+            "dispatched_line_hours_over_100pct": dispatched_overload,
+            "line_overload_hour_reduction": baseline_overload - dispatched_overload,
+            "peak_baseline_line_loading_ratio": float(np.max(self.baseline_line_loading_ratio, initial=0.0)),
+            "peak_dispatched_line_loading_ratio": float(np.max(self.dispatched_line_loading_ratio, initial=0.0)),
+            "final_total_soc_mwh": float(np.sum(self.soc_mwh[-1])) if self.soc_mwh.size else 0.0,
+            "initial_total_soc_mwh": float(np.sum(self.soc_mwh[0])) if self.soc_mwh.size else 0.0,
+            "cycle_boundary_soc_mwh": float(np.sum(self.cycle_boundary_soc_mwh)),
+            "cycle_boundary_mismatch_mwh": float(
+                np.abs(self.soc_mwh[-1] - self.soc_mwh[0]).sum()
+            ) if self.soc_mwh.size else 0.0,
+            "added_thermal_capacity_mw": float(self.thermal_capacity_expansion_mw.sum()),
+            "expanded_thermal_bus_count": int(np.sum(self.thermal_capacity_expansion_mw > 1e-4)),
+            "added_storage_power_mw": float(self.storage_power_expansion_mw.sum()),
+            "added_storage_energy_mwh": float(self.storage_energy_expansion_mwh.sum()),
+            "added_line_capacity_mva": float(self.line_capacity_expansion_mva.sum()),
+            "reinforced_line_count": int(np.sum(self.line_capacity_expansion_mva > 1e-4)),
+        }
+
+    def expansion_dict(self) -> dict[str, list[dict[str, float | int]]]:
+        return {
+            "thermal": [
+                {"bus_id": int(bus_id), "added_capacity_mw": float(expansion)}
+                for bus_id, expansion in zip(self.thermal_bus_ids, self.thermal_capacity_expansion_mw)
+                if expansion > 1e-4
+            ],
+            "storage": [
+                {
+                    "site_id": int(site_id),
+                    "bus_id": int(bus_id),
+                    "added_power_mw": float(power),
+                    "added_energy_mwh": float(energy),
+                }
+                for site_id, bus_id, power, energy in zip(
+                    self.site_ids,
+                    self.site_bus_ids,
+                    self.storage_power_expansion_mw,
+                    self.storage_energy_expansion_mwh,
+                )
+                if max(power, energy) > 1e-4
+            ],
+            "lines": [
+                {"branch_id": int(branch_id), "added_capacity_mva": float(expansion)}
+                for branch_id, expansion in zip(self.branch_ids, self.line_capacity_expansion_mva)
+                if expansion > 1e-4
+            ],
+        }
+
+
+@dataclass(frozen=True)
 class GridUpgradePlanStore:
     branch_ids: np.ndarray
     current_rate_mva: np.ndarray

@@ -49,6 +49,7 @@ def build_grid_nodes(
         start_bus_id=len(buses),
         existing_generation_buses=tuple(bus for bus in buses if bus.kind in {"wind_bus", "pv_bus"}),
     )
+    thermal_candidates = _size_thermal_capacity_for_adequacy(buses, thermal_candidates, config)
     buses.extend(thermal_candidates)
 
     load_bus_map = _bus_map(thermal_suitability.shape, buses, {"load_bus"})
@@ -65,6 +66,57 @@ def build_grid_nodes(
         thermal_bus_map=thermal_bus_map,
         buses=tuple(buses),
     )
+
+
+def _size_thermal_capacity_for_adequacy(
+    existing_buses: list[GridBus],
+    thermal_buses: list[GridBus],
+    config: PowerGridConfig,
+) -> list[GridBus]:
+    if not thermal_buses:
+        return thermal_buses
+    load_capacity = sum(float(bus.capacity_mw) for bus in existing_buses if bus.kind == "load_bus")
+    wind_capacity = sum(float(bus.capacity_mw) for bus in existing_buses if bus.kind == "wind_bus")
+    solar_capacity = sum(float(bus.capacity_mw) for bus in existing_buses if bus.kind == "pv_bus")
+    target = max(
+        float(config.thermal_adequacy_load_fraction) * load_capacity
+        - float(config.thermal_wind_capacity_credit) * wind_capacity
+        - float(config.thermal_solar_capacity_credit) * solar_capacity,
+        0.0,
+    )
+    capacities = np.asarray([float(bus.capacity_mw) for bus in thermal_buses], dtype=np.float64)
+    maximum = max(float(config.thermal_capacity_max_mw), float(config.thermal_capacity_min_mw))
+    total_headroom = float(np.maximum(maximum - capacities, 0.0).sum())
+    remaining = min(max(target - float(capacities.sum()), 0.0), total_headroom)
+    while remaining > 1e-6:
+        headroom = np.maximum(maximum - capacities, 0.0)
+        active = headroom > 1e-6
+        if not np.any(active):
+            break
+        weights = np.asarray([0.35 + 0.65 * bus.suitability for bus in thermal_buses], dtype=np.float64)
+        weights = np.where(active, weights, 0.0)
+        addition = np.minimum(remaining * weights / max(float(weights.sum()), 1e-9), headroom)
+        delivered = float(addition.sum())
+        capacities += addition
+        remaining -= delivered
+        if delivered <= 1e-9:
+            break
+    return [
+        GridBus(
+            bus_id=bus.bus_id,
+            kind=bus.kind,
+            row=bus.row,
+            col=bus.col,
+            x=bus.x,
+            y=bus.y,
+            capacity_mw=float(capacities[index]),
+            suitability=bus.suitability,
+            externality_score=bus.externality_score,
+            source_kind=bus.source_kind,
+            source_id=bus.source_id,
+        )
+        for index, bus in enumerate(thermal_buses)
+    ]
 
 
 def _thermal_suitability(

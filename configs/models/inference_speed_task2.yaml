@@ -1,0 +1,13 @@
+benchmark:
+  device: cuda
+  seed: 29
+  window_index: 4
+  warmup_iterations: 10
+  measured_iterations: 50
+  module_warmup_iterations: 20
+  module_measured_iterations: 100
+  output_dir: checkpoints/results/inference_speed_task2
+
+models:
+  - config: configs/models/gru_gnn_tuned_physics_24to24.yaml
+    checkpoint: checkpoints/gru_gnn_tuned_physics/seed_2026/20260721_1926/24to24.pt

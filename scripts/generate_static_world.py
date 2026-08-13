@@ -7,12 +7,14 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+from tqdm.auto import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from world_generator.core.config import dump_config_snapshot, load_world_config
+from world_generator.core.output_layout import WorldDataLayout
 from world_generator.core.random_state import build_rng_registry
 from world_generator.climate.climate_generator import generate_climate_baseline
 from world_generator.city.city_generator import generate_initial_cities
@@ -28,9 +30,18 @@ from world_generator.operation.grid_upgrade import build_grid_upgrade_plan
 from world_generator.operation.grid_update_loop import run_grid_update_loop
 from world_generator.operation.power_flow import solve_dc_power_flow
 from world_generator.operation.source_load_forecast import generate_source_load_forecast
+from world_generator.operation.stage_cache import (
+    load_hourly_weather_checkpoint,
+    load_stage12_checkpoint,
+    load_stage13_checkpoint,
+    save_stage12_checkpoint,
+)
+from world_generator.operation.storage_dispatch import dispatch_storage_week
+from world_generator.operation.storage_planning import analyze_storage_need, plan_storage_sites
 from world_generator.terrain.derivatives import derive_terrain_features
 from world_generator.terrain.terrain_generator import generate_terrain_base
 from world_generator.visualization.map_plot import save_static_map_figures
+from world_generator.visualization.storage_figures import save_storage_dispatch_figures, save_storage_need_figures
 from world_generator.weather.weather_generator import generate_daily_weather, generate_hourly_weather_week_from_baseline
 
 
@@ -39,7 +50,31 @@ def main() -> None:
     parser.add_argument("--config", default="configs/small_debug.yaml")
     parser.add_argument("--output", default=None)
     parser.add_argument("--seed", type=int, default=None, help="Override the seed from the config file.")
-    parser.add_argument("--skip-weather-gif", action="store_true", help="Skip the hourly weather GIF when rerunning later stages.")
+    parser.add_argument(
+        "--from-stage",
+        type=int,
+        default=1,
+        help="Start from a cached stage. Supports 1 (full), 13 (storage planning), and 14 (storage dispatch).",
+    )
+    parser.add_argument(
+        "--skip-weather-animation",
+        "--skip-weather-gif",
+        dest="skip_weather_animation",
+        action="store_true",
+        help="Skip hourly weather and line-loading animations.",
+    )
+    parser.add_argument(
+        "--skip-storage-animation",
+        "--skip-storage-gif",
+        dest="skip_storage_animation",
+        action="store_true",
+        help="Skip the Stage 14 storage dispatch animation.",
+    )
+    parser.add_argument(
+        "--no-figures",
+        action="store_true",
+        help="Generate machine-readable checkpoints only; skip all PNG/WebP output.",
+    )
     args = parser.parse_args()
 
     config = load_world_config(args.config)
@@ -50,12 +85,39 @@ def main() -> None:
     world_id = f"{config.output.world_name}_seed{config.seed}"
     output_dir = output_root / world_id
     data_dir = output_dir / "data"
+    data_layout = WorldDataLayout(data_dir)
     figure_dir = output_dir / "figures"
-    data_dir.mkdir(parents=True, exist_ok=True)
+    data_layout.create()
+    if args.from_stage == 13:
+        _run_stage13_from_cache(
+            config,
+            output_dir,
+            data_dir,
+            figure_dir,
+            render_storage_animation=not args.skip_storage_animation,
+        )
+        return
+    if args.from_stage == 14:
+        _run_stage14_from_cache(
+            config,
+            output_dir,
+            data_dir,
+            figure_dir,
+            render_storage_animation=not args.skip_storage_animation,
+        )
+        return
+    if args.from_stage != 1:
+        parser.error("--from-stage currently supports only 1, 13, or 14")
 
+    progress = tqdm(total=15, unit="stage", dynamic_ncols=True)
+    progress.set_description("Stage 01 terrain")
     terrain_base = generate_terrain_base(config.world, config.terrain, rngs.generator("terrain"))
     terrain_features = derive_terrain_features(terrain_base, config.world)
+    progress.update()
+    progress.set_description("Stage 02 hydrology")
     hydrology = generate_hydrology(terrain_features, config.world, config.hydrology)
+    progress.update()
+    progress.set_description("Stage 03 static land")
     land = generate_static_land(
         terrain_features,
         hydrology,
@@ -63,6 +125,8 @@ def main() -> None:
         config.land,
         rngs.generator("city"),
     )
+    progress.update()
+    progress.set_description("Stage 04 climate")
     climate = generate_climate_baseline(
         terrain_features,
         hydrology,
@@ -70,6 +134,8 @@ def main() -> None:
         config.climate,
         rngs.generator("weather"),
     )
+    progress.update()
+    progress.set_description("Stage 05 weather")
     operation_rng = rngs.generator("operation")
     weather = generate_daily_weather(
         terrain_features,
@@ -87,6 +153,8 @@ def main() -> None:
         config.weather,
         operation_rng,
     )
+    progress.update()
+    progress.set_description("Stage 06 cities")
     city = generate_initial_cities(
         terrain_features,
         hydrology,
@@ -96,6 +164,8 @@ def main() -> None:
         config.city,
         rngs.generator("evolution"),
     )
+    progress.update()
+    progress.set_description("Stage 07 land use")
     land_use = generate_land_use_zones(
         terrain_features,
         hydrology,
@@ -104,6 +174,8 @@ def main() -> None:
         config.world,
         config.land_use,
     )
+    progress.update()
+    progress.set_description("Stage 08 energy sites")
     climate_maps = climate.as_maps()
     energy = generate_energy_candidates(
         terrain_features,
@@ -115,6 +187,8 @@ def main() -> None:
         config.world,
         config.energy,
     )
+    progress.update()
+    progress.set_description("Stage 09 grid buses")
     grid_nodes = build_grid_nodes(
         terrain_features,
         hydrology,
@@ -124,6 +198,8 @@ def main() -> None:
         config.world,
         config.power_grid,
     )
+    progress.update()
+    progress.set_description("Stage 10 topology")
     grid_topology = build_grid_topology(
         terrain_features,
         hydrology,
@@ -142,6 +218,8 @@ def main() -> None:
         config.power_grid,
     )
     grid_electrical = build_grid_electrical(refined_topology)
+    progress.update()
+    progress.set_description("Stage 11 operation")
     source_load_forecast = generate_source_load_forecast(
         hourly_weather,
         refined_topology,
@@ -158,6 +236,8 @@ def main() -> None:
         grid_electrical,
         power_grid=config.power_grid,
     )
+    progress.update()
+    progress.set_description("Stage 12 grid update")
     update_loop = run_grid_update_loop(
         source_load_forecast,
         refined_topology,
@@ -169,6 +249,44 @@ def main() -> None:
         config.world,
         config.power_grid,
     )
+    progress.update()
+    progress.set_description("Stage 13 storage need")
+    if update_loop.iterations:
+        final_iteration = update_loop.iterations[-1]
+        storage_need = analyze_storage_need(
+            final_iteration.refined_topology,
+            final_iteration.electrical,
+            final_iteration.power_flow,
+            config.world,
+            config.storage,
+        )
+    else:
+        storage_need = analyze_storage_need(
+            refined_topology,
+            grid_electrical,
+            power_flow,
+            config.world,
+            config.storage,
+        )
+    storage_plan = plan_storage_sites(
+        final_iteration.refined_topology if update_loop.iterations else refined_topology,
+        storage_need,
+        config.storage,
+    )
+    progress.update()
+    progress.set_description("Stage 14 storage dispatch")
+    final_topology = final_iteration.refined_topology if update_loop.iterations else refined_topology
+    final_electrical = final_iteration.electrical if update_loop.iterations else grid_electrical
+    final_power_flow = final_iteration.power_flow if update_loop.iterations else power_flow
+    storage_dispatch, storage_dispatch_forecast, storage_dispatch_power_flow, storage_dispatch_electrical = dispatch_storage_week(
+        final_topology,
+        final_electrical,
+        final_power_flow,
+        storage_plan,
+        config.storage,
+    )
+    progress.update()
+    progress.set_description("Writing outputs")
     static_maps = (
         terrain_features.as_maps()
         | hydrology.as_maps()
@@ -186,19 +304,33 @@ def main() -> None:
         | grid_electrical.as_arrays()
     )
 
-    np.savez_compressed(data_dir / "static_maps.npz", **static_maps)
-    np.savez_compressed(data_dir / "daily_weather.npz", **weather.as_arrays())
-    np.savez_compressed(data_dir / "hourly_weather_week.npz", **hourly_weather.as_arrays())
-    np.savez_compressed(data_dir / "source_load_forecast.npz", **source_load_forecast.as_arrays())
-    np.savez_compressed(data_dir / "power_flow_hourly.npz", **power_flow.as_arrays())
-    np.savez_compressed(data_dir / "grid_upgrade_plan.npz", **upgrade_plan.as_arrays())
-    np.savez_compressed(data_dir / "source_load_candidates.npz", **energy.candidates_as_arrays())
-    np.savez_compressed(data_dir / "grid_nodes.npz", **grid_nodes.buses_as_arrays())
-    np.savez_compressed(data_dir / "grid_topology.npz", **grid_topology.edges_as_arrays())
-    np.savez_compressed(data_dir / "refined_grid_topology.npz", **refined_topology.as_arrays())
-    np.savez_compressed(data_dir / "grid_electrical.npz", **grid_electrical.as_arrays())
-    dump_config_snapshot(config, data_dir / "config_snapshot.yaml")
-    (data_dir / "metadata.json").write_text(
+    np.savez_compressed(data_layout.topology / "static_maps.npz", **static_maps)
+    np.savez_compressed(data_layout.weather / "daily_weather.npz", **weather.as_arrays())
+    np.savez_compressed(data_layout.weather / "hourly_weather_week.npz", **hourly_weather.as_arrays())
+    np.savez_compressed(data_layout.operation / "source_load_forecast.npz", **source_load_forecast.as_arrays())
+    np.savez_compressed(data_layout.operation / "power_flow_hourly.npz", **power_flow.as_arrays())
+    np.savez_compressed(data_layout.operation / "grid_upgrade_plan.npz", **upgrade_plan.as_arrays())
+    np.savez_compressed(data_layout.energy / "source_load_candidates.npz", **energy.candidates_as_arrays())
+    np.savez_compressed(data_layout.buses / "grid_nodes.npz", **grid_nodes.buses_as_arrays())
+    np.savez_compressed(data_layout.topology / "grid_topology.npz", **grid_topology.edges_as_arrays())
+    np.savez_compressed(data_layout.topology / "refined_grid_topology.npz", **refined_topology.as_arrays())
+    np.savez_compressed(data_layout.topology / "grid_electrical.npz", **grid_electrical.as_arrays())
+    np.savez_compressed(data_layout.storage_planning / "storage_need.npz", **storage_need.as_arrays())
+    np.savez_compressed(data_layout.storage_planning / "storage_plan.npz", **storage_plan.as_arrays())
+    np.savez_compressed(data_layout.storage_dispatch / "storage_dispatch.npz", **storage_dispatch.as_arrays())
+    np.savez_compressed(
+        data_layout.storage_dispatch / "storage_dispatch_forecast.npz", **storage_dispatch_forecast.as_arrays()
+    )
+    np.savez_compressed(
+        data_layout.storage_dispatch / "storage_dispatch_power_flow.npz", **storage_dispatch_power_flow.as_arrays()
+    )
+    np.savez_compressed(
+        data_layout.storage_dispatch / "storage_dispatch_electrical.npz", **storage_dispatch_electrical.as_arrays()
+    )
+    if update_loop.iterations:
+        save_stage12_checkpoint(update_loop.iterations[-1], data_layout.grid_update)
+    dump_config_snapshot(config, data_layout.config_snapshot)
+    data_layout.metadata.write_text(
         json.dumps(
             {
                 "world_id": world_id,
@@ -228,44 +360,47 @@ def main() -> None:
                 "power_flow": power_flow.summary_dict(),
                 "grid_upgrade_plan": upgrade_plan.summary_dict(),
                 "grid_update_loop": update_loop.summary_dict(),
+                "storage_need": storage_need.summary_dict(),
+                "storage_plan": storage_plan.summary_dict(),
+                "storage_dispatch": storage_dispatch.summary_dict(),
             },
             indent=2,
         ),
         encoding="utf-8",
     )
-    (data_dir / "energy_sites.json").write_text(
+    (data_layout.energy / "energy_sites.json").write_text(
         json.dumps(energy.candidates_as_dicts(), indent=2),
         encoding="utf-8",
     )
-    (data_dir / "bus_sites.json").write_text(
+    (data_layout.buses / "bus_sites.json").write_text(
         json.dumps(grid_nodes.buses_as_dicts(), indent=2),
         encoding="utf-8",
     )
-    (data_dir / "grid_edges.json").write_text(
+    (data_layout.topology / "grid_edges.json").write_text(
         json.dumps(grid_topology.edges_as_dicts(), indent=2),
         encoding="utf-8",
     )
-    (data_dir / "refined_bus_sites.json").write_text(
+    (data_layout.topology / "refined_bus_sites.json").write_text(
         json.dumps(refined_topology.buses_as_dicts(), indent=2),
         encoding="utf-8",
     )
-    (data_dir / "refined_grid_edges.json").write_text(
+    (data_layout.topology / "refined_grid_edges.json").write_text(
         json.dumps(refined_topology.edges_as_dicts(), indent=2),
         encoding="utf-8",
     )
-    (data_dir / "grid_electrical.json").write_text(
+    (data_layout.topology / "grid_electrical.json").write_text(
         json.dumps(grid_electrical.as_dicts(), indent=2),
         encoding="utf-8",
     )
-    (data_dir / "source_load_forecast.json").write_text(
+    (data_layout.operation / "source_load_forecast.json").write_text(
         json.dumps(source_load_forecast.summary_dict(), indent=2),
         encoding="utf-8",
     )
-    (data_dir / "power_flow_hourly.json").write_text(
+    (data_layout.operation / "power_flow_hourly.json").write_text(
         json.dumps(power_flow.summary_dict(), indent=2),
         encoding="utf-8",
     )
-    (data_dir / "grid_upgrade_plan.json").write_text(
+    (data_layout.operation / "grid_upgrade_plan.json").write_text(
         json.dumps(
             {
                 "summary": upgrade_plan.summary_dict(),
@@ -275,43 +410,216 @@ def main() -> None:
         ),
         encoding="utf-8",
     )
-    (data_dir / "grid_update_loop.json").write_text(
+    (data_layout.grid_update / "grid_update_loop.json").write_text(
         json.dumps(update_loop.summary_dict(), indent=2),
         encoding="utf-8",
     )
-    figure_maps = dict(static_maps)
-    figure_maps["grid_edge_paths"] = {
-        int(edge.edge_id): (edge.path_rows, edge.path_cols) for edge in grid_topology.edges
-    }
-    figure_maps["refined_grid_edge_paths"] = {
-        int(edge.edge_id): (edge.path_rows, edge.path_cols) for edge in refined_topology.refined_edges
-    }
-    save_static_map_figures(
-        figure_maps,
-        figure_dir,
-        weather,
-        hourly_weather,
-        source_load_forecast,
-        power_flow,
-        upgrade_plan,
-        update_loop,
-        render_weather_gif=not args.skip_weather_gif,
+    (data_layout.storage_planning / "storage_need.json").write_text(
+        json.dumps(
+            {
+                "summary": storage_need.summary_dict(),
+                "load_regions": storage_need.as_dicts(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
     )
+    (data_layout.storage_planning / "storage_plan.json").write_text(
+        json.dumps(
+            {
+                "summary": storage_plan.summary_dict(),
+                "sites": storage_plan.as_dicts(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (data_layout.storage_dispatch / "storage_dispatch.json").write_text(
+        json.dumps(
+            {
+                "summary": storage_dispatch.summary_dict(),
+                "capacity_expansion": storage_dispatch.expansion_dict(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    if not args.no_figures:
+        figure_maps = dict(static_maps)
+        figure_maps["grid_edge_paths"] = {
+            int(edge.edge_id): (edge.path_rows, edge.path_cols) for edge in grid_topology.edges
+        }
+        figure_maps["refined_grid_edge_paths"] = {
+            int(edge.edge_id): (edge.path_rows, edge.path_cols) for edge in refined_topology.refined_edges
+        }
+        save_static_map_figures(
+            figure_maps,
+            figure_dir,
+            weather,
+            hourly_weather,
+            source_load_forecast,
+            power_flow,
+            upgrade_plan,
+            update_loop,
+            storage_need,
+            storage_plan,
+            storage_dispatch,
+            storage_dispatch_electrical,
+            render_weather_animation=not args.skip_weather_animation,
+            render_storage_animation=not args.skip_storage_animation,
+        )
+    progress.update()
+    progress.close()
 
     print(f"Generated static world: {output_dir}")
-    print(f"Saved maps: {data_dir / 'static_maps.npz'}")
-    print(f"Saved daily weather: {data_dir / 'daily_weather.npz'}")
-    print(f"Saved hourly weather week: {data_dir / 'hourly_weather_week.npz'}")
-    print(f"Saved source/load forecast: {data_dir / 'source_load_forecast.npz'}")
-    print(f"Saved hourly power flow: {data_dir / 'power_flow_hourly.npz'}")
-    print(f"Saved grid upgrade plan: {data_dir / 'grid_upgrade_plan.npz'}")
-    print(f"Saved source/load candidates: {data_dir / 'source_load_candidates.npz'}")
-    print(f"Saved energy candidates: {data_dir / 'energy_sites.json'}")
-    print(f"Saved grid buses: {data_dir / 'bus_sites.json'}")
-    print(f"Saved grid edges: {data_dir / 'grid_edges.json'}")
-    print(f"Saved refined grid topology: {data_dir / 'refined_grid_topology.npz'}")
-    print(f"Saved grid electrical parameters: {data_dir / 'grid_electrical.npz'}")
-    print(f"Saved figures: {figure_dir}")
+    print(f"Saved staged data: {data_dir}")
+    if not args.no_figures:
+        print(f"Saved figures: {figure_dir}")
+
+
+def _run_stage13_from_cache(
+    config: object,
+    output_dir: Path,
+    data_dir: Path,
+    figure_dir: Path,
+    *,
+    render_storage_animation: bool,
+) -> None:
+    data_layout = WorldDataLayout(data_dir)
+    data_layout.create()
+    progress = tqdm(total=2, unit="stage", dynamic_ncols=True, desc="Stage 13 storage need")
+    static_maps, topology, electrical, power_flow = load_stage12_checkpoint(output_dir)
+    storage_need = analyze_storage_need(topology, electrical, power_flow, config.world, config.storage)
+    storage_plan = plan_storage_sites(topology, storage_need, config.storage)
+    np.savez_compressed(data_layout.storage_planning / "storage_need.npz", **storage_need.as_arrays())
+    np.savez_compressed(data_layout.storage_planning / "storage_plan.npz", **storage_plan.as_arrays())
+    (data_layout.storage_planning / "storage_need.json").write_text(
+        json.dumps(
+            {
+                "summary": storage_need.summary_dict(),
+                "load_regions": storage_need.as_dicts(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (data_layout.storage_planning / "storage_plan.json").write_text(
+        json.dumps(
+            {
+                "summary": storage_plan.summary_dict(),
+                "sites": storage_plan.as_dicts(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    stage_dir = figure_dir / "stage_13_storage_need"
+    files = save_storage_need_figures(static_maps, storage_need, storage_plan, topology, electrical, stage_dir)
+    manifest_path = figure_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+    manifest["stage_13_storage_need"] = files
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    progress.update()
+    progress.set_description("Stage 14 storage dispatch")
+    _save_stage14_outputs(
+        config,
+        static_maps,
+        topology,
+        electrical,
+        power_flow,
+        storage_plan,
+        data_dir,
+        figure_dir,
+        render_animation=render_storage_animation,
+    )
+    progress.update()
+    progress.close()
+    print(f"Regenerated Stages 13-14 from cached Stage 12: {stage_dir}")
+
+
+def _run_stage14_from_cache(
+    config: object,
+    output_dir: Path,
+    data_dir: Path,
+    figure_dir: Path,
+    *,
+    render_storage_animation: bool,
+) -> None:
+    progress = tqdm(total=1, unit="stage", dynamic_ncols=True, desc="Stage 14 storage dispatch")
+    static_maps, topology, electrical, power_flow, storage_plan = load_stage13_checkpoint(output_dir)
+    _save_stage14_outputs(
+        config,
+        static_maps,
+        topology,
+        electrical,
+        power_flow,
+        storage_plan,
+        data_dir,
+        figure_dir,
+        render_animation=render_storage_animation,
+    )
+    progress.update()
+    progress.close()
+    print(f"Regenerated Stage 14 from cached Stage 13: {figure_dir / 'stage_14_storage_dispatch'}")
+
+
+def _save_stage14_outputs(
+    config: object,
+    static_maps: dict[str, np.ndarray],
+    topology: object,
+    electrical: object,
+    power_flow: object,
+    storage_plan: object,
+    data_dir: Path,
+    figure_dir: Path,
+    *,
+    render_animation: bool,
+) -> None:
+    data_layout = WorldDataLayout(data_dir)
+    data_layout.create()
+    storage_dispatch, dispatched_forecast, dispatched_power_flow, planned_electrical = dispatch_storage_week(
+        topology,
+        electrical,
+        power_flow,
+        storage_plan,
+        config.storage,
+    )
+    np.savez_compressed(data_layout.storage_dispatch / "storage_dispatch.npz", **storage_dispatch.as_arrays())
+    np.savez_compressed(
+        data_layout.storage_dispatch / "storage_dispatch_forecast.npz", **dispatched_forecast.as_arrays()
+    )
+    np.savez_compressed(
+        data_layout.storage_dispatch / "storage_dispatch_power_flow.npz", **dispatched_power_flow.as_arrays()
+    )
+    np.savez_compressed(
+        data_layout.storage_dispatch / "storage_dispatch_electrical.npz", **planned_electrical.as_arrays()
+    )
+    (data_layout.storage_dispatch / "storage_dispatch.json").write_text(
+        json.dumps(
+            {
+                "summary": storage_dispatch.summary_dict(),
+                "capacity_expansion": storage_dispatch.expansion_dict(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    stage_dir = figure_dir / "stage_14_storage_dispatch"
+    hourly_weather = load_hourly_weather_checkpoint(data_dir.parent)
+    files = save_storage_dispatch_figures(
+        static_maps,
+        storage_dispatch,
+        storage_plan,
+        topology,
+        planned_electrical,
+        stage_dir,
+        hourly_weather,
+        render_animation=render_animation,
+    )
+    manifest_path = figure_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+    manifest["stage_14_storage_dispatch"] = files
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":

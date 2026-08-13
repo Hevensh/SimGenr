@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 
-from world_generator.core.config import PowerGridConfig, WorldConfig
+from world_generator.core.config import PowerGridConfig, WorldConfig, WorldGridConfig
 from world_generator.core.random_state import build_rng_registry
 from world_generator.climate.climate_generator import generate_climate_baseline
-from world_generator.city.city_generator import _edge_buffer, generate_initial_cities
+from world_generator.city.city_generator import _edge_buffer, _resolve_city_targets, generate_initial_cities
 from world_generator.energy.energy_candidate_generator import generate_energy_candidates
 from world_generator.grid.electrical_builder import build_grid_electrical
 from world_generator.grid.node_builder import build_grid_nodes
 from world_generator.grid.refinement_builder import refine_grid_topology
 from world_generator.grid.topology_builder import build_grid_topology
-from world_generator.hydrology.hydrology_generator import generate_hydrology
+from world_generator.hydrology.hydrology_generator import _priority_flood_fill, generate_hydrology
 from world_generator.land.land_generator import generate_static_land
 from world_generator.land_use.land_use_generator import LAND_USE_ZONE, generate_land_use_zones
 from world_generator.terrain.derivatives import derive_terrain_features
@@ -19,10 +21,18 @@ from world_generator.terrain.terrain_generator import generate_terrain_base
 from world_generator.weather.weather_generator import generate_daily_weather
 from world_generator.weather.weather_generator import generate_hourly_weather_week, generate_hourly_weather_week_from_baseline
 from world_generator.operation.source_load_forecast import generate_source_load_forecast
+from world_generator.operation.storage_planning import (
+    _load_weights_from_receiver,
+    _max_contiguous_energy,
+    analyze_storage_need,
+    plan_storage_sites,
+)
+from world_generator.operation.storage_dispatch import dispatch_storage_week
 from world_generator.operation.power_flow import solve_dc_power_flow
 from world_generator.operation.grid_upgrade import build_grid_upgrade_plan
 from world_generator.operation.grid_update_loop import (
     _apply_bypass_actions,
+    _longest_near_parallel_match,
     _merge_collinear_branches,
     _expected_line_rate,
     _resize_branch_multiplier,
@@ -51,6 +61,150 @@ def test_static_terrain_is_reproducible() -> None:
     terrain_b = generate_terrain_base(config.world, config.terrain, rngs_b.generator("terrain"))
 
     np.testing.assert_array_equal(terrain_a.elevation, terrain_b.elevation)
+
+
+def test_multiscale_terrain_tiles_match_larger_extent() -> None:
+    config = WorldConfig(seed=42)
+    terrain_config = replace(config.terrain, algorithm="multiscale_v2")
+    large_grid = replace(
+        config.world,
+        height=128,
+        width=128,
+        cell_size_km=1.0,
+        origin_x_km=0.0,
+        origin_y_km=0.0,
+    )
+    large = generate_terrain_base(
+        large_grid,
+        terrain_config,
+        build_rng_registry(config.seed).generator("terrain"),
+    ).elevation
+
+    rows: list[np.ndarray] = []
+    for origin_y in (0.0, 64.0):
+        columns: list[np.ndarray] = []
+        for origin_x in (0.0, 64.0):
+            tile_grid = replace(
+                large_grid,
+                height=64,
+                width=64,
+                origin_x_km=origin_x,
+                origin_y_km=origin_y,
+            )
+            tile = generate_terrain_base(
+                tile_grid,
+                terrain_config,
+                build_rng_registry(config.seed).generator("terrain"),
+            ).elevation
+            columns.append(tile)
+        rows.append(np.concatenate(columns, axis=1))
+    stitched = np.concatenate(rows, axis=0)
+    np.testing.assert_array_equal(stitched, large)
+
+
+def test_scale_aware_city_targets_grow_sublinearly_with_effective_area() -> None:
+    def states(shape: tuple[int, int]) -> tuple[StaticLandState, HydrologyState]:
+        zeros = np.zeros(shape, dtype=np.float32)
+        false = np.zeros(shape, dtype=bool)
+        land = StaticLandState(
+            land_cover=np.ones(shape, dtype=np.int16),
+            vegetation=zeros.copy(),
+            protected=false.copy(),
+            buildability=np.full(shape, 0.5, dtype=np.float32),
+            terrain_cost=zeros.copy(),
+            water_buffer=false.copy(),
+        )
+        hydrology = HydrologyState(
+            flow_direction=np.zeros(shape, dtype=np.int8),
+            flow_accumulation=zeros.copy(),
+            river_centerline=false.copy(),
+            river=false.copy(),
+            lake=false.copy(),
+            water_depth=zeros.copy(),
+            hydrology_elevation=zeros.copy(),
+            watershed_id=np.zeros(shape, dtype=np.int16),
+            distance_to_water=np.ones(shape, dtype=np.float32),
+            flood_risk=zeros.copy(),
+        )
+        return land, hydrology
+
+    config = replace(
+        WorldConfig().city,
+        scaling_mode="scale_aware",
+        reference_effective_area_km2=2048.0,
+    )
+    land_64, hydrology_64 = states((64, 64))
+    land_128, hydrology_128 = states((128, 128))
+    count_64, population_64 = _resolve_city_targets(
+        land_64,
+        hydrology_64,
+        WorldGridConfig(height=64, width=64, cell_size_km=1.0),
+        config,
+        np.random.default_rng(4),
+    )
+    count_128, population_128 = _resolve_city_targets(
+        land_128,
+        hydrology_128,
+        WorldGridConfig(height=128, width=128, cell_size_km=1.0),
+        config,
+        np.random.default_rng(4),
+    )
+
+    assert count_64 == 8
+    assert 23 <= count_128 <= 25
+    assert population_64 == config.total_population
+    assert 4_100_000.0 < population_128 < 4_200_000.0
+
+
+def test_priority_flood_conditions_closed_depression() -> None:
+    elevation = np.asarray(
+        [
+            [9.0, 8.0, 7.0, 8.0, 9.0],
+            [8.0, 6.0, 5.0, 6.0, 8.0],
+            [7.0, 5.0, 1.0, 5.0, 7.0],
+            [8.0, 6.0, 5.0, 6.0, 8.0],
+            [9.0, 8.0, 7.0, 8.0, 9.0],
+        ],
+        dtype=np.float32,
+    )
+    filled = _priority_flood_fill(elevation, epsilon_m=0.01)
+    assert filled[2, 2] > elevation[2, 2]
+    assert filled[2, 2] >= np.min(filled[[0, -1], :])
+
+
+def test_static_terrain_datum_and_relief_vary_by_seed() -> None:
+    config = WorldConfig()
+    minima: list[float] = []
+    reliefs: list[float] = []
+
+    for seed in range(32):
+        terrain = generate_terrain_base(config.world, config.terrain, np.random.default_rng(seed))
+        minimum = float(np.min(terrain.elevation))
+        relief = float(np.max(terrain.elevation)) - minimum
+        minima.append(minimum)
+        reliefs.append(relief)
+
+        assert config.terrain.lowland_elevation_min_m - 1e-3 <= minimum
+        assert minimum <= config.terrain.lowland_elevation_max_m + 1e-3
+        assert relief > 0.0
+
+    assert np.ptp(minima) > 1.0
+    assert np.ptp(reliefs) > 1.0
+    assert abs(float(np.mean(reliefs)) - config.terrain.relief_mean_m) < config.terrain.relief_std_m
+    assert 0.4 * config.terrain.relief_std_m < float(np.std(reliefs)) < 1.6 * config.terrain.relief_std_m
+
+
+def test_storage_need_event_energy_and_network_decay() -> None:
+    assert _max_contiguous_energy(np.asarray([0.0, 2.0, 3.0, 0.0, 4.0, 1.0])) == 5.0
+    weights = _load_weights_from_receiver(
+        0,
+        np.asarray([0, 2], dtype=np.int32),
+        np.asarray([1.0, 1.0], dtype=np.float32),
+        {0: {1}, 1: {0, 2}, 2: {1}},
+        1.0,
+    )
+    assert np.isclose(weights.sum(), 1.0)
+    assert weights[0] > weights[1]
 
 
 def test_city_edge_buffer_keeps_boundary_candidates_viable() -> None:
@@ -758,6 +912,57 @@ def test_dc_power_flow_matches_forecast_and_refined_edges() -> None:
             for bus in iteration.refined_topology.refined_buses
         )
     assert update_loop.summary_dict()["iteration_count"] == len(update_loop.iterations)
+    final_iteration = update_loop.iterations[-1]
+    storage_need = analyze_storage_need(
+        final_iteration.refined_topology,
+        final_iteration.electrical,
+        final_iteration.power_flow,
+        config.world,
+        config.storage,
+    )
+    assert storage_need.support_requirement_mw.shape[0] == hourly.dynamic.shape[0]
+    assert storage_need.support_requirement_mw.shape[1] == storage_need.bus_ids.size
+    assert storage_need.need_score_map.shape == (config.world.height, config.world.width)
+    assert np.isfinite(storage_need.support_requirement_mw).all()
+    assert np.isfinite(storage_need.need_score).all()
+    storage_plan = plan_storage_sites(final_iteration.refined_topology, storage_need, config.storage)
+    load_bus_ids = {int(bus.bus_id) for bus in final_iteration.refined_topology.refined_buses if bus.kind == "load_bus"}
+    assert len(storage_plan.sites) <= config.storage.site_max_count
+    assert all(site.bus_id in load_bus_ids for site in storage_plan.sites)
+    assert all(site.power_mw >= 0.0 and site.energy_mwh >= site.power_mw * config.storage.minimum_duration_hours for site in storage_plan.sites)
+    assert np.all((storage_plan.assigned_site_ids < len(storage_plan.sites)) & (storage_plan.assigned_site_ids >= -1))
+    storage_dispatch, dispatched_forecast, dispatched_power_flow, planned_electrical = dispatch_storage_week(
+        final_iteration.refined_topology,
+        final_iteration.electrical,
+        final_iteration.power_flow,
+        storage_plan,
+        config.storage,
+    )
+    assert storage_dispatch.charge_mw.shape == storage_dispatch.discharge_mw.shape
+    assert storage_dispatch.soc_mwh.shape[0] == storage_dispatch.timestamps.size + 1
+    assert storage_dispatch.cycle_boundary_soc_mwh.shape == (len(storage_plan.sites),)
+    assert dispatched_forecast.p_load_mw.shape == final_iteration.power_flow.served_load_mw.shape
+    assert dispatched_power_flow.line_loading_ratio.shape == final_iteration.power_flow.line_loading_ratio.shape
+    assert len(planned_electrical.branch_params) == len(final_iteration.electrical.branch_params)
+    assert storage_dispatch.dispatched_unserved_mw.sum() <= 1e-3
+    assert storage_dispatch.dispatched_line_loading_ratio.max() <= config.storage.line_operating_limit_ratio + 1e-4
+    assert not np.any((storage_dispatch.charge_mw > 1e-5) & (storage_dispatch.discharge_mw > 1e-5))
+    np.testing.assert_allclose(storage_dispatch.soc_mwh[-1], storage_dispatch.soc_mwh[0], atol=1e-3)
+    normal_discharge = storage_dispatch.discharge_mw - storage_dispatch.emergency_discharge_mw
+    normal_limit = config.storage.normal_dispatch_c_rate * storage_dispatch.site_energy_capacity_mwh
+    assert np.all(storage_dispatch.charge_mw <= normal_limit[None, :] + 1e-3)
+    assert np.all(normal_discharge <= normal_limit[None, :] + 1e-3)
+    normal_net_power = normal_discharge - storage_dispatch.charge_mw
+    cyclic_ramp = np.abs(normal_net_power - np.roll(normal_net_power, 1, axis=0))
+    ramp_limit = config.storage.storage_power_ramp_fraction_per_hour * storage_dispatch.site_power_capacity_mw
+    assert np.all(cyclic_ramp <= ramp_limit[None, :] + 1e-3)
+    for index, site in enumerate(storage_plan.sites):
+        planned_energy = storage_dispatch.site_energy_capacity_mwh[index]
+        assert planned_energy >= site.energy_mwh
+        soc_tolerance = max(1e-4, 1e-6 * float(planned_energy))
+        minimum_margin = storage_dispatch.soc_mwh[:, index].min() - planned_energy * config.storage.minimum_soc_fraction
+        assert minimum_margin >= -soc_tolerance, (index, minimum_margin, planned_energy)
+        assert np.all(storage_dispatch.soc_mwh[:, index] <= planned_energy * config.storage.maximum_soc_fraction + soc_tolerance)
 
 
 def _action_edges_for_test(action: dict[str, object]) -> list[tuple[int, int]]:
@@ -1285,6 +1490,156 @@ def test_stage12_rechecks_internal_overlap_after_prefix_merge() -> None:
     assert [action["merge_pass"] for action in actions] == [1, 2]
     junctions = [bus for bus in merged_topology.refined_buses if bus.kind == "transit_bus"]
     assert len(junctions) == 3
+
+
+def test_stage12_merges_near_parallel_internal_corridor() -> None:
+    topology, electrical, terrain, hydrology, land, grid = _near_parallel_merge_fixture((2, 3))
+    merged_topology, merged_electrical, actions = _merge_collinear_branches(
+        topology,
+        electrical,
+        terrain,
+        hydrology,
+        land,
+        grid,
+        PowerGridConfig(),
+    )
+
+    assert [action["action"] for action in actions] == ["merge_internal_near_parallel_lines"]
+    assert actions[0]["near_parallel_mean_distance_km"] == 1.0
+    junctions = [bus for bus in merged_topology.refined_buses if bus.kind == "transit_bus"]
+    assert len(junctions) == 2
+    assert len(merged_topology.refined_edges) == 5
+    assert len(merged_electrical.branch_params) == 5
+
+
+def test_near_parallel_match_keeps_last_straight_cell_before_turn() -> None:
+    first = [(7, col) for col in range(28, 34)] + [(8, 34), (9, 35)]
+    second = [(5, col) for col in range(28, 38)]
+    match = _longest_near_parallel_match(first, second, 2.0, 20.0, 1.0, 4.0, allow_reverse=True)
+
+    assert match is not None
+    assert match["first_end_cell"] == (7, 33)
+    assert match["length_km"] == 4.0
+
+
+def test_near_parallel_match_counts_a_shared_source_endpoint() -> None:
+    first = [(7, 2), (8, 2), (9, 3), (10, 4), (11, 5), (12, 5), (13, 5), (14, 5)]
+    second = [(7, 2), (8, 3), (9, 4), (10, 5), (11, 6), (11, 7), (11, 8)]
+    match = _longest_near_parallel_match(
+        first,
+        second,
+        2.0,
+        20.0,
+        1.0,
+        4.0,
+        allow_reverse=False,
+        include_start=True,
+    )
+
+    assert match is not None
+    assert (7, 2) in {match["first_start_cell"], match["second_start_cell"]}
+    assert match["length_km"] >= 4.0
+
+
+def test_stage12_rechecks_near_parallel_corridor_with_third_line() -> None:
+    topology, electrical, terrain, hydrology, land, grid = _near_parallel_merge_fixture((2, 3, 4))
+    merged_topology, merged_electrical, actions = _merge_collinear_branches(
+        topology,
+        electrical,
+        terrain,
+        hydrology,
+        land,
+        grid,
+        PowerGridConfig(),
+    )
+
+    near_actions = [action for action in actions if "near_parallel" in str(action["action"])]
+    assert len(near_actions) >= 2
+    assert max(action["merge_pass"] for action in near_actions) >= 2
+    assert max(branch.rate_mva for branch in merged_electrical.branch_params) >= 360.0
+    assert len(merged_topology.refined_edges) == len(merged_electrical.branch_params)
+
+
+def _near_parallel_merge_fixture(
+    columns: tuple[int, ...],
+) -> tuple[
+    RefinedGridTopologyState,
+    GridElectricalState,
+    TerrainFeatures,
+    HydrologyState,
+    StaticLandState,
+    WorldGridConfig,
+]:
+    shape = (10, 10)
+    terrain = TerrainFeatures(
+        elevation=np.zeros(shape, dtype=np.float32),
+        slope=np.zeros(shape, dtype=np.float32),
+        aspect_sin=np.zeros(shape, dtype=np.float32),
+        aspect_cos=np.ones(shape, dtype=np.float32),
+        roughness=np.zeros(shape, dtype=np.float32),
+        curvature=np.zeros(shape, dtype=np.float32),
+    )
+    hydrology = HydrologyState(
+        flow_direction=np.zeros(shape, dtype=np.int16),
+        flow_accumulation=np.zeros(shape, dtype=np.float32),
+        river_centerline=np.zeros(shape, dtype=bool),
+        river=np.zeros(shape, dtype=bool),
+        lake=np.zeros(shape, dtype=bool),
+        water_depth=np.zeros(shape, dtype=np.float32),
+        hydrology_elevation=np.zeros(shape, dtype=np.float32),
+        watershed_id=np.zeros(shape, dtype=np.int16),
+        distance_to_water=np.ones(shape, dtype=np.float32),
+        flood_risk=np.zeros(shape, dtype=np.float32),
+    )
+    land = StaticLandState(
+        land_cover=np.zeros(shape, dtype=np.int16),
+        vegetation=np.zeros(shape, dtype=np.float32),
+        protected=np.zeros(shape, dtype=bool),
+        buildability=np.ones(shape, dtype=np.float32),
+        terrain_cost=np.zeros(shape, dtype=np.float32),
+        water_buffer=np.zeros(shape, dtype=bool),
+    )
+    buses: list[GridBus] = []
+    edges: list[GridEdge] = []
+    for edge_id, col in enumerate(columns):
+        from_bus = 2 * edge_id
+        to_bus = from_bus + 1
+        buses.extend(
+            (
+                GridBus(from_bus, "load_bus", 0, col, col / 9, 0.0, 30.0, 1.0, 0.0, "test", from_bus),
+                GridBus(to_bus, "wind_bus", 9, col, col / 9, 1.0, 30.0, 1.0, 0.0, "test", to_bus),
+            )
+        )
+        edges.append(
+            GridEdge(
+                edge_id,
+                from_bus,
+                to_bus,
+                9.0,
+                9.0,
+                False,
+                tuple(range(10)),
+                tuple([col] * 10),
+            )
+        )
+    topology = RefinedGridTopologyState(
+        refined_line_route_map=np.zeros(shape, dtype=np.float32),
+        refined_grid_edge_map=np.full(shape, -1, dtype=np.int16),
+        transit_bus_map=np.full(shape, -1, dtype=np.int16),
+        refined_buses=tuple(buses),
+        refined_edges=tuple(edges),
+    )
+    electrical = GridElectricalState(
+        bus_params=tuple(
+            BusElectricalParam(bus.bus_id, bus.kind, 110.0, 0.0, 0.0, 0.0, 1.0, 1.0, "TEST")
+            for bus in buses
+        ),
+        branch_params=tuple(
+            BranchElectricalParam(edge.edge_id, edge.from_bus, edge.to_bus, 110.0, 9.0, 0.9, 3.6, 18.0, 120.0, False)
+            for edge in edges
+        ),
+    )
+    return topology, electrical, terrain, hydrology, land, WorldGridConfig(10, 10, 1.0)
 
 
 def test_stage12_line_multiplier_uses_actual_peak_flow() -> None:

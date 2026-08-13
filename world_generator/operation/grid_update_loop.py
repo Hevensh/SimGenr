@@ -769,6 +769,10 @@ def _merge_collinear_branches_pass(
     grid: WorldGridConfig,
     power_grid: PowerGridConfig,
     power_flow: PowerFlowStore | None,
+    *,
+    allowed_branch_ids: frozenset[int] | None = None,
+    allow_near_parallel: bool = True,
+    routing_cost_override: np.ndarray | None = None,
 ) -> tuple[RefinedGridTopologyState, GridElectricalState, list[dict[str, float | int | str]]]:
     buses = list(topology.refined_buses)
     edges = list(topology.refined_edges)
@@ -777,12 +781,19 @@ def _merge_collinear_branches_pass(
     edge_by_id = {int(edge.edge_id): edge for edge in edges}
     branch_by_id = {int(branch.edge_id): branch for branch in branches}
     flow_by_branch = _flow_series_by_branch(power_flow)
-    risk_cost = transit_risk_cost(terrain, hydrology, land, power_grid)
+    risk_cost = (
+        np.asarray(routing_cost_override, dtype=np.float32)
+        if routing_cost_override is not None
+        else transit_risk_cost(terrain, hydrology, land, power_grid)
+    )
     occupied = {(int(bus.row), int(bus.col)) for bus in buses}
 
     candidates: list[tuple[int, int, int, int, int, int, list[tuple[int, int]]]] = []
     internal_candidates: list[tuple[int, int, int, tuple[int, int], tuple[int, int], bool]] = []
     for first, second in combinations(branches, 2):
+        pair_ids = frozenset((int(first.edge_id), int(second.edge_id)))
+        if allowed_branch_ids is not None and pair_ids != allowed_branch_ids:
+            continue
         first_edge = edge_by_id.get(int(first.edge_id))
         second_edge = edge_by_id.get(int(second.edge_id))
         if first_edge is None or second_edge is None:
@@ -1036,12 +1047,522 @@ def _merge_collinear_branches_pass(
         next_bus_id += 2
 
     if not actions:
+        if allow_near_parallel:
+            return _merge_near_parallel_branches_pass(
+                topology,
+                electrical,
+                terrain,
+                hydrology,
+                land,
+                grid,
+                power_grid,
+                power_flow,
+            )
         return topology, electrical, []
     return (
         _rebuild_refined_topology(topology, buses, edges),
         GridElectricalState(bus_params=tuple(bus_params), branch_params=tuple(branches)),
         actions,
     )
+
+
+def _merge_near_parallel_branches_pass(
+    topology: RefinedGridTopologyState,
+    electrical: GridElectricalState,
+    terrain: TerrainFeatures,
+    hydrology: HydrologyState,
+    land: StaticLandState,
+    grid: WorldGridConfig,
+    power_grid: PowerGridConfig,
+    power_flow: PowerFlowStore | None,
+) -> tuple[RefinedGridTopologyState, GridElectricalState, list[dict[str, float | int | str]]]:
+    if power_grid.near_parallel_max_distance_km <= 0.0 or power_grid.near_parallel_min_length_km <= 0.0:
+        return topology, electrical, []
+
+    edge_by_id = {int(edge.edge_id): edge for edge in topology.refined_edges}
+    bus_by_id = {int(bus.bus_id): bus for bus in topology.refined_buses}
+    occupied = {(int(bus.row), int(bus.col)) for bus in topology.refined_buses}
+    risk_cost = transit_risk_cost(terrain, hydrology, land, power_grid)
+    max_distance_cells = power_grid.near_parallel_max_distance_km / max(grid.cell_size_km, 1e-6)
+    candidates: list[dict[str, object]] = []
+
+    for first_branch, second_branch in combinations(electrical.branch_params, 2):
+        first_edge = edge_by_id.get(int(first_branch.edge_id))
+        second_edge = edge_by_id.get(int(second_branch.edge_id))
+        if first_edge is None or second_edge is None:
+            continue
+        shared = {int(first_branch.from_bus), int(first_branch.to_bus)} & {
+            int(second_branch.from_bus),
+            int(second_branch.to_bus),
+        }
+        if len(shared) > 1:
+            continue
+
+        first_cells = [(int(row), int(col)) for row, col in zip(first_edge.path_rows, first_edge.path_cols)]
+        second_cells = [(int(row), int(col)) for row, col in zip(second_edge.path_rows, second_edge.path_cols)]
+        if len(shared) == 1:
+            shared_bus = next(iter(shared))
+            first_cells = _edge_cells_from_bus(first_edge, shared_bus)
+            second_cells = _edge_cells_from_bus(second_edge, shared_bus)
+            match = _longest_near_parallel_match(
+                first_cells,
+                second_cells,
+                max_distance_cells,
+                power_grid.near_parallel_max_angle_deg,
+                grid.cell_size_km,
+                power_grid.near_parallel_min_length_km,
+                allow_reverse=False,
+                include_start=True,
+            )
+            if match is None:
+                continue
+            start_distance = max(
+                _cell_path_length(first_cells[: int(match["first_start_index"]) + 1]),
+                _cell_path_length(second_cells[: int(match["second_start_index"]) + 1]),
+            ) * grid.cell_size_km
+            if start_distance > power_grid.near_parallel_max_distance_km + grid.cell_size_km:
+                continue
+            corridor_cost = _near_merge_corridor_cost(
+                risk_cost,
+                first_cells,
+                second_cells,
+                power_grid.near_parallel_corridor_radius_km,
+                grid.cell_size_km,
+            )
+            shared_node = bus_by_id[shared_bus]
+            for junction in _near_merge_junction_choices(
+                match["first_end_cell"],
+                match["second_end_cell"],
+                corridor_cost,
+                occupied,
+                max_distance_cells,
+            ):
+                first_snapped = _reroute_edge_via_shared_junction(
+                    first_edge, shared_bus, junction, bus_by_id, corridor_cost, grid
+                )
+                second_snapped = _reroute_edge_via_shared_junction(
+                    second_edge, shared_bus, junction, bus_by_id, corridor_cost, grid
+                )
+                common_rows, common_cols = risk_path(
+                    shared_node.row, shared_node.col, junction[0], junction[1], corridor_cost
+                )
+                improvement = _near_merge_cost_improvement(
+                    first_edge,
+                    second_edge,
+                    first_snapped,
+                    second_snapped,
+                    list(zip(common_rows.tolist(), common_cols.tolist())),
+                    risk_cost,
+                )
+                if improvement + 1e-9 < power_grid.near_parallel_min_cost_improvement:
+                    continue
+                candidates.append(
+                    {
+                        "first_id": int(first_edge.edge_id),
+                        "second_id": int(second_edge.edge_id),
+                        "first_edge": first_snapped,
+                        "second_edge": second_snapped,
+                        "routing_cost": corridor_cost,
+                        "improvement": float(improvement),
+                        "matched_length_km": float(match["length_km"]),
+                        "mean_distance_km": float(match["mean_distance_cells"]) * grid.cell_size_km,
+                        "mode": "shared",
+                    }
+                )
+                break
+            continue
+
+        match = _longest_near_parallel_match(
+            first_cells,
+            second_cells,
+            max_distance_cells,
+            power_grid.near_parallel_max_angle_deg,
+            grid.cell_size_km,
+            power_grid.near_parallel_min_length_km,
+            allow_reverse=True,
+        )
+        if match is None:
+            continue
+        corridor_cost = _near_merge_corridor_cost(
+            risk_cost,
+            first_cells,
+            second_cells,
+            power_grid.near_parallel_corridor_radius_km,
+            grid.cell_size_km,
+        )
+        start_choices = _near_merge_junction_choices(
+            match["first_start_cell"],
+            match["second_start_cell"],
+            corridor_cost,
+            occupied,
+            max_distance_cells,
+        )
+        end_choices = _near_merge_junction_choices(
+            match["first_end_cell"],
+            match["second_end_cell"],
+            corridor_cost,
+            occupied,
+            max_distance_cells,
+        )
+        best_internal: dict[str, object] | None = None
+        for first_junction in start_choices:
+            for second_junction in end_choices:
+                if first_junction == second_junction:
+                    continue
+                common_rows, common_cols = risk_path(
+                    first_junction[0], first_junction[1], second_junction[0], second_junction[1], corridor_cost
+                )
+                common_cells = list(zip(common_rows.tolist(), common_cols.tolist()))
+                if _cell_path_length(common_cells) * grid.cell_size_km < power_grid.near_parallel_min_length_km:
+                    continue
+                first_snapped = _reroute_edge_via_internal_corridor(
+                    first_edge,
+                    first_junction,
+                    second_junction,
+                    True,
+                    bus_by_id,
+                    corridor_cost,
+                    grid,
+                )
+                second_snapped = _reroute_edge_via_internal_corridor(
+                    second_edge,
+                    first_junction,
+                    second_junction,
+                    bool(match["same_direction"]),
+                    bus_by_id,
+                    corridor_cost,
+                    grid,
+                )
+                improvement = _near_merge_cost_improvement(
+                    first_edge,
+                    second_edge,
+                    first_snapped,
+                    second_snapped,
+                    common_cells,
+                    risk_cost,
+                )
+                if improvement + 1e-9 < power_grid.near_parallel_min_cost_improvement:
+                    continue
+                proposal = {
+                    "first_id": int(first_edge.edge_id),
+                    "second_id": int(second_edge.edge_id),
+                    "first_edge": first_snapped,
+                    "second_edge": second_snapped,
+                    "routing_cost": corridor_cost,
+                    "improvement": float(improvement),
+                    "matched_length_km": float(match["length_km"]),
+                    "mean_distance_km": float(match["mean_distance_cells"]) * grid.cell_size_km,
+                    "mode": "internal",
+                }
+                if best_internal is None or float(proposal["improvement"]) > float(best_internal["improvement"]):
+                    best_internal = proposal
+        if best_internal is not None:
+            candidates.append(best_internal)
+
+    candidates.sort(
+        key=lambda item: (
+            -float(item["improvement"]),
+            -float(item["matched_length_km"]),
+            float(item["mean_distance_km"]),
+            int(item["first_id"]),
+            int(item["second_id"]),
+        )
+    )
+    for candidate in candidates:
+        replacement_by_id = {
+            int(candidate["first_id"]): candidate["first_edge"],
+            int(candidate["second_id"]): candidate["second_edge"],
+        }
+        snapped_edges = tuple(
+            replacement_by_id.get(int(edge.edge_id), edge) for edge in topology.refined_edges
+        )
+        snapped_topology = replace(topology, refined_edges=snapped_edges)
+        merged_topology, merged_electrical, actions = _merge_collinear_branches_pass(
+            snapped_topology,
+            electrical,
+            terrain,
+            hydrology,
+            land,
+            grid,
+            power_grid,
+            power_flow,
+            allowed_branch_ids=frozenset((int(candidate["first_id"]), int(candidate["second_id"]))),
+            allow_near_parallel=False,
+            routing_cost_override=np.asarray(candidate["routing_cost"], dtype=np.float32),
+        )
+        if not actions:
+            continue
+        action_name = (
+            "merge_near_parallel_lines"
+            if candidate["mode"] == "shared"
+            else "merge_internal_near_parallel_lines"
+        )
+        for action in actions:
+            action["action"] = action_name
+            action["near_parallel_length_km"] = float(candidate["matched_length_km"])
+            action["near_parallel_mean_distance_km"] = float(candidate["mean_distance_km"])
+            action["corridor_cost_improvement"] = float(candidate["improvement"])
+        return merged_topology, merged_electrical, actions
+    return topology, electrical, []
+
+
+def _longest_near_parallel_match(
+    first: list[tuple[int, int]],
+    second: list[tuple[int, int]],
+    max_distance_cells: float,
+    max_angle_deg: float,
+    cell_size_km: float,
+    min_length_km: float,
+    *,
+    allow_reverse: bool,
+    include_start: bool = False,
+) -> dict[str, object] | None:
+    if len(first) < 4 or len(second) < 4:
+        return None
+    cosine_limit = float(np.cos(np.deg2rad(max_angle_deg)))
+    best: dict[str, object] | None = None
+    orientations = ((False, second), (True, list(reversed(second)))) if allow_reverse else ((False, second),)
+    first_start = 0 if include_start else 1
+    for reversed_path, oriented_second in orientations:
+        second_start = 0 if include_start else 1
+        chains: list[list[tuple[int, int]]] = []
+        current_chain: list[tuple[int, int]] = []
+        for first_index in range(first_start, len(first) - 1):
+            first_directions = _path_directions(first, first_index)
+            compatible: list[tuple[float, int]] = []
+            for second_index in range(second_start, len(oriented_second) - 1):
+                distance = float(np.hypot(
+                    first[first_index][0] - oriented_second[second_index][0],
+                    first[first_index][1] - oriented_second[second_index][1],
+                ))
+                if distance > max_distance_cells + 1e-9:
+                    continue
+                second_directions = _path_directions(oriented_second, second_index)
+                if max(
+                    float(np.dot(first_direction, second_direction))
+                    for first_direction in first_directions
+                    for second_direction in second_directions
+                ) < cosine_limit:
+                    continue
+                compatible.append((distance, second_index))
+            if not compatible:
+                if current_chain:
+                    chains.append(current_chain)
+                    current_chain = []
+                continue
+            _, second_index = min(compatible, key=lambda item: (item[0], item[1]))
+            if current_chain and not (current_chain[-1][1] <= second_index <= current_chain[-1][1] + 2):
+                chains.append(current_chain)
+                current_chain = []
+            current_chain.append((first_index, second_index))
+        if current_chain:
+            chains.append(current_chain)
+
+        for chain in chains:
+            if len(chain) < 2:
+                continue
+            first_length = _cell_path_length([first[first_index] for first_index, _ in chain])
+            second_length = _cell_path_length([oriented_second[second_index] for _, second_index in chain])
+            length_km = min(first_length, second_length) * cell_size_km
+            distances = [
+                float(np.hypot(
+                    first[first_index][0] - oriented_second[second_index][0],
+                    first[first_index][1] - oriented_second[second_index][1],
+                ))
+                for first_index, second_index in chain
+            ]
+            proposal = {
+                "first_start_index": int(chain[0][0]),
+                "second_start_index": int(chain[0][1]),
+                "first_start_cell": first[chain[0][0]],
+                "second_start_cell": oriented_second[chain[0][1]],
+                "first_end_cell": first[chain[-1][0]],
+                "second_end_cell": oriented_second[chain[-1][1]],
+                "same_direction": not reversed_path,
+                "length_km": float(length_km),
+                "mean_distance_cells": float(np.mean(distances)),
+            }
+            if best is None or (
+                float(proposal["length_km"]),
+                -float(proposal["mean_distance_cells"]),
+            ) > (
+                float(best["length_km"]),
+                -float(best["mean_distance_cells"]),
+            ):
+                best = proposal
+    if best is None or float(best["length_km"]) + 1e-9 < min_length_km:
+        return None
+    return best
+
+
+def _path_directions(path: list[tuple[int, int]], index: int) -> tuple[np.ndarray, ...]:
+    current = np.asarray(path[index], dtype=np.float64)
+    vectors = (
+        current - np.asarray(path[max(index - 1, 0)], dtype=np.float64),
+        np.asarray(path[min(index + 1, len(path) - 1)], dtype=np.float64) - current,
+    )
+    directions = []
+    for vector in vectors:
+        norm = float(np.linalg.norm(vector))
+        if norm > 1e-9:
+            directions.append(vector / norm)
+    return tuple(directions)
+
+
+def _cell_path_length(path: list[tuple[int, int]]) -> float:
+    if len(path) < 2:
+        return 0.0
+    values = np.asarray(path, dtype=np.float64)
+    return float(np.hypot(np.diff(values[:, 0]), np.diff(values[:, 1])).sum())
+
+
+def _near_merge_corridor_cost(
+    risk_cost: np.ndarray,
+    first: list[tuple[int, int]],
+    second: list[tuple[int, int]],
+    radius_km: float,
+    cell_size_km: float,
+) -> np.ndarray:
+    radius = max(1, int(np.ceil(radius_km / max(cell_size_km, 1e-6))))
+    allowed = np.zeros(risk_cost.shape, dtype=bool)
+    for row, col in first + second:
+        row0 = max(0, row - radius)
+        row1 = min(risk_cost.shape[0], row + radius + 1)
+        col0 = max(0, col - radius)
+        col1 = min(risk_cost.shape[1], col + radius + 1)
+        rr, cc = np.ogrid[row0:row1, col0:col1]
+        allowed[row0:row1, col0:col1] |= (rr - row) ** 2 + (cc - col) ** 2 <= radius**2
+    penalty = max(float(np.nanmax(risk_cost, initial=1.0)), 1.0) * 50.0
+    return np.where(allowed, risk_cost, risk_cost + penalty).astype(np.float32)
+
+
+def _near_merge_junction_choices(
+    first: tuple[int, int],
+    second: tuple[int, int],
+    cost: np.ndarray,
+    occupied: set[tuple[int, int]],
+    max_distance_cells: float,
+) -> list[tuple[int, int]]:
+    first_cell = (int(first[0]), int(first[1]))
+    second_cell = (int(second[0]), int(second[1]))
+    midpoint = (
+        int(round(0.5 * (first_cell[0] + second_cell[0]))),
+        int(round(0.5 * (first_cell[1] + second_cell[1]))),
+    )
+    choices = {first_cell, second_cell, midpoint}
+    valid = [
+        cell
+        for cell in choices
+        if 0 <= cell[0] < cost.shape[0]
+        and 0 <= cell[1] < cost.shape[1]
+        and cell not in occupied
+        and np.hypot(cell[0] - first_cell[0], cell[1] - first_cell[1]) <= max_distance_cells + 1e-9
+        and np.hypot(cell[0] - second_cell[0], cell[1] - second_cell[1]) <= max_distance_cells + 1e-9
+    ]
+    return sorted(valid, key=lambda cell: (float(cost[cell]), abs(cell[0] - midpoint[0]) + abs(cell[1] - midpoint[1]), cell))
+
+
+def _reroute_edge_via_shared_junction(
+    edge: GridEdge,
+    shared_bus: int,
+    junction: tuple[int, int],
+    bus_by_id: dict[int, GridBus],
+    cost: np.ndarray,
+    grid: WorldGridConfig,
+) -> GridEdge:
+    shared = bus_by_id[shared_bus]
+    other_bus_id = int(edge.to_bus) if int(edge.from_bus) == shared_bus else int(edge.from_bus)
+    other = bus_by_id[other_bus_id]
+    common = _risk_path_cells((shared.row, shared.col), junction, cost)
+    tail = _risk_path_cells(junction, (other.row, other.col), cost)
+    cells = _join_cell_paths(common, tail)
+    if int(edge.from_bus) != shared_bus:
+        cells.reverse()
+    return _replace_edge_path(edge, cells, cost, grid)
+
+
+def _reroute_edge_via_internal_corridor(
+    edge: GridEdge,
+    first_junction: tuple[int, int],
+    second_junction: tuple[int, int],
+    same_direction: bool,
+    bus_by_id: dict[int, GridBus],
+    cost: np.ndarray,
+    grid: WorldGridConfig,
+) -> GridEdge:
+    start = bus_by_id[int(edge.from_bus)]
+    end = bus_by_id[int(edge.to_bus)]
+    entry, exit_ = (first_junction, second_junction) if same_direction else (second_junction, first_junction)
+    cells = _join_cell_paths(
+        _risk_path_cells((start.row, start.col), entry, cost),
+        _risk_path_cells(entry, exit_, cost),
+        _risk_path_cells(exit_, (end.row, end.col), cost),
+    )
+    return _replace_edge_path(edge, cells, cost, grid)
+
+
+def _risk_path_cells(
+    start: tuple[int, int],
+    end: tuple[int, int],
+    cost: np.ndarray,
+) -> list[tuple[int, int]]:
+    rows, cols = risk_path(start[0], start[1], end[0], end[1], cost)
+    return [(int(row), int(col)) for row, col in zip(rows, cols)]
+
+
+def _join_cell_paths(*paths: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    joined: list[tuple[int, int]] = []
+    for path in paths:
+        if not path:
+            continue
+        joined.extend(path[1:] if joined and joined[-1] == path[0] else path)
+    return joined
+
+
+def _replace_edge_path(
+    edge: GridEdge,
+    cells: list[tuple[int, int]],
+    cost: np.ndarray,
+    grid: WorldGridConfig,
+) -> GridEdge:
+    rows = np.asarray([cell[0] for cell in cells], dtype=np.int16)
+    cols = np.asarray([cell[1] for cell in cells], dtype=np.int16)
+    return replace(
+        edge,
+        length_km=path_length_km(rows, cols, grid.cell_size_km),
+        route_cost=_path_cost_for_cells(cells, cost) * grid.cell_size_km,
+        path_rows=tuple(int(value) for value in rows),
+        path_cols=tuple(int(value) for value in cols),
+    )
+
+
+def _path_cost_for_cells(path: list[tuple[int, int]], cost: np.ndarray) -> float:
+    if len(path) < 2:
+        return 0.0
+    rows = np.asarray([cell[0] for cell in path], dtype=np.intp)
+    cols = np.asarray([cell[1] for cell in path], dtype=np.intp)
+    step = np.hypot(np.diff(rows.astype(np.float64)), np.diff(cols.astype(np.float64)))
+    local = 0.5 * (cost[rows[:-1], cols[:-1]] + cost[rows[1:], cols[1:]])
+    return float(np.sum(step * local))
+
+
+def _near_merge_cost_improvement(
+    first_original: GridEdge,
+    second_original: GridEdge,
+    first_snapped: GridEdge,
+    second_snapped: GridEdge,
+    common: list[tuple[int, int]],
+    risk_cost: np.ndarray,
+) -> float:
+    original = _path_cost_for_cells(
+        list(zip(first_original.path_rows, first_original.path_cols)), risk_cost
+    ) + _path_cost_for_cells(list(zip(second_original.path_rows, second_original.path_cols)), risk_cost)
+    merged = (
+        _path_cost_for_cells(list(zip(first_snapped.path_rows, first_snapped.path_cols)), risk_cost)
+        + _path_cost_for_cells(list(zip(second_snapped.path_rows, second_snapped.path_cols)), risk_cost)
+        - _path_cost_for_cells(common, risk_cost)
+    )
+    return float((original - merged) / max(original, 1e-9))
 
 
 def _append_implicit_junction(

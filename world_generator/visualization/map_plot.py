@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from world_generator.core.datatypes import GridUpgradePlanStore, PowerFlowStore, SourceLoadForecastStore, WeatherStore
+from world_generator.core.datatypes import GridElectricalState, GridUpgradePlanStore, PowerFlowStore, SourceLoadForecastStore, StorageDispatchStore, StorageNeedStore, StoragePlanStore, WeatherStore
 from world_generator.operation.grid_update_loop import GridUpdateLoopResult
 from world_generator.visualization.city_figures import save_city_figures
 from world_generator.visualization.climate_figures import save_climate_figures
@@ -19,6 +19,7 @@ from world_generator.visualization.land_use_figures import save_land_use_figures
 from world_generator.visualization.operation_figures import save_operation_figures
 from world_generator.visualization.power_flow_figures import save_power_flow_figures
 from world_generator.visualization.static_land_figures import save_static_land_figures
+from world_generator.visualization.storage_figures import save_storage_dispatch_figures, save_storage_need_figures
 from world_generator.visualization.terrain_figures import save_terrain_figures
 from world_generator.visualization.upgrade_figures import save_upgrade_figures
 from world_generator.visualization.weather_figures import save_weather_figures
@@ -33,7 +34,12 @@ def save_static_map_figures(
     power_flow: PowerFlowStore | None = None,
     upgrade_plan: GridUpgradePlanStore | None = None,
     update_loop: GridUpdateLoopResult | None = None,
-    render_weather_gif: bool = True,
+    storage_need: StorageNeedStore | None = None,
+    storage_plan: StoragePlanStore | None = None,
+    storage_dispatch: StorageDispatchStore | None = None,
+    storage_dispatch_electrical: GridElectricalState | None = None,
+    render_weather_animation: bool = True,
+    render_storage_animation: bool = True,
 ) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -56,7 +62,7 @@ def save_static_map_figures(
             output_dir / "stage_05_weather",
             hourly_weather,
             static_maps,
-            render_hourly_gif=render_weather_gif,
+            render_hourly_animation=render_weather_animation,
         )
 
     if "city_suitability" in static_maps:
@@ -95,10 +101,32 @@ def save_static_map_figures(
             update_loop,
             output_dir / "stage_12_grid_update",
             hourly_weather,
-            render_gif=render_weather_gif,
+            render_animation=render_weather_animation,
         )
     elif upgrade_plan is not None:
         manifest["stage_12_grid_update"] = save_upgrade_figures(static_maps, upgrade_plan, output_dir / "stage_12_grid_update")
+
+    if storage_need is not None and storage_plan is not None and update_loop is not None and update_loop.iterations:
+        final_iteration = update_loop.iterations[-1]
+        manifest["stage_13_storage_need"] = save_storage_need_figures(
+            static_maps,
+            storage_need,
+            storage_plan,
+            final_iteration.refined_topology,
+            final_iteration.electrical,
+            output_dir / "stage_13_storage_need",
+        )
+        if storage_dispatch is not None:
+            manifest["stage_14_storage_dispatch"] = save_storage_dispatch_figures(
+                static_maps,
+                storage_dispatch,
+                storage_plan,
+                final_iteration.refined_topology,
+                storage_dispatch_electrical or final_iteration.electrical,
+                output_dir / "stage_14_storage_dispatch",
+                hourly_weather,
+                render_animation=render_storage_animation,
+            )
 
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2),
