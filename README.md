@@ -2,6 +2,55 @@
 
 This project builds a reproducible synthetic world for multimodal source-load-grid experiments. The current pipeline starts from terrain, then derives hydrology, static land constraints, climate background, daily weather, initial cities, and land-use/load zones.
 
+Private project repository: <https://github.com/Hevensh/SimGenr>
+
+## Generate One Seed
+
+For an inspectable single world, run the following commands from the repository root in Git Bash. Replace `42`
+with any integer seed:
+
+```bash
+source /c/ProgramData/miniconda3/etc/profile.d/conda.sh
+conda activate myEnv
+python scripts/generate_static_world.py \
+  --config configs/small_debug.yaml \
+  --seed 42
+```
+
+The generated world is written to:
+
+```text
+outputs/small_debug_seed42/
+```
+
+This default mode retains the full staged visualization. The output directory contains stage-grouped numeric data
+under `data/`, intermediate PNG figures and animated WebP files under `figures/`, the exact configuration snapshot,
+and world metadata. Use this mode when checking whether terrain, hydrology, weather, cities, grid routing, power
+flow, and storage behavior are reasonable. The same seed and configuration reproduce the same world.
+
+For batch dataset production, add `--no-figures`. This mode skips all intermediate PNG/WebP visualization and keeps
+the machine-readable stage data used by dataset packaging:
+
+```bash
+python scripts/generate_static_world.py \
+  --config configs/small_debug.yaml \
+  --seed 42 \
+  --no-figures
+```
+
+The multi-seed dataset generator uses this no-figure workflow because rendered figures are inspection artifacts and
+are not embedded in the final `.npz` samples.
+
+To resume from an existing stage checkpoint, use `--from-stage`. For example, this reruns Stage 13 and Stage 14
+without rebuilding terrain, weather, cities, or the initial grid:
+
+```bash
+python scripts/generate_static_world.py \
+  --config configs/small_debug.yaml \
+  --seed 42 \
+  --from-stage 13
+```
+
 The generated data are written under `outputs/`. For the default debug config, the current output folder is:
 
 ```text
@@ -24,7 +73,7 @@ Each output run contains:
 
 Legacy flat outputs can be reorganized without recomputation using `python scripts/migrate_output_layout.py`.
 
-## Run
+## Additional Run Options
 
 ```bash
 python scripts/generate_static_world.py --config configs/small_debug.yaml
