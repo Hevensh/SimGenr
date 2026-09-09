@@ -20,7 +20,124 @@ from world_generator.core.datatypes import (
     WeatherStore,
     HydrologyTimeSeriesStore,
     SourceLoadForecastStore,
+    StorageDispatchStore,
 )
+
+
+def load_asset_boundary_checkpoint(output_dir: Path, *, expected_timestamps: np.ndarray | None = None,
+                                   expected_bus_ids: np.ndarray | None = None,
+                                   expected_branch_ids: np.ndarray | None = None) -> dict[str, object]:
+    """Require F's original/frozen design assets and check their content hashes."""
+    from world_generator.core.contracts import entity_ids, interval_bounds_hours
+    from world_generator.core.operation_contracts import PLANNING_MODES
+    from world_generator.operation.asset_planning import asset_snapshot_sha256
+    directory = output_dir / "data" / "planning"
+    paths = [directory / name for name in ("initial_assets.npz","frozen_assets.npz","asset_boundary.json")]
+    if not all(path.exists() for path in paths):
+        raise ValueError("Checkpoint predates F asset boundaries; regenerate with --from-stage 1")
+    metadata = json.loads(paths[2].read_text(encoding="utf-8"))
+    if not isinstance(metadata,dict) or metadata.get("schema_version") != "asset_planning_v1" or metadata.get("mode") not in PLANNING_MODES:
+        raise ValueError("Unsupported F asset planning boundary metadata")
+    required_metadata = {"initial_assets_sha256","frozen_assets_sha256","planning_input_hashes","planning_time_bounds_hours",
+                         "operation_time_bounds_hours","planning_input_source","dispatch_foresight"}
+    if not required_metadata.issubset(metadata) or not isinstance(metadata["planning_input_hashes"],dict):
+        raise ValueError("Incomplete F asset planning information boundary")
+    def check_bounds(value: object, name: str) -> np.ndarray:
+        bounds = np.asarray(value,dtype=float)
+        if bounds.shape != (2,) or not np.isfinite(bounds).all() or bounds[1] <= bounds[0]:
+            raise ValueError(f"{name} must contain finite increasing hour boundaries")
+        return bounds
+    operation_bounds = check_bounds(metadata["operation_time_bounds_hours"],"operation_time_bounds_hours")
+    design_bounds = metadata["planning_time_bounds_hours"]
+    if metadata["mode"] == "fixed_assets":
+        if design_bounds is not None:
+            raise ValueError("Fixed assets must not claim an operation-derived planning period")
+    elif design_bounds is None:
+        raise ValueError("Planning mode must declare its information time bounds")
+    else:
+        design_bounds = check_bounds(design_bounds,"planning_time_bounds_hours")
+        if metadata["mode"] == "preplanned":
+            if metadata.get("planning_time_axis") == "independent_design_climatology_not_operation_clock":
+                available_at = metadata.get("planning_information_available_at_operation_hour")
+                if not isinstance(available_at,(int,float)) or not np.isfinite(available_at) or available_at > operation_bounds[0]:
+                    raise ValueError("Independent design information must be available before operation")
+            elif design_bounds[1] > operation_bounds[0]:
+                raise ValueError("Preplanned input on the operation clock must end before operation")
+    if expected_timestamps is not None:
+        expected = interval_bounds_hours(expected_timestamps,1.0,stamp_unit="hour")
+        if not np.array_equal(operation_bounds,expected[[0,-1],[0,1]]):
+            raise ValueError("Asset boundary operation period differs from current timestamps")
+    if metadata["mode"] == "preplanned":
+        input_paths = {name:directory / "design_input" / f"{name}.npz" for name in ("daily_weather","hourly_weather","source_load_forecast")}
+    elif metadata["mode"] == "full_window_planning":
+        input_paths = {"operation_source_used_as_design":output_dir / "data" / "stage_11_operation" / "source_load_forecast.npz"}
+    else:
+        input_paths = {}
+    if set(metadata["planning_input_hashes"]) != set(input_paths):
+        raise ValueError("Planning input hash identities differ from the declared asset mode")
+    for name,path in input_paths.items():
+        if not path.exists():
+            raise ValueError(f"Planning input artifact is missing: {name}")
+        with np.load(path,allow_pickle=False) as payload:
+            inputs = {key:payload[key].copy() for key in payload.files}
+        if asset_snapshot_sha256(inputs) != metadata["planning_input_hashes"][name]:
+            raise ValueError(f"Planning input hash mismatch: {name}")
+    required = {"bus_ids","bus_nameplate_capacity_mw","branch_ids","branch_capacity_mva","electrical_buses","electrical_branches",
+                "storage_site_ids","storage_bus_ids","storage_power_mw","storage_energy_mwh","storage_initial_soc_mwh",
+                "thermal_bus_ids","thermal_land_capacity_upper_bound_mw"}
+    result = {"metadata":metadata}
+    for label,path in zip(("initial_assets","frozen_assets"),paths[:2]):
+        with np.load(path,allow_pickle=False) as payload:
+            arrays = {name:payload[name].copy() for name in payload.files}
+        if not required.issubset(arrays) or set(arrays)-required-{"refined_grid_buses"}:
+            raise ValueError(f"Incomplete or unknown {label} snapshot fields")
+        for name,value in arrays.items():
+            if value.dtype.kind not in "biuf" or not np.isfinite(value).all():
+                raise ValueError(f"Asset snapshot {name} must contain finite numeric data")
+        buses = entity_ids(arrays["bus_ids"],f"{label} bus_ids")
+        branches = entity_ids(arrays["branch_ids"],f"{label} branch_ids")
+        sites = entity_ids(arrays["storage_site_ids"],f"{label} storage_site_ids")
+        thermals = entity_ids(arrays["thermal_bus_ids"],f"{label} thermal_bus_ids")
+        for name,size in {"bus_nameplate_capacity_mw":len(buses),"branch_capacity_mva":len(branches),
+                          "storage_bus_ids":len(sites),"storage_power_mw":len(sites),"storage_energy_mwh":len(sites),
+                          "storage_initial_soc_mwh":len(sites),"thermal_land_capacity_upper_bound_mw":len(thermals)}.items():
+            if arrays[name].shape != (size,) or np.any(arrays[name] < 0):
+                raise ValueError(f"Asset {name} has invalid shape or negative values")
+        if not set(arrays["storage_bus_ids"]).issubset(set(buses)) or not set(thermals).issubset(set(buses)):
+            raise ValueError("Storage/thermal asset IDs must refer to snapshot buses")
+        for name,count,ids in (("electrical_buses",len(buses),buses),("electrical_branches",len(branches),branches)):
+            if arrays[name].ndim != 2 or len(arrays[name]) != count or arrays[name].shape[1] == 0 or not np.array_equal(arrays[name][:,0],ids):
+                raise ValueError(f"{name} rows must match fixed entity IDs")
+        if np.any(arrays["storage_initial_soc_mwh"] > arrays["storage_energy_mwh"] + 1e-6):
+            raise ValueError("Asset initial SOC exceeds storage energy capacity")
+        if asset_snapshot_sha256(arrays) != metadata[f"{label}_sha256"]:
+            raise ValueError(f"Asset snapshot hash mismatch: {label}")
+        result[label] = arrays
+    frozen = result["frozen_assets"]
+    if expected_bus_ids is not None and not np.array_equal(frozen["bus_ids"],expected_bus_ids):
+        raise ValueError("Frozen asset bus IDs differ from current operation")
+    if expected_branch_ids is not None and not np.array_equal(frozen["branch_ids"],expected_branch_ids):
+        raise ValueError("Frozen asset branch IDs differ from current operation")
+    return result
+
+
+def load_operation_checkpoint(output_dir: Path, *, expected_timestamps: np.ndarray | None = None,
+                              require_modern: bool = False) -> tuple[PowerFlowStore, StorageDispatchStore]:
+    """Read persisted runtime topology and physical dispatch without rerolling outages."""
+    layout = WorldDataLayout(output_dir / "data")
+    with np.load(layout.storage_dispatch / "storage_dispatch_power_flow.npz",allow_pickle=False) as payload:
+        power = PowerFlowStore.from_arrays({name:payload[name].copy() for name in payload.files})
+    with np.load(layout.storage_dispatch / "storage_dispatch.npz",allow_pickle=False) as payload:
+        storage = StorageDispatchStore.from_arrays({name:payload[name].copy() for name in payload.files})
+    if require_modern and (not power.operation_arrays or not storage.operation_arrays):
+        raise ValueError("Checkpoint lacks F runtime operation state; regenerate with --from-stage 1")
+    if not np.array_equal(power.timestamps,storage.timestamps) or (expected_timestamps is not None and not np.array_equal(power.timestamps,expected_timestamps)):
+        raise ValueError("Runtime operation checkpoints have inconsistent timestamps")
+    if not np.array_equal(power.branch_ids,storage.branch_ids):
+        raise ValueError("Runtime branch IDs differ between power flow and storage")
+    if storage.operation_arrays and not np.array_equal(storage.operation_arrays["bus_ids"],power.bus_ids):
+        raise ValueError("Runtime bus IDs differ between physical and storage accounts")
+    return power, storage
 
 
 def load_source_load_checkpoint(
@@ -162,20 +279,7 @@ def load_stage12_checkpoint(
     with np.load(stage_dir / "grid_electrical.npz", allow_pickle=False) as payload:
         electrical = _electrical_from_arrays(payload["electrical_buses"], payload["electrical_branches"], bus_by_id)
     with np.load(stage_dir / "power_flow_hourly.npz", allow_pickle=False) as payload:
-        power_flow = PowerFlowStore(
-            timestamps=payload["timestamps"].copy(),
-            bus_ids=payload["bus_ids"].copy(),
-            branch_ids=payload["branch_ids"].copy(),
-            bus_angle_rad=payload["bus_angle_rad"].copy(),
-            bus_p_injection_mw=payload["bus_p_injection_mw"].copy(),
-            served_load_mw=payload["served_load_mw"].copy(),
-            dispatched_generation_mw=payload["dispatched_generation_mw"].copy(),
-            unserved_load_mw=payload["unserved_load_mw"].copy(),
-            curtailed_generation_mw=payload["curtailed_generation_mw"].copy(),
-            line_flow_mw=payload["line_flow_mw"].copy(),
-            line_loading_ratio=payload["line_loading_ratio"].copy(),
-            slack_bus_id=int(payload["slack_bus_id"]),
-        )
+        power_flow = PowerFlowStore.from_arrays({name:payload[name].copy() for name in payload.files})
     return static_maps, topology, electrical, power_flow
 
 

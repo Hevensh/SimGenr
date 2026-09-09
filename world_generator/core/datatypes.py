@@ -402,9 +402,11 @@ class PowerFlowStore:
     line_flow_mw: np.ndarray
     line_loading_ratio: np.ndarray
     slack_bus_id: int
+    operation_arrays: dict[str, np.ndarray] = field(default_factory=dict)
+    operation_metadata: dict[str, object] = field(default_factory=dict)
 
     def as_arrays(self) -> dict[str, np.ndarray]:
-        return {
+        result = {
             "timestamps": self.timestamps,
             "bus_ids": self.bus_ids,
             "branch_ids": self.branch_ids,
@@ -418,6 +420,25 @@ class PowerFlowStore:
             "line_loading_ratio": self.line_loading_ratio,
             "slack_bus_id": np.asarray(self.slack_bus_id, dtype=np.int32),
         }
+        from world_generator.core.operation_contracts import operation_appendix_arrays, validate_operation_serialized_shapes
+        result.update(operation_appendix_arrays("power_flow", self.operation_arrays, self.operation_metadata,
+                      timestamps=self.timestamps, bus_ids=self.bus_ids, branch_ids=self.branch_ids))
+        if self.operation_arrays:
+            validate_operation_serialized_shapes(result,"power_flow")
+        return result
+
+    @classmethod
+    def from_arrays(cls, payload: dict[str, np.ndarray]) -> "PowerFlowStore":
+        from dataclasses import fields
+        from world_generator.core.operation_contracts import decode_operation_appendix, validate_operation_time_bounds
+        arrays, metadata = decode_operation_appendix(payload, "power_flow")
+        names = {item.name for item in fields(cls)} - {"operation_arrays", "operation_metadata"}
+        if not names.issubset(payload):
+            raise ValueError("Incomplete power-flow base fields")
+        store = cls(**{name: payload[name] for name in names}, operation_arrays=arrays, operation_metadata=metadata)
+        checked = store.as_arrays()
+        validate_operation_time_bounds(payload, checked)
+        return store
 
     def summary_dict(self) -> dict[str, float | int]:
         peak_loading = self.line_loading_ratio.max(axis=0) if self.line_loading_ratio.size else np.asarray([], dtype=np.float32)
@@ -611,9 +632,11 @@ class StorageDispatchStore:
     thermal_capacity_expansion_mw: np.ndarray
     baseline_line_loading_ratio: np.ndarray
     dispatched_line_loading_ratio: np.ndarray
+    operation_arrays: dict[str, np.ndarray] = field(default_factory=dict)
+    operation_metadata: dict[str, object] = field(default_factory=dict)
 
     def as_arrays(self) -> dict[str, np.ndarray]:
-        return {
+        result = {
             "timestamps": self.timestamps,
             "site_ids": self.site_ids,
             "site_bus_ids": self.site_bus_ids,
@@ -646,6 +669,27 @@ class StorageDispatchStore:
             "baseline_line_loading_ratio": self.baseline_line_loading_ratio,
             "dispatched_line_loading_ratio": self.dispatched_line_loading_ratio,
         }
+        from world_generator.core.operation_contracts import operation_appendix_arrays, validate_storage_operation_states, validate_operation_serialized_shapes
+        result.update(operation_appendix_arrays("storage_dispatch", self.operation_arrays, self.operation_metadata,
+                      timestamps=self.timestamps, branch_ids=self.branch_ids, site_ids=self.site_ids,
+                      thermal_bus_ids=self.thermal_bus_ids))
+        if self.operation_arrays:
+            validate_storage_operation_states(result)
+            validate_operation_serialized_shapes(result,"storage_dispatch")
+        return result
+
+    @classmethod
+    def from_arrays(cls, payload: dict[str, np.ndarray]) -> "StorageDispatchStore":
+        from dataclasses import fields
+        from world_generator.core.operation_contracts import decode_operation_appendix, validate_operation_time_bounds
+        arrays, metadata = decode_operation_appendix(payload, "storage_dispatch")
+        names = {item.name for item in fields(cls)} - {"operation_arrays", "operation_metadata"}
+        if not names.issubset(payload):
+            raise ValueError("Incomplete storage-dispatch base fields")
+        store = cls(**{name: payload[name] for name in names}, operation_arrays=arrays, operation_metadata=metadata)
+        checked = store.as_arrays()
+        validate_operation_time_bounds(payload, checked)
+        return store
 
     def summary_dict(self) -> dict[str, float | int]:
         baseline_overload = int(np.sum(self.baseline_line_loading_ratio > 1.0))

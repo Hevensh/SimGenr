@@ -10,10 +10,10 @@ from tqdm.auto import tqdm
 
 from world_generator.core.output_layout import WorldDataLayout
 from world_generator.core.contracts import entity_ids
-from world_generator.operation.stage_cache import load_stage12_checkpoint, load_dynamic_hydrology_checkpoint, load_source_load_checkpoint, validate_weather_checkpoint_time
+from world_generator.operation.stage_cache import load_stage12_checkpoint, load_dynamic_hydrology_checkpoint, load_source_load_checkpoint, load_asset_boundary_checkpoint, load_operation_checkpoint, validate_weather_checkpoint_time
 
 
-SCHEMA_VERSION = "0.9.0"
+SCHEMA_VERSION = "0.10.0"
 
 STATIC_CONTINUOUS_CHANNELS = (
     "elevation",
@@ -229,6 +229,18 @@ def package_world(
     hydrology_payload = hydrology_store.as_arrays() if hydrology_store is not None else {}
     source_load_store = load_source_load_checkpoint(world_dir, expected_timestamps=weather["timestamps"], expected_grid_shape=static_source["elevation"].shape) if exogenous is not None else None
     source_load_payload = source_load_store.as_arrays() if source_load_store is not None and source_load_store.nameplate_capacity_mw is not None else {}
+    operation_detail, power_flow_detail, asset_payload = {}, {}, {}
+    boundary_path = world_dir / "data" / "planning" / "asset_boundary.json"
+    if boundary_path.exists() or world_metadata.get("asset_planning") is not None:
+        boundary = load_asset_boundary_checkpoint(world_dir, expected_timestamps=weather["timestamps"],
+                    expected_bus_ids=forecast["bus_ids"],expected_branch_ids=power_flow["branch_ids"])
+        modern_power, modern_storage = load_operation_checkpoint(world_dir,expected_timestamps=weather["timestamps"],require_modern=True)
+        operation_detail, power_flow_detail = modern_storage.as_arrays(), modern_power.as_arrays()
+        asset_payload = {f"{group}__{name}":value for group in ("initial_assets","frozen_assets") for name,value in boundary[group].items()}
+        asset_payload["boundary_metadata_json"] = np.asarray(json.dumps(boundary["metadata"],sort_keys=True))
+        world_metadata["asset_planning"] = boundary["metadata"]
+    elif "operation_schema_version" in storage or "operation_schema_version" in power_flow:
+        raise ValueError("F runtime outputs require an explicit asset planning boundary")
     dynamic_payload = {
         "timestamps": weather["timestamps"].astype(np.int32),
         "weather": weather["dynamic"].astype(np.float32),
@@ -246,6 +258,12 @@ def package_world(
             dynamic_payload[name] = values.copy()
 
     graph_payload, graph_metadata = _graph_payload(topology, electrical)
+    graph_metadata["capacity_sources"] = {
+        "node_features.capacity_mw":"Stage12 pre-operation topology design capacity; retained legacy values",
+        "node_electrical.p_capacity_mw":"Stage14 electrical bus capacity; may include storage interface capacity",
+        "final_asset_capacity":"asset_planning.frozen_assets__bus_nameplate_capacity_mw is authoritative for the declared frozen bus asset snapshot" if asset_payload else "legacy_no_frozen_asset_boundary",
+        "physical_thermal_capacity":"operation_detail.op__thermal_installed_capacity_mw excludes storage; thermal_bus_ids define applicability" if operation_detail else "legacy_no_separate_physical_generator_account",
+    }
     operation_payload = _operation_payload(forecast, power_flow, storage, exogenous=exogenous)
 
     validation = _validate_modalities(
@@ -309,6 +327,9 @@ def package_world(
             ),
         },
         "graph": graph_metadata,
+        "asset_planning": world_metadata.get("asset_planning", {"mode":"legacy_full_window_unspecified"}),
+        "operation_detail": {"mode":"operation_v1" if operation_detail else "legacy_no_appendix",
+                             "fields":list(operation_detail),"semantics":"physical gross demand and generator output exclude storage; explicit island-local reserve accounts"},
         "operation": {
             "units": OPERATION_UNITS,
             "exogenous_available": exogenous is not None,
@@ -331,6 +352,9 @@ def package_world(
         **_prefix_payload("land", land_payload),
         **_prefix_payload("hydrology", hydrology_payload),
         **_prefix_payload("source_load", source_load_payload),
+        **_prefix_payload("operation_detail", operation_detail),
+        **_prefix_payload("power_flow_detail", power_flow_detail),
+        **_prefix_payload("asset_planning", asset_payload),
         **_prefix_payload("dynamic", dynamic_payload),
         **_prefix_payload("graph", graph_payload),
         **_prefix_payload("operation", operation_payload),
@@ -406,11 +430,21 @@ def dataset_schema() -> dict[str, object]:
                 "field_schema": "source_load_field_schema_json declares units and support; no shape-based classification",
                 "absent": "Legacy worlds remain readable without fabricated capacities or diagnostics",
             },
+            "operation_detail/power_flow_detail": {
+                "semantics":"Complete operation_v1 Stores; explicit named support, no leading-dimension inference",
+                "op__*":"Physical interval mean demand/generation/reserve and [T,N]/[T,E] runtime topology",
+                "soc_mwh":"[T+1,S] boundary states; window initial and previous power use their own preceding boundary",
+            },
+            "asset_planning": {
+                "initial_assets__/frozen_assets__":"Explicit fixed ID/capacity arrays and original/frozen asset snapshots",
+                "boundary_metadata_json":"Mode, input hashes, information cutoff, separate planning/operation clocks and dispatch foresight",
+                "window_use":"Separate design group; full-window planning assets remain oracle context, never relabeled issue-time inputs",
+            },
             "graph": {
                 "semantics": "only node and line are graph entities; A* paths are optional line geometry metadata",
                 "node_id": "int32 [N]",
                 "node_type": "int8 [N]",
-                "node_features": "float32 [N,5]",
+                "node_features": "float32 [N,5]; capacity_mw retains Stage12 pre-operation design values; F authoritative frozen assets live in asset_planning",
                 "node_source_id": "int32 [N] auxiliary source relationship",
                 "node_electrical": "float32 [N,6]",
                 "edge_id": "int32 [E]",
@@ -441,7 +475,7 @@ def dataset_schema() -> dict[str, object]:
         "node_type_mapping": NODE_TYPE_TO_ID,
         "static_units": STATIC_UNITS,
         "operation_units": OPERATION_UNITS,
-        "dispatch_semantics": "perfect_foresight_dispatch",
+        "dispatch_semantics": "declared_per_world_separately_from_asset_planning_mode",
         "forecast_evaluation": "Future weather is realized weather, not a forecast available at issue time. Final topology and dispatch were planned using the operation period.",
     }
 
@@ -673,14 +707,21 @@ def _land_accounting_payload(layout: WorldDataLayout, static: dict[str, np.ndarr
 
 
 def _world_provenance(world_metadata: dict[str, object]) -> dict[str, object]:
+    planning = world_metadata.get("asset_planning", {})
+    if not isinstance(planning,dict):
+        raise ValueError("Asset planning metadata must be a mapping")
+    mode = planning.get("mode","legacy_full_window_unspecified")
+    assets_oracle = mode in {"full_window_planning","legacy_full_window_unspecified"}
     return {
         "generator_version": world_metadata.get("generator_version", "legacy_unspecified"),
         "scenario_semantics": world_metadata.get("scenario_semantics", "unspecified_legacy"),
         "time_convention": world_metadata.get("time_convention", "unspecified_legacy"),
         "execution_stage_order": world_metadata.get("execution_stage_order", []),
         "land_accounting_version": world_metadata.get("land_accounting_version", "legacy_no_land_guarantee"),
-        "dispatch_semantics": "perfect_foresight_dispatch",
-        "forecast_feature_availability": "Future weather is realized; final topology, capacities and dispatch use the full operation period.",
+        "asset_planning_mode": mode,
+        "asset_planning_uses_operation_future": assets_oracle,
+        "dispatch_semantics": planning.get("dispatch_foresight","perfect_foresight_dispatch"),
+        "forecast_feature_availability": "Future weather is realized. " + ("Assets use the full operation period and are oracle context. " if assets_oracle else "Assets are frozen before operation. ") + "Operation optimizer foresight is declared independently and is not implied by the asset mode.",
     }
 
 

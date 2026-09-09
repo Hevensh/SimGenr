@@ -59,7 +59,7 @@ def test_provenance_does_not_rebrand_legacy_output_as_physics_v3():
     current = _world_provenance(source)
     assert all(current[key] == value for key, value in source.items())
     assert current["dispatch_semantics"] == "perfect_foresight_dispatch"
-    assert SCHEMA_VERSION == "0.9.0"
+    assert SCHEMA_VERSION == "0.10.0"
     assert STATIC_UNITS["population_density"] == "persons/km2"
     assert STATIC_UNITS["water_depth"] == STATIC_UNITS["hydrology_elevation"] == "m"
     assert "exogenous_p_load_mw" in dataset_schema()["sample_file"]["operation"]

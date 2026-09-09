@@ -28,13 +28,18 @@ from world_generator.hydrology.hydrology_generator import generate_hydrology
 from world_generator.land.land_generator import generate_static_land
 from world_generator.land_use.land_use_generator import generate_land_use_zones
 from world_generator.operation.grid_upgrade import build_grid_upgrade_plan
-from world_generator.operation.grid_update_loop import run_grid_update_loop
+from world_generator.operation.asset_planning import (
+    run_asset_planning, thermal_land_limits_from_ledger, align_source_to_assets,
+    operation_branch_mask, asset_snapshot, asset_snapshot_sha256, installed_assets, storage_initial_boundary,
+    restore_cached_thermal_land_boundary,
+)
 from world_generator.operation.power_flow import solve_dc_power_flow
 from world_generator.operation.source_load_forecast import generate_source_load_forecast
 from world_generator.operation.stage_cache import (
     load_hourly_weather_checkpoint,
     load_dynamic_hydrology_checkpoint,
     load_source_load_checkpoint,
+    load_asset_boundary_checkpoint,
     load_stage12_checkpoint,
     load_stage13_checkpoint,
     save_stage12_checkpoint,
@@ -259,55 +264,19 @@ def main() -> None:
         power_grid=config.power_grid,
     )
     progress.update()
-    progress.set_description("Stage 12 grid update")
-    update_loop = run_grid_update_loop(
-        source_load_forecast,
-        refined_topology,
-        grid_topology,
-        grid_electrical,
-        terrain_features,
-        hydrology,
-        land,
-        config.world,
-        config.power_grid,
+    progress.set_description(f"Stages 12-14 asset planning: {config.planning.mode}")
+    asset_result = run_asset_planning(
+        config=config, terrain=terrain_features, hydrology=hydrology, climate=climate,
+        land=land, land_use=land_use, topology=refined_topology, base_topology=grid_topology,
+        electrical=grid_electrical, operation_source=source_load_forecast,
+        thermal_land_limits_mw=thermal_land_limits_from_ledger(grid_nodes.thermal_project_land_ledger, refined_topology),
+        output_dir=data_dir / "planning",
     )
-    progress.update()
-    progress.set_description("Stage 13 storage need")
-    if update_loop.iterations:
-        final_iteration = update_loop.iterations[-1]
-        storage_need = analyze_storage_need(
-            final_iteration.refined_topology,
-            final_iteration.electrical,
-            final_iteration.power_flow,
-            config.world,
-            config.storage,
-        )
-    else:
-        storage_need = analyze_storage_need(
-            refined_topology,
-            grid_electrical,
-            power_flow,
-            config.world,
-            config.storage,
-        )
-    storage_plan = plan_storage_sites(
-        final_iteration.refined_topology if update_loop.iterations else refined_topology,
-        storage_need,
-        config.storage,
-    )
-    progress.update()
-    progress.set_description("Stage 14 storage dispatch")
-    final_topology = final_iteration.refined_topology if update_loop.iterations else refined_topology
-    final_electrical = final_iteration.electrical if update_loop.iterations else grid_electrical
-    final_power_flow = final_iteration.power_flow if update_loop.iterations else power_flow
-    storage_dispatch, storage_dispatch_forecast, storage_dispatch_power_flow, storage_dispatch_electrical = dispatch_storage_week(
-        final_topology,
-        final_electrical,
-        final_power_flow,
-        storage_plan,
-        config.storage,
-    )
-    progress.update()
+    update_loop, storage_need, storage_plan = asset_result.update_loop, asset_result.storage_need, asset_result.storage_plan
+    final_topology, final_electrical, final_power_flow = asset_result.final_topology, asset_result.final_electrical, asset_result.final_power_flow
+    storage_dispatch, storage_dispatch_forecast = asset_result.storage_dispatch, asset_result.dispatched_forecast
+    storage_dispatch_power_flow, storage_dispatch_electrical = asset_result.dispatched_power_flow, asset_result.dispatched_electrical
+    progress.update(3)
     progress.set_description("Writing outputs")
     static_maps = (
         terrain_features.as_maps()
@@ -384,7 +353,8 @@ def main() -> None:
                 "field_contracts": "field_contracts.json" if config.contracts.export_field_contracts else None,
                 "time_step_hours": config.contracts.time_step_hours,
                 "execution_stage_order": [1, 2, 4, 3, 5, 6, 7] + (["dynamic_hydrology"] if dynamic_hydrology is not None else []) + [8, 9, 10, 11, 12, 13, 14],
-                "scenario_semantics": "synthetic_realization_with_perfect_foresight_planning",
+                "scenario_semantics": f"synthetic_realization_{config.planning.mode}_with_perfect_foresight_dispatch",
+                "asset_planning": asset_result.metadata,
                 "grid_model": "single_voltage_lossless_DC_transmission_equivalent",
                 "stage14_line_expansion": "thermal_rerating_fixed_impedance",
                 "parameter_status": "uncalibrated_scenario_priors_except_documented_physical_constants_and_line_templates",
@@ -552,9 +522,14 @@ def _run_stage13_from_cache(
     data_layout = WorldDataLayout(data_dir)
     data_layout.create()
     progress = tqdm(total=2, unit="stage", dynamic_ncols=True, desc="Stage 13 storage need")
-    static_maps, topology, electrical, power_flow = load_stage12_checkpoint(output_dir)
-    storage_need = analyze_storage_need(topology, electrical, power_flow, config.world, config.storage)
-    storage_plan = plan_storage_sites(topology, storage_need, config.storage)
+    if config.planning.mode == "full_window_planning":
+        static_maps, topology, electrical, power_flow = load_stage12_checkpoint(output_dir)
+        storage_need = analyze_storage_need(topology, electrical, power_flow, config.world, config.storage)
+        storage_plan = plan_storage_sites(topology, storage_need, config.storage)
+    else:
+        # The cached operation week must not become a fresh design input.
+        static_maps, topology, electrical, power_flow, storage_plan = load_stage13_checkpoint(output_dir)
+        storage_need = analyze_storage_need(topology, electrical, power_flow, config.world, config.storage)
     np.savez_compressed(data_layout.storage_planning / "storage_need.npz", **storage_need.as_arrays())
     np.savez_compressed(data_layout.storage_planning / "storage_plan.npz", **storage_plan.as_arrays())
     (data_layout.storage_planning / "storage_need.json").write_text(
@@ -646,13 +621,35 @@ def _save_stage14_outputs(
 ) -> None:
     data_layout = WorldDataLayout(data_dir)
     data_layout.create()
+    source = load_source_load_checkpoint(data_dir.parent, expected_timestamps=power_flow.timestamps)
+    boundary = load_asset_boundary_checkpoint(data_dir.parent, expected_timestamps=source.timestamps)
+    topology, electrical = restore_cached_thermal_land_boundary(topology, electrical, static_maps.get("thermal_land_ledger"))
+    land_limits = thermal_land_limits_from_ledger(static_maps.get("thermal_land_ledger"), topology)
+    runtime_source = align_source_to_assets(source, topology, electrical)
+    service = operation_branch_mask(electrical, source.timestamps, config.planning.line_faults)
     storage_dispatch, dispatched_forecast, dispatched_power_flow, planned_electrical = dispatch_storage_week(
         topology,
         electrical,
         power_flow,
         storage_plan,
         config.storage,
+        source_forecast=runtime_source,
+        fixed_capacity=config.planning.mode != "full_window_planning",
+        branch_in_service=service,
+        thermal_land_limits_mw=land_limits,
+        initial_soc_mwh_by_site_id=storage_initial_boundary(storage_plan, config),
     )
+    installed_topology, installed_plan = installed_assets(topology, planned_electrical, storage_plan, storage_dispatch, config)
+    frozen = asset_snapshot(installed_topology, planned_electrical, installed_plan, land_limits)
+    frozen_hash = asset_snapshot_sha256(frozen)
+    boundary_metadata = dict(boundary["metadata"])
+    if config.planning.mode != "full_window_planning" and frozen_hash != boundary_metadata["frozen_assets_sha256"]:
+        raise ValueError("Cached operation changed frozen assets; regenerate with --from-stage 1")
+    boundary_metadata["frozen_assets_sha256"] = frozen_hash
+    boundary_metadata["initial_state_policy"] = "optimized_periodic_runtime" if config.storage.cyclic_state_of_charge else "fixed_prior_boundary"
+    planning_dir = data_dir / "planning"
+    np.savez_compressed(planning_dir / "frozen_assets.npz", **frozen)
+    (planning_dir / "asset_boundary.json").write_text(json.dumps(boundary_metadata, indent=2), encoding="utf-8")
     np.savez_compressed(data_layout.storage_dispatch / "storage_dispatch.npz", **storage_dispatch.as_arrays())
     np.savez_compressed(
         data_layout.storage_dispatch / "storage_dispatch_forecast.npz", **dispatched_forecast.as_arrays()
@@ -674,6 +671,7 @@ def _save_stage14_outputs(
         encoding="utf-8",
     )
     metadata = json.loads(data_layout.metadata.read_text(encoding="utf-8"))
+    metadata["asset_planning"] = boundary_metadata
     metadata["storage_dispatch"] = storage_dispatch.summary_dict()
     metadata["storage_plan"] = storage_plan.summary_dict()
     need_path = data_layout.storage_planning / "storage_need.json"
@@ -722,6 +720,8 @@ def _validate_cached_physics(output_dir: Path, config: object, from_stage: int) 
         raise ValueError(f"Upstream configuration changed ({', '.join(changed)}); run --from-stage 1")
     if from_stage == 14 and cached["storage"] != current["storage"]:
         raise ValueError("Storage parameters changed; rerun storage sizing with --from-stage 13")
+    if config.planning.mode != "full_window_planning" and cached["storage"] != current["storage"]:
+        raise ValueError("Frozen planning/dispatch configuration changed; regenerate with --from-stage 1")
     if config.hydrology_dynamic.enabled or metadata.get("dynamic_hydrology") is not None:
         weather = load_hourly_weather_checkpoint(output_dir)
         dynamic = load_dynamic_hydrology_checkpoint(output_dir, expected_timestamps=weather.timestamps,
@@ -731,6 +731,9 @@ def _validate_cached_physics(output_dir: Path, config: object, from_stage: int) 
     weather = load_hourly_weather_checkpoint(output_dir)
     load_source_load_checkpoint(output_dir, expected_timestamps=weather.timestamps,
                                 expected_grid_shape=(config.world.height, config.world.width))
+    boundary = load_asset_boundary_checkpoint(output_dir, expected_timestamps=weather.timestamps)
+    if boundary["metadata"]["mode"] != config.planning.mode or metadata.get("asset_planning") != boundary["metadata"]:
+        raise ValueError("Asset boundary mode/metadata differs from its checkpoint; regenerate with --from-stage 1")
 
 
 if __name__ == "__main__":

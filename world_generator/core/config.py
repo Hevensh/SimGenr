@@ -598,12 +598,93 @@ class StorageConfig:
     emergency_discharge_cost: float = 4.0
     soc_band_penalty: float = 2.0
     renewable_dispatch_credit: float = 0.05
+    # S: aggregate upward reserve scenario; no network deliverability claim.
+    reserve_load_fraction: float = 0.0
+    reserve_contingency_mw: float = 0.0
+    reserve_duration_hours: float = 1.0
+    reserve_response_hours: float = 0.25
+    reserve_shortfall_cost: float = 1000.0
+    reserve_offer_cost: float = 0.01
+    # S: pre-window dispatch used when the boundary is not cyclic.
+    initial_thermal_mw: float = 0.0
+    initial_storage_net_mw: float = 0.0
+
+    def __post_init__(self) -> None:
+        import math
+        for name, value in vars(self).items():
+            if isinstance(value, (int, float)) and not math.isfinite(value):
+                raise ValueError(f"storage.{name} must be finite")
+        for name in ("reserve_load_fraction", "reserve_contingency_mw", "reserve_offer_cost", "initial_thermal_mw",
+                     "thermal_ramp_fraction_per_hour", "storage_power_ramp_fraction_per_hour", "normal_dispatch_c_rate"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"storage.{name} must be nonnegative")
+        for name in ("reserve_duration_hours", "reserve_response_hours", "reserve_shortfall_cost"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"storage.{name} must be positive")
 
 
 @dataclass(frozen=True)
 class OutputConfig:
     root: str = "outputs"
     world_name: str = "small_debug"
+
+
+@dataclass(frozen=True)
+class PlanningConfig:
+    """S: explicit asset information boundary, separate from dispatch policy."""
+
+    mode: str = "full_window_planning"
+    design_days: int = 7
+    design_start_day_of_year: int = 0
+    design_seed: int = 190731
+    design_weather_overrides: dict[str, Any] = field(default_factory=dict)
+    design_source_load_overrides: dict[str, Any] = field(default_factory=dict)
+    fixed_storage_sites: tuple[dict[str, Any], ...] = ()
+    line_faults: tuple[dict[str, Any], ...] = ()
+
+    def __post_init__(self) -> None:
+        import math
+
+        if self.mode not in {"fixed_assets", "preplanned", "full_window_planning"}:
+            raise ValueError("planning.mode must be fixed_assets, preplanned or full_window_planning")
+        object.__setattr__(self, "fixed_storage_sites", tuple(dict(site) for site in self.fixed_storage_sites))
+        object.__setattr__(self, "line_faults", tuple(dict(fault) for fault in self.line_faults))
+        for name in ("design_days", "design_start_day_of_year", "design_seed"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < (1 if name == "design_days" else 0):
+                raise ValueError(f"planning.{name} must be an integer in its supported range")
+        if self.design_start_day_of_year >= 365:
+            raise ValueError("planning.design_start_day_of_year must be 0..364")
+        if self.mode != "fixed_assets" and self.fixed_storage_sites:
+            raise ValueError("planning.fixed_storage_sites is only applicable to fixed_assets mode")
+        if set(self.design_weather_overrides) & {"days", "hourly_week_days", "start_day_of_year"}:
+            raise ValueError("Use planning design_days/start_day fields to define the design clock")
+        WeatherConfig(**self.design_weather_overrides)
+        SourceLoadConfig(**self.design_source_load_overrides)
+        site_ids = []
+        for index, site in enumerate(self.fixed_storage_sites):
+            if set(site) - {"site_id", "bus_id", "power_mw", "energy_mwh", "initial_soc_fraction"}:
+                raise ValueError("Unknown fixed storage site property")
+            for name in ("bus_id",):
+                if name not in site or isinstance(site[name], bool) or not isinstance(site[name], int) or site[name] < 0:
+                    raise ValueError("Fixed storage bus_id must be a nonnegative integer")
+            site_id = site.get("site_id", index)
+            if isinstance(site_id, bool) or not isinstance(site_id, int) or site_id < 0:
+                raise ValueError("Fixed storage site_id must be a nonnegative integer")
+            site_ids.append(site_id)
+            for name in ("power_mw", "energy_mwh"):
+                if name not in site or not math.isfinite(site[name]) or site[name] <= 0:
+                    raise ValueError("Fixed storage power/energy must be positive and finite")
+            if "initial_soc_fraction" in site and not 0 <= site["initial_soc_fraction"] <= 1:
+                raise ValueError("Fixed storage initial SOC fraction must be [0,1]")
+        if len(set(site_ids)) != len(site_ids):
+            raise ValueError("Fixed storage site IDs must be unique")
+        for fault in self.line_faults:
+            if set(fault) != {"branch_id", "start_offset_hours", "duration_hours"}:
+                raise ValueError("Line faults need branch_id, start_offset_hours and duration_hours")
+            for name, value in fault.items():
+                if isinstance(value, bool) or not isinstance(value, int) or value < (1 if name == "duration_hours" else 0):
+                    raise ValueError("Line fault identifiers/offsets must be nonnegative integers and duration positive")
 
 
 @dataclass(frozen=True)
@@ -624,6 +705,7 @@ class WorldConfig:
     output: OutputConfig = field(default_factory=OutputConfig)
     contracts: ContractConfig = field(default_factory=ContractConfig)
     hydrology_dynamic: HydrologyDynamicConfig = field(default_factory=HydrologyDynamicConfig)
+    planning: PlanningConfig = field(default_factory=PlanningConfig)
 
     def __post_init__(self) -> None:
         # P: capacities cannot be negative; do not silently clip bad scenarios.
@@ -661,6 +743,7 @@ def load_world_config(path: str | Path) -> WorldConfig:
         storage=StorageConfig(**data.get("storage", {})),
         output=OutputConfig(**data.get("output", {})),
         contracts=ContractConfig(**data.get("contracts", {})),
+        planning=PlanningConfig(**data.get("planning", {})),
         hydrology_dynamic=HydrologyDynamicConfig(**data.get("hydrology_dynamic", {})),
     )
 

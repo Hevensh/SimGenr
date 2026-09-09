@@ -12,6 +12,7 @@ import numpy as np
 
 from world_generator.core.hydrology_contracts import hydrology_field_schema
 from world_generator.core.source_load_contracts import source_load_field_schema
+from world_generator.core.operation_contracts import operation_field_schema, operation_store_field_schema
 
 GENERATOR_VERSION = "physics_v4"
 CONTRACT_VERSION = "1.0"
@@ -224,6 +225,15 @@ def field_contract_document(step_hours: float = 1.0) -> dict[str, object]:
         fields[f"source_load.{name}"].update(shape=spec["shape"],
             generation_relation_type=spec["generation_relation_type"], accounting_relation_type="P",
             generation_note="Scenario equipment/load diagnostics; energy and capacity-factor accounting use the declared nameplate and intervals")
+    for store_kind in ("power_flow","storage_dispatch"):
+        for name,spec in operation_store_field_schema(store_kind).items():
+            relation = spec.get("relation_class", "S" if spec["time_kind"] in {"metadata","fixed_asset_attribute","fixed_entity_identity","fixed_operation_parameter","world_terminal_target","interval_end_target","legacy_reference_identity"} else "P")
+            key = f"operation.{store_kind}.{name}"
+            add(key,spec["unit"],spec["time_kind"],spec["shape"],spec["time_kind"],
+                store_kind,("operation_validation","dataset","cached_operation_resume"),relation,"F_realized_operation_with_frozen_asset_boundary")
+            fields[key].update(spec)
+        for name,spec in operation_field_schema(store_kind).items():
+            fields[f"operation.{store_kind}.op__{name}"].update(spec)
     for name, unit in WEATHER_UNITS.items():
         add(f"weather.{name}", unit, "accumulation" if name == "precipitation" else "interval_mean", "cell_area_representative", "explicit_interval_bounds_hours", "weather", ("source_load", "hydrology", "daily_aggregation"), "P" if name in {"wind_speed", "humidity", "pressure"} else "E", "exogenous_weather")
     add("weather.diagnostic__specific_humidity_kg_kg", "kg/kg moist air", "interval_representative_primitive", "cell", "explicit_interval_bounds_hours", "weather", ("moist_air_diagnosis", "source_load"), "S", "prescribed_moisture_forcing")
@@ -269,6 +279,7 @@ def field_contract_document(step_hours: float = 1.0) -> dict[str, object]:
         "fields": fields,
         "dynamic_hydrology_field_schema": hydrology_field_schema(),
         "source_load_field_schema": source_load_field_schema(),
+        "operation_store_field_schema": {kind:operation_store_field_schema(kind) for kind in ("power_flow","storage_dispatch")},
         "artifact_field_overrides": artifact_overrides,
         "matrix_columns": {
             "electrical_buses": ["id:1", "nominal:kV", "P_capacity:MW", "Q_capacity:Mvar", "base_load:MW", "power_factor:1", "voltage_setpoint:pu"],

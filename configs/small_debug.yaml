@@ -1,5 +1,12 @@
 seed: 42
 
+planning:
+  # S: oracle asset planning with full operation-window truth, explicit default.
+  mode: full_window_planning
+  design_days: 7
+  design_start_day_of_year: 0
+  design_seed: 190731
+
 # S: the public generator currently supports one-hour intervals only.
 # P: all integrations and accumulated depths carry explicit time support.
 contracts:

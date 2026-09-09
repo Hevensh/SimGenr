@@ -23,6 +23,7 @@ from world_generator.weather.physics import extraterrestrial_hourly_irradiance, 
 from world_generator.weather.physics import diagnose_moist_air, saturation_vapor_pressure_hpa
 from scripts.hydrology_validation import check_dynamic_hydrology
 from scripts.source_load_validation import check_source_load_contracts
+from scripts.operation_validation import check_operation_contracts, check_frozen_asset_contracts
 
 
 def _npz(path: Path) -> dict[str, np.ndarray]:
@@ -460,6 +461,8 @@ def validate_world(world_dir: Path) -> dict[str, object]:
     checks.upper("soc_upper_bound", soc, config.storage.maximum_soc_fraction * energy_capacity[None, :], 2e-3, "MWh")
     if config.storage.cyclic_state_of_charge:
         checks.equal("soc_cycle_closure", soc[-1] - soc[0], 2e-3, "MWh")
+    elif "op__initial_soc_mwh" in storage:
+        checks.equal("soc_initial_state", soc[0] - storage["op__initial_soc_mwh"], 2e-3, "MWh")
     else:
         checks.equal("soc_initial_state", soc[0] - config.storage.initial_soc_fraction * energy_capacity, 2e-3, "MWh")
     checks.upper("storage_charge_nonnegative", -charge, 0.0, 1e-6, "MW")
@@ -485,6 +488,12 @@ def validate_world(world_dir: Path) -> dict[str, object]:
     thermal_ramps = thermal - np.roll(thermal, 1, axis=0) if config.storage.cyclic_state_of_charge else np.diff(thermal, axis=0)
     checks.upper("thermal_ramp", np.abs(thermal_ramps), config.storage.thermal_ramp_fraction_per_hour * thermal_capacity[None, :], 2e-3, "MW/hour")
 
+    operation_summary = {"mode": "legacy_without_operation_v1"}
+    if "operation_schema_version" in storage:
+        operation_summary = check_operation_contracts(checks, storage, flow, electrical, source, config,
+            _npz(layout.buses / "grid_nodes.npz").get("thermal_land_ledger"))
+        operation_summary["asset_boundary"] = check_frozen_asset_contracts(checks, world_dir, storage, flow, electrical, config)
+
     return {
         "world": world_dir.name, "generator_version": metadata.get("generator_version", "unspecified"),
         "scenario_semantics": metadata.get("scenario_semantics", "unspecified"),
@@ -495,8 +504,9 @@ def validate_world(world_dir: Path) -> dict[str, object]:
                     "total_unserved_mwh": float(flow["unserved_load_mw"].sum()),
                     "total_curtailed_mwh": float(flow["curtailed_generation_mw"].sum()),
                     "storage_site_count": int(storage["site_ids"].size), "land_accounting": land_summary,
-                    "dynamic_hydrology": hydrology_summary, "source_load": source_load_summary},
-        "limitations": "Checks validate exported physical identities and constraints, not empirical realism or forecast accuracy. A PASS can include explicitly reported unserved energy when load shedding is allowed; it does not imply supply adequacy. Capacity factors are descriptive only. Final graph and dispatch use perfect foresight.",
+                    "dynamic_hydrology": hydrology_summary, "source_load": source_load_summary,
+                    "operation": operation_summary},
+        "limitations": "Checks validate exported physical identities and constraints, not empirical realism or forecast accuracy. A PASS can include explicitly reported unserved energy when load shedding is allowed; it does not imply supply adequacy. Capacity factors are descriptive only. Asset planning mode is declared separately from full-window dispatch foresight. Island reserve accounting does not certify reserve activation deliverability, AC voltage or frequency security.",
     }
 
 

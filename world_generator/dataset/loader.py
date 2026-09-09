@@ -85,6 +85,21 @@ class SimGenrDataset:
         metadata = json.loads(str(payload["metadata_json"]))
         hydrology = _extract_group(payload, "hydrology")
         source_load = _extract_group(payload, "source_load")
+        operation_detail = _extract_group(payload,"operation_detail")
+        power_flow_detail = _extract_group(payload,"power_flow_detail")
+        asset_planning = _extract_group(payload,"asset_planning")
+        operation_mode = metadata.get("operation_detail",{}).get("mode","legacy_no_appendix")
+        if operation_mode not in {"legacy_no_appendix","operation_v1"} or (operation_mode == "operation_v1") != bool(operation_detail) or bool(operation_detail) != bool(power_flow_detail) or bool(operation_detail) != bool(asset_planning):
+            raise ValueError("Dataset F operation/asset appendices must be complete and explicitly declared")
+        if operation_detail:
+            from world_generator.core.datatypes import StorageDispatchStore, PowerFlowStore
+            storage_store = StorageDispatchStore.from_arrays(operation_detail)
+            power_store = PowerFlowStore.from_arrays(power_flow_detail)
+            if not np.array_equal(storage_store.timestamps,payload["dynamic__timestamps"]) or not np.array_equal(power_store.timestamps,storage_store.timestamps):
+                raise ValueError("Dataset runtime operation time differs from weather")
+            if not np.array_equal(storage_store.branch_ids,power_store.branch_ids) or not np.array_equal(storage_store.operation_arrays["bus_ids"],power_store.bus_ids):
+                raise ValueError("Dataset runtime stores do not share fixed entity IDs")
+            _validate_asset_planning_group(asset_planning,storage_store.operation_arrays["bus_ids"],storage_store.branch_ids)
         source_declaration = metadata.get("source_load", {})
         if not isinstance(source_declaration, dict):
             raise ValueError("Dataset source/load metadata must be a mapping")
@@ -119,6 +134,9 @@ class SimGenrDataset:
             "land": _extract_group(payload, "land"),
             "hydrology": hydrology,
             "source_load": source_load,
+            "operation_detail":operation_detail,
+            "power_flow_detail":power_flow_detail,
+            "asset_planning":asset_planning,
             "dynamic": _extract_group(payload, "dynamic"),
             "graph": _extract_group(payload, "graph"),
             "operation": _extract_group(payload, "operation"),
@@ -183,6 +201,8 @@ class TemporalWindowDataset:
         history_source, future_source, static_source = _split_source_load(
             world.get("source_load", {}), start, history_end, forecast_end, hours
         )
+        history_detail,future_detail,static_detail = _split_operation_detail(world.get("operation_detail",{}),start,history_end,forecast_end,hours,"storage_dispatch")
+        history_power,future_power,static_power = _split_operation_detail(world.get("power_flow_detail",{}),start,history_end,forecast_end,hours,"power_flow")
         window = {
             "sample_id": world["sample_id"],
             "seed": world["seed"],
@@ -190,21 +210,28 @@ class TemporalWindowDataset:
             "static": world["static"],
             "land": world.get("land", {}),
             "graph": world["graph"],
+            "asset_planning": world.get("asset_planning",{}),
             "history": {
                 **_slice_weather(world["dynamic"], start, history_end, hours),
                 "operation": history_operation,
                 "hydrology": history_hydrology,
                 "source_load": history_source,
+                "operation_detail":history_detail,
+                "power_flow_detail":history_power,
             },
             "future": {
                 **_slice_weather(world["dynamic"], history_end, forecast_end, hours),
                 "operation": future_operation,
                 "hydrology": future_hydrology,
                 "source_load": future_source,
+                "operation_detail":future_detail,
+                "power_flow_detail":future_power,
             },
             "operation_static": static_operation,
             "hydrology_static": static_hydrology,
             "source_load_static": static_source,
+            "operation_detail_static":static_detail,
+            "power_flow_detail_static":static_power,
             "metadata": world["metadata"],
             "prepared_static": world.get("prepared_static"),
         }
@@ -345,6 +372,54 @@ def _split_hydrology(
         else:
             shared[name] = values
     return history, future, shared
+
+
+def _validate_asset_planning_group(group:dict[str,Any], bus_ids:np.ndarray, branch_ids:np.ndarray) -> None:
+    from world_generator.operation.asset_planning import asset_snapshot_sha256
+    from world_generator.core.operation_contracts import PLANNING_MODES
+    if "boundary_metadata_json" not in group:
+        raise ValueError("Dataset assets lack planning information boundary")
+    metadata = json.loads(str(group["boundary_metadata_json"]))
+    if metadata.get("schema_version") != "asset_planning_v1" or metadata.get("mode") not in PLANNING_MODES:
+        raise ValueError("Dataset assets have unknown planning mode/schema")
+    for label in ("initial_assets","frozen_assets"):
+        arrays = {name.removeprefix(label+"__"):np.asarray(value) for name,value in group.items() if name.startswith(label+"__")}
+        if not arrays or asset_snapshot_sha256(arrays) != metadata.get(label+"_sha256"):
+            raise ValueError("Dataset asset snapshot hash mismatch")
+        if label == "frozen_assets" and (not np.array_equal(arrays.get("bus_ids"),bus_ids) or not np.array_equal(arrays.get("branch_ids"),branch_ids)):
+            raise ValueError("Dataset frozen asset IDs differ from operation IDs")
+
+
+def _split_operation_detail(payload:dict[str,Any],start:int,history_end:int,forecast_end:int,hours:int,store_kind:str) -> tuple[dict[str,Any],dict[str,Any],dict[str,Any]]:
+    if not payload:
+        return {},{},{}
+    from world_generator.core.operation_contracts import operation_store_field_schema
+    schema = operation_store_field_schema(store_kind)
+    if set(payload) != set(schema):
+        raise ValueError("Operation detail lacks explicit complete field support")
+    history,future,shared = {},{},{}
+    boundary_fields = {"op__initial_soc_mwh","op__previous_storage_net_mw","op__previous_thermal_mw"}
+    for name,value in payload.items():
+        if name in boundary_fields:
+            continue
+        support = schema[name]["shape"]
+        if str(support).split(",")[0] == "T":
+            if value.shape[0] != hours:
+                raise ValueError(f"Operation detail {name} differs from weather time axis")
+            history[name],future[name] = value[start:history_end],value[history_end:forecast_end]
+        elif str(support).split(",")[0] == "T+1":
+            if value.shape[0] != hours+1:
+                raise ValueError(f"Operation detail {name} lacks terminal boundary")
+            history[name],future[name] = value[start:history_end+1],value[history_end:forecast_end+1]
+        else:
+            shared[name] = value
+    if store_kind == "storage_dispatch":
+        def boundaries(index:int) -> dict[str,Any]:
+            return {"op__initial_soc_mwh":payload["soc_mwh"][index],
+                    "op__previous_storage_net_mw":payload["op__previous_storage_net_mw"] if index==0 else payload["discharge_mw"][index-1]-payload["charge_mw"][index-1],
+                    "op__previous_thermal_mw":payload["op__previous_thermal_mw"] if index==0 else payload["op__thermal_dispatch_mw"][index-1]}
+        history.update(boundaries(start)); future.update(boundaries(history_end))
+    return history,future,shared
 
 
 def _split_operation(

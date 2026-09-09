@@ -84,7 +84,7 @@ tau、dt 单位 h；主流程 dt=1 h，换算 helper 支持半小时。
 温度不再被静默裁成 150 K；配置初温和外部温度必须超过绝对零度。
 输出六个诊断：hub_wind_speed_mps、wind_air_density_kg_m3、pv_poa_w_m2、pv_module_temperature_c、load_effective_temperature_c、load_log_residual。
 诊断输出 float32、内部计算 float64；非适用母线填零并由明确的 bus-kind 适用表解释。
-名牌容量、基准需求、初温、实际采样行列作为静态附录传给 Store。
+名牌容量、基准需求和实际采样行列作为固定属性传给 Store；初温是窗口前边界状态，N 形状不代表它是静态属性。
 Store 按 A 的显式 MW×h 积分导出请求、可用和计划能量，以及容量因子有效掩码；零容量不除零。
 `available-scheduled` 中的闲置火电不称弃电；实际送达、火电回调、弃风弃光和缺供等待 F 运行结果。
 
