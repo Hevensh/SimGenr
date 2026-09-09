@@ -71,3 +71,26 @@ def test_config_snapshot_and_field_semantics(tmp_path):
     assert fields["soc_mwh"]["time_support"] == "T+1_interval_boundaries"
     assert fields["buildability"]["quantity_kind"] == "score"
     assert fields["flow_accumulation"]["unit"] == "km2"
+
+
+def test_daily_indices_do_not_truncate_accepted_timestamp_roundoff():
+    day_ids, sums = aggregate_complete_days(np.ones(48), np.arange(48) * (1 - 1e-11), quantity_kind="accumulation")
+    np.testing.assert_array_equal(day_ids, [0, 1])
+    np.testing.assert_array_equal(sums, [24, 24])
+
+
+@pytest.mark.parametrize("value", [float("nan"), 1.1])
+def test_weather_class_and_entity_ids_reject_noninteger_labels(value):
+    with pytest.raises(ValueError, match="integer"):
+        validate_weather_arrays(np.zeros((1, 1, 1, 1)), np.full((1, 1, 1), value), np.array([0]), ("cloud",), "hour")
+    with pytest.raises(ValueError, match="integer"):
+        validate_node_arrays(np.array([0]), np.array([value]), {"p_load_mw": np.ones((1, 1))})
+
+
+def test_identical_power_keys_have_artifact_specific_information_layers():
+    contracts = field_contract_document()["artifact_field_overrides"]
+    source = contracts["stage_11_operation/source_load_forecast.npz"]
+    dispatch = contracts["stage_14_storage_dispatch/storage_dispatch_forecast.npz"]
+    assert source["p_load_mw"]["semantic_layer"] == "exogenous_source_load"
+    assert dispatch["p_load_mw"]["semantic_layer"] == "operation_result_with_storage_requests"
+    assert dispatch["q_load_mvar"]["quantity_kind"] == "placeholder"

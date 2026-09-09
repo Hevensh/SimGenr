@@ -72,6 +72,13 @@ def test_physics_v4_retains_population_units_and_requires_exogenous_data():
     assert not _has_physical_units({"generator_version": "unknown_future"})
 
 
+def test_fractional_ids_cannot_alias_when_mapping_source_energy():
+    source = _source()
+    source["bus_ids"] = np.array([10.1, 10.2, 30, 40])
+    with pytest.raises(ValueError, match="integer"):
+        _exogenous_payload(source, source["bus_ids"].copy(), source["timestamps"])
+
+
 def test_temporal_split_uses_field_semantics_when_nodes_or_sites_equal_hours():
     operation = {
         "timestamps": np.arange(4), "bus_ids": np.arange(4),

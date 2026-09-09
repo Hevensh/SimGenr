@@ -37,6 +37,24 @@ def cell_area_km2(cell_size_km: float) -> float:
     return positive_finite(cell_size_km, "cell_size_km") ** 2
 
 
+def integer_labels(values: np.ndarray, name: str) -> np.ndarray:
+    labels = np.asarray(values)
+    if labels.dtype.kind not in "iuf" or not np.isfinite(labels).all():
+        raise ValueError(f"{name} must contain finite integer labels")
+    if labels.dtype.kind == "f" and (np.any(labels != np.rint(labels)) or np.any(np.abs(labels) > 2**53)):
+        raise ValueError(f"{name} must contain exactly representable integer labels")
+    if labels.size and (int(labels.min()) < -(2**63) or int(labels.max()) >= 2**63):
+        raise ValueError(f"{name} exceeds signed 64-bit label range")
+    return labels.astype(np.int64)
+
+
+def entity_ids(values: np.ndarray, name: str = "bus_ids") -> np.ndarray:
+    ids = integer_labels(values, name)
+    if ids.ndim != 1 or len(np.unique(ids)) != len(ids):
+        raise ValueError(f"{name} must be one-dimensional and unique")
+    return ids
+
+
 def depth_mm_to_volume_m3(depth_mm: np.ndarray, area_km2: np.ndarray | float) -> np.ndarray:
     depth = finite_array(depth_mm, "depth_mm", nonnegative=True)
     area = finite_array(area_km2, "area_km2", nonnegative=True)
@@ -101,7 +119,8 @@ def aggregate_complete_days(values: np.ndarray, timestamps: np.ndarray, *, quant
         result /= count
     elif quantity_kind == "rate":
         result *= step_hours
-    return (bounds[::count, 0] / 24).astype(np.int64), result
+    # Accepted sub-nanosecond timestamp noise must not truncate day 1 to day 0.
+    return np.rint(bounds[::count, 0] / 24).astype(np.int64), result
 
 
 def validate_weather_arrays(dynamic: np.ndarray, weather_class: np.ndarray, timestamps: np.ndarray,
@@ -115,6 +134,7 @@ def validate_weather_arrays(dynamic: np.ndarray, weather_class: np.ndarray, time
         raise ValueError("weather channel names must be unique")
     if np.shape(weather_class) != (values.shape[0], *values.shape[2:]):
         raise ValueError("weather_class must be [time,y,x] matching dynamic")
+    integer_labels(weather_class, "weather_class")
     if np.shape(timestamps) != (values.shape[0],):
         raise ValueError("weather timestamps do not match dynamic time dimension")
     interval_bounds_hours(timestamps, 1.0 if time_unit == "hour" else 24.0, stamp_unit=time_unit)
@@ -122,9 +142,7 @@ def validate_weather_arrays(dynamic: np.ndarray, weather_class: np.ndarray, time
 
 def validate_node_arrays(timestamps: np.ndarray, bus_ids: np.ndarray, arrays: Mapping[str, np.ndarray]) -> None:
     interval_bounds_hours(timestamps, 1.0)
-    ids = np.asarray(bus_ids)
-    if ids.ndim != 1 or len(np.unique(ids)) != len(ids):
-        raise ValueError("bus_ids must be one-dimensional and unique")
+    ids = entity_ids(bus_ids)
     expected = (len(timestamps), len(ids))
     for name, values in arrays.items():
         data = finite_array(values, name, nonnegative=True)
@@ -177,9 +195,9 @@ def field_contract_document(step_hours: float = 1.0) -> dict[str, object]:
     add("protected water_buffer river river_centerline lake urban_mask", "1", "mask", "cell", "static", "land/hydrology/city", ("site_constraints",), "S", "static_design")
     for name, unit in WEATHER_UNITS.items():
         add(f"weather.{name}", unit, "accumulation" if name == "precipitation" else "interval_mean", "cell_area_representative", "explicit_interval_bounds_hours", "weather", ("source_load", "hydrology", "daily_aggregation"), "P" if name in {"wind_speed", "humidity", "pressure"} else "E", "exogenous_weather")
-    add("p_load_mw p_gen_available_mw", "MW", "interval_mean", "bus", "hour_interval", "source_load", ("planning", "dispatch"), "E", "exogenous_source_load")
+    add("p_load_mw p_gen_available_mw", "MW", "interval_mean", "bus", "hour_interval", "artifact_dependent_see_overrides", ("planning", "dispatch"), "E", "artifact_dependent_see_overrides")
     add("p_gen_scheduled_mw", "MW", "interval_mean", "bus", "hour_interval", "planning_or_dispatch", ("power_flow",), "S", "planned_or_operated_power_by_artifact")
-    add("q_load_mvar", "Mvar", "interval_mean", "bus", "hour_interval", "source_load", ("optional_AC",), "S", "exogenous_source_load")
+    add("q_load_mvar", "Mvar", "interval_mean", "bus", "hour_interval", "artifact_dependent_see_overrides", ("optional_AC",), "S", "artifact_dependent_see_overrides")
     add("bus_p_injection_mw served_load_mw dispatched_generation_mw unserved_load_mw curtailed_generation_mw", "MW", "interval_mean", "bus", "hour_interval", "power_flow", ("validation", "dataset"), "P", "operation_result")
     add("line_flow_mw", "MW", "interval_mean", "directed_branch_from_to", "hour_interval", "power_flow", ("validation", "dispatch"), "P", "operation_result")
     add("bus_angle_rad", "rad", "diagnostic", "bus_relative_to_island_reference", "hour_interval_DC", "power_flow", ("validation",), "P", "operation_result")
@@ -188,6 +206,18 @@ def field_contract_document(step_hours: float = 1.0) -> dict[str, object]:
     add("soc_mwh", "MWh", "state", "storage_site", "T+1_interval_boundaries", "storage_dispatch", ("validation", "next_interval"), "P", "operation_result")
     add("site_power_capacity_mw storage_power_expansion_mw thermal_capacity_expansion_mw", "MW", "capacity", "asset", "fixed_for_declared_run", "asset_planning", ("dispatch", "validation"), "S", "planning_result")
     add("site_energy_capacity_mwh storage_energy_expansion_mwh cycle_boundary_soc_mwh target_soc_mwh", "MWh", "state_or_capacity_by_name", "storage_site", "declared_boundary_or_asset", "storage_planning", ("dispatch", "validation"), "S", "planning_result")
+    artifact_overrides = {}
+    for artifact, layer, module in (
+        ("stage_11_operation/source_load_forecast.npz", "exogenous_source_load", "source_load"),
+        ("stage_14_storage_dispatch/storage_dispatch_forecast.npz", "operation_result_with_storage_requests", "storage_dispatch"),
+    ):
+        artifact_overrides[artifact] = {
+            name: dict(fields[name], semantic_layer=layer, source_module=module)
+            for name in ("p_load_mw", "p_gen_available_mw", "q_load_mvar")
+        }
+    artifact_overrides["stage_14_storage_dispatch/storage_dispatch_forecast.npz"]["q_load_mvar"].update(
+        semantic_layer="unsupported_DC_placeholder", quantity_kind="placeholder", note="Zero placeholder; reactive operation was not solved."
+    )
     return {
         "contract_version": CONTRACT_VERSION, "generator_version": GENERATOR_VERSION,
         "step_hours": step_hours, "grid_area_rule": "square projected cell: cell_size_km**2 km2",
@@ -196,6 +226,7 @@ def field_contract_document(step_hours: float = 1.0) -> dict[str, object]:
         "power_aggregation": "interval_mean_MW * duration_h = energy_MWh",
         "weather_channel_order": "read channel_names; never assume a new channel index",
         "fields": fields,
+        "artifact_field_overrides": artifact_overrides,
         "matrix_columns": {
             "electrical_buses": ["id:1", "nominal:kV", "P_capacity:MW", "Q_capacity:Mvar", "base_load:MW", "power_factor:1", "voltage_setpoint:pu"],
             "electrical_branches": ["id:1", "from_id:1", "to_id:1", "nominal:kV", "length:km", "r:ohm", "x:ohm", "b:microS", "rate:MVA", "redundant:bool"],

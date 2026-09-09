@@ -9,6 +9,7 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from world_generator.core.output_layout import WorldDataLayout
+from world_generator.core.contracts import entity_ids
 from world_generator.operation.stage_cache import load_stage12_checkpoint
 
 
@@ -531,10 +532,8 @@ def _exogenous_payload(source: dict[str, np.ndarray], final_bus_ids: np.ndarray,
     """
     if not np.array_equal(source["timestamps"], timestamps):
         raise ValueError("Stage 11 and final-operation timestamps differ")
-    original_ids = np.asarray(source["bus_ids"])
-    target_ids = np.asarray(final_bus_ids)
-    if len(np.unique(original_ids)) != original_ids.size or len(np.unique(target_ids)) != target_ids.size:
-        raise ValueError("Exogenous bus mapping requires unique bus IDs")
+    original_ids = entity_ids(source["bus_ids"], "exogenous bus_ids")
+    target_ids = entity_ids(final_bus_ids, "final bus_ids")
     source_index = {int(bus_id): i for i, bus_id in enumerate(original_ids)}
     missing = ~np.isin(original_ids, target_ids)
     payload: dict[str, np.ndarray] = {}
