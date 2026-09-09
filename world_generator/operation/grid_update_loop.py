@@ -686,6 +686,15 @@ def _new_branch_from_template(
     r_per_km = float(action["source_r_ohm_per_km"])
     x_per_km = float(action["source_x_ohm_per_km"])
     b_per_km = float(action["source_b_us_per_km"])
+    source_rate = float(action["source_rate_mva"])
+    bypass_rate = float(action["bypass_rate_mva"])
+    if not np.isfinite(source_rate) or not np.isfinite(bypass_rate) or min(source_rate, bypass_rate) <= 0.0:
+        raise ValueError("Equivalent bypass circuits require positive finite source and target ratings")
+    # Stage 12 uses a continuous parallel-circuit equivalent. Template per-km
+    # values already contain its existing multiplier, so use the rating ratio
+    # rather than applying the target multiplier a second time. Stage 14's
+    # fixed-impedance thermal rerating is a separate planning approximation.
+    impedance_scale = source_rate / bypass_rate
     return replace(
         template,
         edge_id=edge_id,
@@ -693,10 +702,10 @@ def _new_branch_from_template(
         to_bus=to_bus_id,
         nominal_kv=float(action["nominal_kv"]),
         length_km=length_km,
-        r_ohm=max(r_per_km * length_km, 1e-4),
-        x_ohm=max(x_per_km * length_km, 1e-4),
-        b_us=max(b_per_km * length_km, 1e-4),
-        rate_mva=float(action["bypass_rate_mva"]),
+        r_ohm=max(r_per_km * length_km * impedance_scale, 1e-4),
+        x_ohm=max(x_per_km * length_km * impedance_scale, 1e-4),
+        b_us=max(b_per_km * length_km / impedance_scale, 1e-4),
+        rate_mva=bypass_rate,
         is_redundant=True,
     )
 
@@ -1727,9 +1736,13 @@ def _equivalent_path_segment(
     rows, cols = risk_path(from_bus.row, from_bus.col, to_bus.row, to_bus.col, risk_cost)
     length_km = path_length_km(rows, cols, grid.cell_size_km)
     path_cost = _astar_path_cost((from_bus.row, from_bus.col), (to_bus.row, to_bus.col), risk_cost)
-    r_per_km = [_unit_value(branch.r_ohm, branch.length_km) for branch in contributors]
-    x_per_km = [_unit_value(branch.x_ohm, branch.length_km) for branch in contributors]
-    b_per_km = [_unit_value(branch.b_us, branch.length_km) for branch in contributors]
+    # Contributors may already represent a fractional or parallel circuit.
+    # Recover each single-circuit template before applying the NEW multiplier;
+    # otherwise repeated route refinement compounds impedance scaling.
+    old_multipliers = [max(branch.rate_mva / _base_line_rate_mva(branch.nominal_kv), 1e-6) for branch in contributors]
+    r_per_km = [_unit_value(branch.r_ohm, branch.length_km) * multiplier for branch, multiplier in zip(contributors, old_multipliers)]
+    x_per_km = [_unit_value(branch.x_ohm, branch.length_km) * multiplier for branch, multiplier in zip(contributors, old_multipliers)]
+    b_per_km = [_unit_value(branch.b_us, branch.length_km) / multiplier for branch, multiplier in zip(contributors, old_multipliers)]
     contributor_weights = np.asarray([max(branch.rate_mva, 1e-6) for branch in contributors], dtype=np.float64)
     contributor_weights /= contributor_weights.sum()
     base_r = float(np.dot(contributor_weights, np.asarray(r_per_km, dtype=np.float64)))
@@ -1843,7 +1856,8 @@ def _suitable_line_multiplier_for_voltage(
 
 
 def _base_line_rate_mva(nominal_kv: float) -> float:
-    return 260.0 if float(nominal_kv) >= 200.0 else 120.0
+    from world_generator.grid.electrical_builder import _standard_line_rating_mva
+    return _standard_line_rating_mva(nominal_kv)
 
 
 def _expected_line_rate(

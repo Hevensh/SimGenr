@@ -13,7 +13,7 @@ from world_generator.core.datatypes import (
     StorageDispatchStore,
     StoragePlanStore,
 )
-from world_generator.operation.power_flow import _branch_susceptance_mw_per_rad, solve_dc_power_flow
+from world_generator.operation.power_flow import _branch_susceptance_mw_per_rad, _network_components, solve_dc_power_flow
 
 
 def dispatch_storage_week(
@@ -23,7 +23,12 @@ def dispatch_storage_week(
     storage_plan: StoragePlanStore,
     config: StorageConfig,
 ) -> tuple[StorageDispatchStore, SourceLoadForecastStore, PowerFlowStore, GridElectricalState]:
-    """Jointly plan capacity and dispatch a zero-unserved multi-period DC-OPF."""
+    """Perfect-foresight planning DC-OPF; not an operational forecast/backtest.
+
+    Capacity additions are bounded scenario decisions. Line expansion is thermal
+    rerating at fixed impedance, not the addition of parallel circuits.
+    """
+    _validate_dispatch_inputs(baseline_power_flow, config)
     try:
         from scipy.optimize import linprog
         from scipy.sparse import coo_matrix
@@ -48,6 +53,7 @@ def dispatch_storage_week(
     gross_load = (
         baseline_power_flow.served_load_mw + baseline_power_flow.unserved_load_mw
     ).astype(np.float64)
+    load_bus_positions = np.flatnonzero(np.any(gross_load > 0.0, axis=0))
     requested_generation = (
         baseline_power_flow.dispatched_generation_mw + baseline_power_flow.curtailed_generation_mw
     ).astype(np.float64)
@@ -58,6 +64,7 @@ def dispatch_storage_week(
     )
 
     branches = electrical.branch_params
+    components = _network_components(bus_count, branches, bus_index)
     branch_count = len(branches)
     branch_ids = np.asarray([branch.edge_id for branch in branches], dtype=np.int32)
     line_rates = np.asarray([max(float(branch.rate_mva), 1e-6) for branch in branches], dtype=np.float64)
@@ -78,6 +85,7 @@ def dispatch_storage_week(
         generator_count=generator_bus_positions.size,
         site_count=site_count,
         thermal_count=thermal_bus_positions.size,
+        load_count=load_bus_positions.size,
     )
     objective = np.zeros(layout.size, dtype=np.float64)
     lower = np.full(layout.size, -np.inf, dtype=np.float64)
@@ -87,6 +95,9 @@ def dispatch_storage_week(
     ptdf = _build_ptdf(bus_count, from_positions, to_positions, susceptance, slack_position)
 
     lower[layout.generation] = 0.0
+    lower[layout.load_shed] = 0.0
+    upper[layout.load_shed] = gross_load[:, load_bus_positions].ravel() if config.allow_load_shedding else 0.0
+    objective[layout.load_shed] = float(config.load_shedding_cost)
     for hour in range(hours):
         for index in range(renewable_bus_positions.size):
             variable = layout.generation_index(hour, index)
@@ -124,15 +135,22 @@ def dispatch_storage_week(
     inequalities = _SparseConstraintBuilder(layout.size)
     line_operating_ratio = float(np.clip(config.line_operating_limit_ratio, 1e-3, 1.0))
     for hour in range(hours):
-        balance_terms = [
-            (layout.generation_index(hour, generator_index), 1.0)
-            for generator_index in range(generator_bus_positions.size)
-        ]
-        for site_index in range(site_count):
-            balance_terms.append((layout.discharge_index(hour, site_index), 1.0))
-            balance_terms.append((layout.emergency_discharge_index(hour, site_index), 1.0))
-            balance_terms.append((layout.charge_index(hour, site_index), -1.0))
-        equalities.add(balance_terms, float(gross_load[hour].sum()))
+        for component in components:
+            balance_terms = [
+                (layout.generation_index(hour, generator_index), 1.0)
+                for generator_index, position in enumerate(generator_bus_positions)
+                if position in component
+            ]
+            for site_index, position in enumerate(site_bus_positions):
+                if position not in component:
+                    continue
+                balance_terms.append((layout.discharge_index(hour, site_index), 1.0))
+                balance_terms.append((layout.emergency_discharge_index(hour, site_index), 1.0))
+                balance_terms.append((layout.charge_index(hour, site_index), -1.0))
+            for load_index, position in enumerate(load_bus_positions):
+                if position in component:
+                    balance_terms.append((layout.load_shed_index(hour, load_index), 1.0))
+            equalities.add(balance_terms, float(gross_load[hour, component].sum()))
         load_flow_offset = ptdf @ gross_load[hour]
         for edge_index in range(branch_count):
             flow_terms: list[tuple[int, float]] = []
@@ -146,6 +164,10 @@ def dispatch_storage_week(
                     flow_terms.append((layout.discharge_index(hour, site_index), coefficient))
                     flow_terms.append((layout.emergency_discharge_index(hour, site_index), coefficient))
                     flow_terms.append((layout.charge_index(hour, site_index), -coefficient))
+            for load_index, bus_position in enumerate(load_bus_positions):
+                coefficient = float(ptdf[edge_index, int(bus_position)])
+                if abs(coefficient) > 1e-12:
+                    flow_terms.append((layout.load_shed_index(hour, load_index), coefficient))
             inequalities.add(
                 flow_terms + [(layout.line_expansion.start + edge_index, -line_operating_ratio)],
                 float(line_operating_ratio * line_rates[edge_index] + load_flow_offset[edge_index]),
@@ -167,6 +189,8 @@ def dispatch_storage_week(
                 [(generation_variable, 1.0), (expansion_index, -thermal_operating_ratio)],
                 thermal_operating_ratio * base_capacity,
             )
+            if hour == 0 and not config.cyclic_state_of_charge:
+                continue  # No pre-horizon generator dispatch was specified.
             previous_hour = (hour - 1) % hours
             previous_variable = layout.generation_index(previous_hour, int(generation_index))
             inequalities.add(
@@ -195,13 +219,15 @@ def dispatch_storage_week(
         energy_expansion_index = layout.storage_energy_expansion.start + site_index
         base_power = float(storage_base_power[site_index])
         base_energy = float(storage_base_energy[site_index])
-        equalities.add(
-            [
-                (layout.soc_index(0, site_index), 1.0),
-                (layout.soc_index(hours, site_index), -1.0),
-            ],
-            0.0,
-        )
+        if config.cyclic_state_of_charge:
+            equalities.add(
+                [(layout.soc_index(0, site_index), 1.0), (layout.soc_index(hours, site_index), -1.0)], 0.0
+            )
+        else:
+            equalities.add(
+                [(layout.soc_index(0, site_index), 1.0), (energy_expansion_index, -config.initial_soc_fraction)],
+                config.initial_soc_fraction * base_energy,
+            )
         for step in range(hours + 1):
             soc_variable = layout.soc_index(step, site_index)
             inequalities.add(
@@ -247,6 +273,12 @@ def dispatch_storage_week(
                 [(discharge_variable, 1.0), (emergency_variable, 1.0), (power_expansion_index, -1.0)],
                 base_power,
             )
+            # Shared inverter capacity (convex hull); binary fallback below
+            # enforces the mutually exclusive modes if this LP relaxes them.
+            inequalities.add(
+                [(charge_variable, 1.0), (discharge_variable, 1.0), (emergency_variable, 1.0),
+                 (power_expansion_index, -1.0)], base_power,
+            )
             inequalities.add(
                 [(charge_variable, 1.0), (energy_expansion_index, -normal_c_rate)],
                 normal_c_rate * base_energy,
@@ -255,14 +287,19 @@ def dispatch_storage_week(
                 [(discharge_variable, 1.0), (energy_expansion_index, -normal_c_rate)],
                 normal_c_rate * base_energy,
             )
+            if hour == 0 and not config.cyclic_state_of_charge:
+                continue
             previous_hour = (hour - 1) % hours
             previous_charge = layout.charge_index(previous_hour, site_index)
             previous_discharge = layout.discharge_index(previous_hour, site_index)
+            previous_emergency = layout.emergency_discharge_index(previous_hour, site_index)
             inequalities.add(
                 [
                     (discharge_variable, 1.0),
+                    (emergency_variable, 1.0),
                     (charge_variable, -1.0),
                     (previous_discharge, -1.0),
+                    (previous_emergency, -1.0),
                     (previous_charge, 1.0),
                     (power_expansion_index, -storage_ramp_fraction),
                 ],
@@ -271,8 +308,10 @@ def dispatch_storage_week(
             inequalities.add(
                 [
                     (discharge_variable, -1.0),
+                    (emergency_variable, -1.0),
                     (charge_variable, 1.0),
                     (previous_discharge, 1.0),
+                    (previous_emergency, 1.0),
                     (previous_charge, -1.0),
                     (power_expansion_index, -storage_ramp_fraction),
                 ],
@@ -289,10 +328,31 @@ def dispatch_storage_week(
         method="highs",
         options={"presolve": True},
     )
+    if not result.success and result.status == 4:
+        # Degenerate planning LPs can hit a numerical HiGHS simplex status.
+        # Retry the same constraints with its independent interior-point solver;
+        # never turn an infeasible result into a success or relax physics.
+        result = linprog(
+            objective, A_ub=inequalities.matrix(coo_matrix), b_ub=np.asarray(inequalities.rhs),
+            A_eq=equalities.matrix(coo_matrix), b_eq=np.asarray(equalities.rhs),
+            bounds=np.column_stack((lower, upper)), method="highs-ipm", options={"presolve": False},
+        )
     if not result.success:
-        raise RuntimeError(f"Stage 14 zero-unserved DC-OPF is infeasible: {result.message}")
+        reason = "infeasible under the configured capacity bounds" if result.status == 2 else "solver failed"
+        raise RuntimeError(f"Stage 14 DC-OPF {reason}: {result.message}")
+
+    if site_count:
+        lp_charge = result.x[layout.charge]
+        lp_discharge = result.x[layout.discharge] + result.x[layout.emergency_discharge]
+        if np.any(np.minimum(lp_charge, lp_discharge) > 1e-6):
+            result = _solve_exclusive_storage_modes(
+                objective, lower, upper, equalities, inequalities, layout,
+                storage_base_power * (1.0 + config.max_storage_power_expansion_fraction),
+            )
 
     solution = np.asarray(result.x, dtype=np.float64)
+    load_shed = np.zeros_like(gross_load)
+    load_shed[:, load_bus_positions] = _clean(solution[layout.load_shed].reshape(hours, load_bus_positions.size))
     generation = _clean(solution[layout.generation].reshape(hours, generator_bus_positions.size))
     charge = _clean(solution[layout.charge].reshape(hours, site_count))
     normal_discharge = _clean(solution[layout.discharge].reshape(hours, site_count))
@@ -314,7 +374,7 @@ def dispatch_storage_week(
         branch_ids,
         line_expansion,
     )
-    dispatched_load = gross_load.astype(np.float32)
+    dispatched_load = (gross_load - load_shed).astype(np.float32)
     dispatched_available = np.zeros((hours, bus_count), dtype=np.float32)
     dispatched_generation = np.zeros((hours, bus_count), dtype=np.float32)
     dispatched_available[:, renewable_bus_positions] = renewable_available.astype(np.float32)
@@ -342,8 +402,29 @@ def dispatch_storage_week(
             "storage_charge_mw",
             "storage_discharge_mw",
         ),
+        data_semantics="perfect_foresight_dispatch",
     )
     dispatched_power_flow = solve_dc_power_flow(dispatched_forecast, topology, planned_electrical)
+    # Solve on the actually served demand, then retain the *requested* demand
+    # and explicit bus-level shortfall in the public stores. Do not rebalance
+    # by proportionally spreading the OPF's local shortfall across other buses.
+    dispatched_forecast = replace(dispatched_forecast, p_load_mw=(dispatched_load + load_shed).astype(np.float32))
+    dispatched_power_flow = replace(
+        dispatched_power_flow,
+        unserved_load_mw=(dispatched_power_flow.unserved_load_mw + load_shed).astype(np.float32),
+    )
+    # The OPF has already reduced renewable dispatch before the power-flow
+    # check. Keep that intentional spill in the accounting, in addition to any
+    # subsequent numerical/island rebalancing. Passing renewable availability
+    # as scheduled generation to the solver would undo the optimized dispatch.
+    optimized_spill = np.zeros_like(dispatched_power_flow.curtailed_generation_mw)
+    optimized_spill[:, renewable_bus_positions] = np.maximum(
+        renewable_available - generation[:, :renewable_bus_positions.size], 0.0
+    ).astype(np.float32)
+    dispatched_power_flow = replace(
+        dispatched_power_flow,
+        curtailed_generation_mw=dispatched_power_flow.curtailed_generation_mw + optimized_spill,
+    )
     baseline_thermal = baseline_power_flow.dispatched_generation_mw[:, thermal_bus_positions].sum(axis=1)
     scheduled_thermal = dispatched_power_flow.dispatched_generation_mw[:, thermal_bus_positions].sum(axis=1)
     dispatched_unserved = dispatched_power_flow.unserved_load_mw.sum(axis=1).astype(np.float32)
@@ -394,11 +475,13 @@ class _VariableLayout:
         generator_count: int,
         site_count: int,
         thermal_count: int,
+        load_count: int = 0,
     ) -> None:
         self.hours = hours
         self.branch_count = branch_count
         self.generator_count = generator_count
         self.site_count = site_count
+        self.load_count = load_count
         offset = 0
 
         def allocate(size: int) -> slice:
@@ -408,6 +491,7 @@ class _VariableLayout:
             return result
 
         self.generation = allocate(hours * generator_count)
+        self.load_shed = allocate(hours * load_count)
         self.charge = allocate(hours * site_count)
         self.discharge = allocate(hours * site_count)
         self.emergency_discharge = allocate(hours * site_count)
@@ -422,6 +506,9 @@ class _VariableLayout:
 
     def generation_index(self, hour: int, generator: int) -> int:
         return self.generation.start + hour * self.generator_count + generator
+
+    def load_shed_index(self, hour: int, load: int) -> int:
+        return self.load_shed.start + hour * self.load_count + load
 
     def charge_index(self, hour: int, site: int) -> int:
         return self.charge.start + hour * self.site_count + site
@@ -504,15 +591,92 @@ def _build_ptdf(
     incidence[np.arange(from_positions.size), from_positions] = 1.0
     incidence[np.arange(to_positions.size), to_positions] = -1.0
     b_matrix = incidence.T @ (susceptance[:, None] * incidence)
-    non_slack = np.asarray([index for index in range(bus_count) if index != slack_position], dtype=np.int32)
-    reduced = b_matrix[np.ix_(non_slack, non_slack)]
-    try:
-        inverse = np.linalg.inv(reduced)
-    except np.linalg.LinAlgError:
-        inverse = np.linalg.pinv(reduced)
     ptdf = np.zeros((from_positions.size, bus_count), dtype=np.float64)
-    ptdf[:, non_slack] = susceptance[:, None] * incidence[:, non_slack] @ inverse
+    # One reference per island; the OPF separately enforces each island balance.
+    from types import SimpleNamespace
+    branches = tuple(SimpleNamespace(from_bus=int(i), to_bus=int(j)) for i, j in zip(from_positions, to_positions))
+    components = _network_components(bus_count, branches, {i: i for i in range(bus_count)})
+    for component in components:
+        reference = slack_position if slack_position in component else int(component[0])
+        non_slack = component[component != reference]
+        if not non_slack.size:
+            continue
+        reduced = b_matrix[np.ix_(non_slack, non_slack)]
+        try:
+            ptdf[:, non_slack] = np.linalg.solve(
+                reduced, (susceptance[:, None] * incidence[:, non_slack]).T
+            ).T
+        except np.linalg.LinAlgError as exc:
+            raise ValueError("Singular PTDF island; check line reactances and topology") from exc
     return ptdf
+
+
+def _validate_dispatch_inputs(power_flow: PowerFlowStore, config: StorageConfig) -> None:
+    timestamps = np.asarray(power_flow.timestamps, dtype=np.float64)
+    if timestamps.size == 0 or not np.all(np.isfinite(timestamps)) or np.any(np.diff(timestamps) != 1.0):
+        raise ValueError("Storage dispatch requires consecutive hourly timestamps (MW * 1 h = MWh)")
+    if not (0 < config.charge_efficiency <= 1 and 0 < config.discharge_efficiency <= 1):
+        raise ValueError("Storage charge/discharge efficiency must lie in (0, 1]")
+    if not (0 <= config.minimum_soc_fraction <= config.preferred_soc_lower_fraction <=
+            config.preferred_soc_upper_fraction <= config.maximum_soc_fraction <= 1):
+        raise ValueError("SOC limits and preferred band must be ordered in [0, 1]")
+    if not config.minimum_soc_fraction <= config.initial_soc_fraction <= config.maximum_soc_fraction:
+        raise ValueError("Initial SOC must be within the physical SOC limits")
+    for name in ("thermal_operating_limit_ratio", "line_operating_limit_ratio"):
+        if not 0 < getattr(config, name) <= 1:
+            raise ValueError(f"{name} must lie in (0, 1]")
+    for name in ("normal_dispatch_c_rate", "storage_power_ramp_fraction_per_hour", "thermal_ramp_fraction_per_hour"):
+        if not np.isfinite(getattr(config, name)) or getattr(config, name) <= 0:
+            raise ValueError(f"{name} must be positive and finite")
+    for name in ("max_thermal_expansion_mw_per_bus", "max_storage_power_expansion_fraction",
+                 "max_storage_energy_expansion_fraction", "max_line_expansion_fraction", "thermal_capacity_cost",
+                 "storage_power_cost", "storage_energy_cost", "line_capacity_cost_per_mva_km",
+                 "thermal_dispatch_cost", "storage_cycle_cost", "emergency_discharge_cost", "soc_band_penalty", "load_shedding_cost"):
+        if not np.isfinite(getattr(config, name)) or getattr(config, name) < 0:
+            raise ValueError(f"{name} must be finite and nonnegative")
+    if config.allow_load_shedding and config.load_shedding_cost <= 0:
+        raise ValueError("Load shedding must have a strictly positive penalty")
+
+
+def _solve_exclusive_storage_modes(
+    objective: np.ndarray, lower: np.ndarray, upper: np.ndarray,
+    equalities: _SparseConstraintBuilder, inequalities: _SparseConstraintBuilder,
+    layout: _VariableLayout, maximum_power: np.ndarray,
+) -> object:
+    """Recover a physical dispatch when the continuous relaxation cycles energy.
+
+    Big-M bounds come from the *bounded* installed plus expandable inverter power.
+    All investment and dispatch constraints are retained in the mixed-integer solve.
+    """
+    from scipy.optimize import Bounds, LinearConstraint, milp
+    from scipy.sparse import coo_matrix
+
+    mode_count = layout.hours * layout.site_count
+    size = layout.size + mode_count
+    equalities.variable_count = size
+    inequalities.variable_count = size
+    modes = _SparseConstraintBuilder(size)
+    for hour in range(layout.hours):
+        for site in range(layout.site_count):
+            mode = layout.size + hour * layout.site_count + site
+            bound = float(maximum_power[site])
+            modes.add([(layout.charge_index(hour, site), 1.0), (mode, -bound)], 0.0)
+            modes.add([(layout.discharge_index(hour, site), 1.0),
+                       (layout.emergency_discharge_index(hour, site), 1.0), (mode, bound)], bound)
+    result = milp(
+        np.concatenate((objective, np.zeros(mode_count))),
+        integrality=np.concatenate((np.zeros(layout.size), np.ones(mode_count))),
+        bounds=Bounds(np.concatenate((lower, np.zeros(mode_count))), np.concatenate((upper, np.ones(mode_count)))),
+        constraints=(
+            LinearConstraint(equalities.matrix(coo_matrix), equalities.rhs, equalities.rhs),
+            LinearConstraint(inequalities.matrix(coo_matrix), -np.inf, inequalities.rhs),
+            LinearConstraint(modes.matrix(coo_matrix), -np.inf, modes.rhs),
+        ),
+        options={"mip_rel_gap": 1e-7},
+    )
+    if not result.success:
+        raise RuntimeError(f"Storage dispatch with exclusive charge/discharge modes failed: {result.message}")
+    return result
 
 
 def _clean(values: np.ndarray, tolerance: float = 1e-7) -> np.ndarray:

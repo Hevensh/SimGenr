@@ -36,7 +36,7 @@ def save_city_figures(static_maps: dict[str, np.ndarray], output_dir: Path) -> l
     save_single_map(
         static_maps["population_density"],
         output_dir / "population_density.png",
-        "Population density",
+        "Population density (persons/km²)",
         "inferno",
     )
     save_single_map(
@@ -58,13 +58,13 @@ def _save_city_overview(static_maps: dict[str, np.ndarray], path: Path) -> None:
         (axes[0, 0], static_maps["city_suitability"], "City suitability", "YlGn"),
         (axes[0, 1], static_maps["urban_core_suitability"], "Urban core suitability", "YlGn"),
         (axes[0, 2], static_maps["waterfront_amenity"], "Waterfront amenity", "PuBuGn"),
-        (axes[1, 0], static_maps["population_density"], "Population density", "inferno"),
+        (axes[1, 0], static_maps["population_density"], "Population density (persons/km²)", "inferno"),
         (axes[1, 1], static_maps["economic_activity"], "Economic activity", "magma"),
         (axes[1, 2], static_maps["urban_density"], "Urban density", "Reds"),
     ]
     centers = city_centers_from_id_map(static_maps["city_id_map"], static_maps["urban_density"])
     for ax, values, title, cmap in panels:
-        image = ax.imshow(values, cmap=cmap, origin="upper", vmin=0.0, vmax=1.0)
+        image = ax.imshow(values, cmap=cmap, origin="upper", vmin=0.0, vmax=None if title.startswith("Population") else 1.0)
         ax.set_title(title)
         ax.set_xticks([])
         ax.set_yticks([])

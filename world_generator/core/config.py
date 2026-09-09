@@ -12,11 +12,12 @@ class WorldGridConfig:
     cell_size_km: float = 2.0
     origin_x_km: float = 0.0
     origin_y_km: float = 0.0
+    latitude_center_degrees: float = 35.0
 
 
 @dataclass(frozen=True)
 class TerrainConfig:
-    algorithm: str = "legacy"
+    algorithm: str = "multiscale_v2"
     octaves: int = 6
     mountain_ridges: int = 4
     basins: int = 2
@@ -38,7 +39,7 @@ class TerrainConfig:
 
 @dataclass(frozen=True)
 class HydrologyConfig:
-    algorithm: str = "legacy"
+    algorithm: str = "conditioned_v2"
     river_threshold_quantile: float = 0.98
     river_max_dilation_cells: int = 1
     river_dilation_min_strength: float = 0.72
@@ -48,16 +49,18 @@ class HydrologyConfig:
     lake_min_cells: int = 6
     lake_extra_dilation_cells: int = 1
     lake_expansion_slope_multiplier: float = 1.25
-    flow_smoothing_steps: int = 2
-    river_depth_min_m: float = 4.0
-    river_depth_max_m: float = 28.0
+    flow_smoothing_steps: int = 0
+    river_depth_min_m: float = 0.5
+    river_depth_max_m: float = 12.0
     lake_depth_m: float = 18.0
     flood_water_decay_km: float = 4.0
     river_min_catchment_km2: float = 32.0
     river_width_reference_catchment_km2: float = 128.0
+    river_width_reference_m: float = 30.0
     river_width_exponent: float = 0.35
     lake_min_depth_m: float = 6.0
     lake_max_area_km2: float = 80.0
+    lake_min_area_km2: float = 2.0
     depression_fill_epsilon_m: float = 0.02
 
 
@@ -96,6 +99,9 @@ class ClimateConfig:
 @dataclass(frozen=True)
 class WeatherConfig:
     days: int = 365
+    wet_day_probability: float = 0.30
+    wet_day_persistence: float = 0.55
+    precipitation_gamma_shape: float = 1.5
     start_day_of_year: int = 0
     hourly_week_days: int = 7
     hourly_temperature_diurnal_c: float = 4.5
@@ -198,10 +204,51 @@ class EnergyConfig:
     pv_capacity_max_mw: float = 75.0
     load_capacity_min_mw: float = 10.0
     load_capacity_max_mw: float = 120.0
+    wind_capacity_density_mw_km2: float = 3.0
+    pv_capacity_density_mw_km2: float = 35.0
+    per_capita_peak_load_kw: float = 1.5
+
+
+@dataclass(frozen=True)
+class SourceLoadConfig:
+    """Transparent scenario priors; calibrate against regional observations."""
+
+    calendar_start_date: str = "2025-01-01"
+    wind_reference_height_m: float = 10.0
+    wind_hub_height_m: float = 90.0
+    wind_shear_exponent: float = 0.14
+    wind_cut_in_mps: float = 3.0
+    wind_rated_mps: float = 11.4
+    wind_cut_out_mps: float = 25.0
+    wind_system_loss_fraction: float = 0.08
+    pv_dc_ac_ratio: float = 1.2
+    pv_tilt_degrees: float = 30.0
+    pv_azimuth_degrees: float = 180.0
+    pv_ground_albedo: float = 0.2
+    pv_inverter_efficiency: float = 0.96
+    pv_system_loss_fraction: float = 0.10
+    pv_temperature_coefficient_per_c: float = -0.004
+    pv_heat_loss_constant: float = 25.0
+    pv_heat_loss_wind: float = 6.84
+    load_heating_balance_c: float = 16.0
+    load_cooling_balance_c: float = 22.0
+    load_heating_sensitivity_per_c: float = 0.016
+    load_cooling_sensitivity_per_c: float = 0.025
+    load_thermal_memory_hours: float = 8.0
+    load_residual_std_fraction: float = 0.035
+    load_residual_ar1: float = 0.85
+    load_common_variance_fraction: float = 0.55
+    load_spatial_correlation_km: float = 20.0
+    load_residential_fraction: float = 0.55
+    load_commercial_fraction: float = 0.30
+    load_industrial_fraction: float = 0.15
 
 
 @dataclass(frozen=True)
 class PowerGridConfig:
+    nominal_voltage_kv: float = 220.0
+    thermal_scale_with_load: bool = True
+    thermal_planning_reserve_margin: float = 1.15
     thermal_candidate_count: int = 4
     thermal_load_optimal_km: float = 5.0
     thermal_load_sigma_km: float = 4.0
@@ -253,6 +300,9 @@ class PowerGridConfig:
 
 @dataclass(frozen=True)
 class StorageConfig:
+    cyclic_state_of_charge: bool = True
+    allow_load_shedding: bool = True
+    load_shedding_cost: float = 10000.0
     congestion_trigger_ratio: float = 0.90
     congestion_decay_hops: float = 2.0
     minimum_duration_hours: float = 2.0
@@ -310,6 +360,7 @@ class WorldConfig:
     city: CityConfig = field(default_factory=CityConfig)
     land_use: LandUseConfig = field(default_factory=LandUseConfig)
     energy: EnergyConfig = field(default_factory=EnergyConfig)
+    source_load: SourceLoadConfig = field(default_factory=SourceLoadConfig)
     power_grid: PowerGridConfig = field(default_factory=PowerGridConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
@@ -331,6 +382,7 @@ def load_world_config(path: str | Path) -> WorldConfig:
         city=CityConfig(**data.get("city", {})),
         land_use=LandUseConfig(**data.get("land_use", {})),
         energy=EnergyConfig(**data.get("energy", {})),
+        source_load=SourceLoadConfig(**data.get("source_load", {})),
         power_grid=PowerGridConfig(**data.get("power_grid", {})),
         storage=StorageConfig(**data.get("storage", {})),
         output=OutputConfig(**data.get("output", {})),

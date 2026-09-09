@@ -1,6 +1,28 @@
 # Procedural Multimodal Source-Load-Grid World Generator
 
-This project builds a reproducible synthetic world for multimodal source-load-grid experiments. The current pipeline starts from terrain, then derives hydrology, static land constraints, climate background, daily weather, initial cities, and land-use/load zones.
+This project builds a reproducible synthetic world for multimodal source-load-grid experiments. The physics_v3 pipeline derives terrain and drainage first, then climate, climate-conditioned land, consistent daily/hourly weather, cities, land use, sources, the grid, and constrained operation.
+
+## 物理模型修订（physics_v3）
+
+本次对 14 个阶段完成文献核对和公式修订。请先阅读 [中文研究与修改总览](docs/PHYSICS_REVIEW_ZH.md)、[验证结果](docs/VALIDATION_RESULTS.md)，以及其中链接的地理、气象、源荷、电网与储能分项报告。
+
+关键变化：气候前置于植被；人口/面积/能量守恒；日小时天气一致；风光转换采用物理模型；负荷考虑日历、温度记忆和以 km 计的空间相关；电源候选数量随负荷规模变化；逐岛电力平衡；储能互斥和显式缺供。配置中的经验权重仍是待校准的场景先验。`source_load_forecast` 是兼容名称，数据代表合成实况，最终调度采用全窗口预知规划。
+
+在仓库根目录 PowerShell 中使用已有的 D 盘 Anaconda：
+
+```powershell
+$env:PYTHONDONTWRITEBYTECODE = '1'
+$env:MPLCONFIGDIR = Join-Path $PWD 'outputs/.mplconfig'
+$env:TEMP = Join-Path $PWD 'outputs/.tmp'
+$env:TMP = $env:TEMP
+New-Item -ItemType Directory -Force $env:TEMP | Out-Null
+& D:/anaconda/python.exe -B scripts/generate_static_world.py --config configs/small_debug.yaml --seed 42 --no-figures
+& D:/anaconda/python.exe -B scripts/validate_world_physics.py outputs/small_debug_seed42
+```
+
+增加 `--start-day 180 --output outputs/summer` 可检查夏季。移除 `--no-figures` 可保留原有分阶段可视化。生成依赖见 [requirements-generator.txt](requirements-generator.txt)，所有运行输出默认位于仓库 `outputs/`。
+
+数据集为 0.6.0，新增未混入储能操作的外生源荷数组，旧字段兼容保留，参见 [字段和预测语义](datasets/DATA_DESCRIPTION.md)。旧版输出必须重新生成；新版缓存恢复会检查物理版本与上游配置。
 
 Project repository: <https://github.com/Hevensh/SimGenr>
 
@@ -138,7 +160,7 @@ python scripts/train_physics_gst.py \
   --config configs/models/physics_gst_24to24.yaml
 ```
 
-Stage 14 solves a 168-hour multi-period DC optimal power flow. It enforces nodal active-power balance, DC branch flow and 90% operating limits, thermal capacity and hourly ramp limits, storage power/energy bounds, 20% minimum SOC, and equal SOC at the beginning and end of the week. If the existing system cannot serve all load, the same optimization plans minimum-cost thermal, storage, and line-capacity additions while keeping unserved load at zero.
+Stage 14 solves a multi-period DC optimal power flow with bounded investment, nodal active-power balance, line limits, thermal capacity/ramping, storage power/energy limits and exclusive charge/discharge modes. Cyclic SOC is the default; a fixed initial SOC is available. If generation or the network remains insufficient after bounded additions, high-penalty nodal load shedding is explicitly reported. Set `storage.allow_load_shedding: false` to require zero shortfall. This is perfect-foresight planning; a validation PASS confirms physical accounting and constraints, not supply adequacy or empirical realism.
 
 Both full and resumed runs show a stage-level `tqdm` progress bar.
 

@@ -15,6 +15,10 @@ MODULE_NAMES = (
     "grid",
     "operation",
     "evolution",
+    "climate",
+    "land",
+    "weather_hourly",
+    "source_load",
 )
 
 

@@ -42,7 +42,7 @@ from world_generator.terrain.derivatives import derive_terrain_features
 from world_generator.terrain.terrain_generator import generate_terrain_base
 from world_generator.visualization.map_plot import save_static_map_figures
 from world_generator.visualization.storage_figures import save_storage_dispatch_figures, save_storage_need_figures
-from world_generator.weather.weather_generator import generate_daily_weather, generate_hourly_weather_week_from_baseline
+from world_generator.weather.weather_generator import generate_daily_weather, generate_hourly_weather_week
 
 
 def main() -> None:
@@ -50,6 +50,7 @@ def main() -> None:
     parser.add_argument("--config", default="configs/small_debug.yaml")
     parser.add_argument("--output", default=None)
     parser.add_argument("--seed", type=int, default=None, help="Override the seed from the config file.")
+    parser.add_argument("--start-day", type=int, default=None, help="Zero-based first day of the 365-day climatology (0..364).")
     parser.add_argument(
         "--from-stage",
         type=int,
@@ -80,6 +81,10 @@ def main() -> None:
     config = load_world_config(args.config)
     if args.seed is not None:
         config = replace(config, seed=args.seed)
+    if args.start_day is not None:
+        if not 0 <= args.start_day < 365:
+            parser.error("--start-day must be in 0..364")
+        config = replace(config, weather=replace(config.weather, start_day_of_year=args.start_day))
     rngs = build_rng_registry(config.seed)
     output_root = Path(args.output or config.output.root)
     world_id = f"{config.output.world_name}_seed{config.seed}"
@@ -87,6 +92,8 @@ def main() -> None:
     data_dir = output_dir / "data"
     data_layout = WorldDataLayout(data_dir)
     figure_dir = output_dir / "figures"
+    if args.from_stage in (13, 14):
+        _validate_cached_physics(output_dir, config, args.from_stage)
     data_layout.create()
     if args.from_stage == 13:
         _run_stage13_from_cache(
@@ -95,6 +102,7 @@ def main() -> None:
             data_dir,
             figure_dir,
             render_storage_animation=not args.skip_storage_animation,
+            render_figures=not args.no_figures,
         )
         return
     if args.from_stage == 14:
@@ -104,6 +112,7 @@ def main() -> None:
             data_dir,
             figure_dir,
             render_storage_animation=not args.skip_storage_animation,
+            render_figures=not args.no_figures,
         )
         return
     if args.from_stage != 1:
@@ -117,41 +126,39 @@ def main() -> None:
     progress.set_description("Stage 02 hydrology")
     hydrology = generate_hydrology(terrain_features, config.world, config.hydrology)
     progress.update()
-    progress.set_description("Stage 03 static land")
-    land = generate_static_land(
-        terrain_features,
-        hydrology,
-        config.world,
-        config.land,
-        rngs.generator("city"),
-    )
-    progress.update()
     progress.set_description("Stage 04 climate")
     climate = generate_climate_baseline(
         terrain_features,
         hydrology,
         config.world,
         config.climate,
-        rngs.generator("weather"),
+        rngs.generator("climate"),
+    )
+    progress.update()
+    progress.set_description("Stage 03 static land (climate conditioned)")
+    land = generate_static_land(
+        terrain_features,
+        hydrology,
+        config.world,
+        config.land,
+        rngs.generator("land"),
+        climate=climate,
     )
     progress.update()
     progress.set_description("Stage 05 weather")
-    operation_rng = rngs.generator("operation")
     weather = generate_daily_weather(
         terrain_features,
         hydrology,
         climate,
         config.world,
         config.weather,
-        operation_rng,
+        rngs.generator("weather"),
     )
-    hourly_weather = generate_hourly_weather_week_from_baseline(
-        terrain_features,
-        hydrology,
-        climate,
-        config.world,
+    hourly_weather = generate_hourly_weather_week(
+        weather,
         config.weather,
-        operation_rng,
+        rngs.generator("weather_hourly"),
+        grid=config.world,
     )
     progress.update()
     progress.set_description("Stage 06 cities")
@@ -217,14 +224,17 @@ def main() -> None:
         config.world,
         config.power_grid,
     )
-    grid_electrical = build_grid_electrical(refined_topology)
+    grid_electrical = build_grid_electrical(refined_topology, config.power_grid.nominal_voltage_kv)
     progress.update()
     progress.set_description("Stage 11 operation")
     source_load_forecast = generate_source_load_forecast(
         hourly_weather,
         refined_topology,
         grid_electrical,
-        operation_rng,
+        rngs.generator("source_load"),
+        config=config.source_load,
+        land_use=land_use,
+        grid=config.world,
     )
     power_flow = solve_dc_power_flow(
         source_load_forecast,
@@ -334,6 +344,13 @@ def main() -> None:
         json.dumps(
             {
                 "world_id": world_id,
+                "generator_version": "physics_v3",
+                "execution_stage_order": [1, 2, 4, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+                "scenario_semantics": "synthetic_realization_with_perfect_foresight_planning",
+                "grid_model": "single_voltage_lossless_DC_transmission_equivalent",
+                "stage14_line_expansion": "thermal_rerating_fixed_impedance",
+                "parameter_status": "uncalibrated_scenario_priors_except_documented_physical_constants_and_line_templates",
+                "time_convention": "local_solar_time_365_day_climatology",
                 "seed": config.seed,
                 "module_seeds": rngs.module_seeds,
                 "static_maps": {name: list(value.shape) for name, value in static_maps.items()},
@@ -484,6 +501,7 @@ def _run_stage13_from_cache(
     figure_dir: Path,
     *,
     render_storage_animation: bool,
+    render_figures: bool = True,
 ) -> None:
     data_layout = WorldDataLayout(data_dir)
     data_layout.create()
@@ -514,11 +532,12 @@ def _run_stage13_from_cache(
         encoding="utf-8",
     )
     stage_dir = figure_dir / "stage_13_storage_need"
-    files = save_storage_need_figures(static_maps, storage_need, storage_plan, topology, electrical, stage_dir)
-    manifest_path = figure_dir / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
-    manifest["stage_13_storage_need"] = files
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    if render_figures:
+        files = save_storage_need_figures(static_maps, storage_need, storage_plan, topology, electrical, stage_dir)
+        manifest_path = figure_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+        manifest["stage_13_storage_need"] = files
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     progress.update()
     progress.set_description("Stage 14 storage dispatch")
     _save_stage14_outputs(
@@ -531,10 +550,11 @@ def _run_stage13_from_cache(
         data_dir,
         figure_dir,
         render_animation=render_storage_animation,
+        render_figures=render_figures,
     )
     progress.update()
     progress.close()
-    print(f"Regenerated Stages 13-14 from cached Stage 12: {stage_dir}")
+    print(f"Regenerated Stages 13-14 from cached Stage 12: {data_layout.storage_planning}")
 
 
 def _run_stage14_from_cache(
@@ -544,6 +564,7 @@ def _run_stage14_from_cache(
     figure_dir: Path,
     *,
     render_storage_animation: bool,
+    render_figures: bool = True,
 ) -> None:
     progress = tqdm(total=1, unit="stage", dynamic_ncols=True, desc="Stage 14 storage dispatch")
     static_maps, topology, electrical, power_flow, storage_plan = load_stage13_checkpoint(output_dir)
@@ -557,10 +578,11 @@ def _run_stage14_from_cache(
         data_dir,
         figure_dir,
         render_animation=render_storage_animation,
+        render_figures=render_figures,
     )
     progress.update()
     progress.close()
-    print(f"Regenerated Stage 14 from cached Stage 13: {figure_dir / 'stage_14_storage_dispatch'}")
+    print(f"Regenerated Stage 14 from cached Stage 13: {WorldDataLayout(data_dir).storage_dispatch}")
 
 
 def _save_stage14_outputs(
@@ -574,6 +596,7 @@ def _save_stage14_outputs(
     figure_dir: Path,
     *,
     render_animation: bool,
+    render_figures: bool = True,
 ) -> None:
     data_layout = WorldDataLayout(data_dir)
     data_layout.create()
@@ -604,6 +627,16 @@ def _save_stage14_outputs(
         ),
         encoding="utf-8",
     )
+    metadata = json.loads(data_layout.metadata.read_text(encoding="utf-8"))
+    metadata["storage_dispatch"] = storage_dispatch.summary_dict()
+    metadata["storage_plan"] = storage_plan.summary_dict()
+    need_path = data_layout.storage_planning / "storage_need.json"
+    if need_path.exists():
+        metadata["storage_need"] = json.loads(need_path.read_text(encoding="utf-8"))["summary"]
+    data_layout.metadata.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    dump_config_snapshot(config, data_layout.config_snapshot)
+    if not render_figures:
+        return
     stage_dir = figure_dir / "stage_14_storage_dispatch"
     hourly_weather = load_hourly_weather_checkpoint(data_dir.parent)
     files = save_storage_dispatch_figures(
@@ -620,6 +653,24 @@ def _save_stage14_outputs(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
     manifest["stage_14_storage_dispatch"] = files
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+def _validate_cached_physics(output_dir: Path, config: object, from_stage: int) -> None:
+    """Prevent silent mixtures of old equations, new parameters and stale worlds."""
+    layout = WorldDataLayout(output_dir / "data")
+    if not layout.metadata.exists() or not layout.config_snapshot.exists():
+        raise ValueError("No complete physics_v3 checkpoint; run --from-stage 1 first")
+    metadata = json.loads(layout.metadata.read_text(encoding="utf-8"))
+    if metadata.get("generator_version") != "physics_v3":
+        raise ValueError("Checkpoint predates physics_v3; regenerate with --from-stage 1")
+    cached = load_world_config(layout.config_snapshot).to_dict()
+    current = config.to_dict()
+    upstream = set(current) - {"output", "storage"}
+    changed = sorted(name for name in upstream if cached[name] != current[name])
+    if changed:
+        raise ValueError(f"Upstream configuration changed ({', '.join(changed)}); run --from-stage 1")
+    if from_stage == 14 and cached["storage"] != current["storage"]:
+        raise ValueError("Storage parameters changed; rerun storage sizing with --from-stage 13")
 
 
 if __name__ == "__main__":

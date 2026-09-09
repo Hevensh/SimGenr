@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 
 from world_generator.core.config import PowerGridConfig, WorldGridConfig
@@ -41,10 +43,17 @@ def build_grid_nodes(
         grid,
         config,
     )
+    selection_config = config
+    if config.thermal_scale_with_load:
+        maximum = max(config.thermal_capacity_max_mw, config.thermal_capacity_min_mw)
+        if maximum <= 0:
+            raise ValueError("Thermal unit capacity must be positive")
+        required_count = int(np.ceil(_thermal_capacity_target(buses, config) / maximum))
+        selection_config = replace(config, thermal_candidate_count=max(config.thermal_candidate_count, required_count))
     thermal_candidates = _select_thermal_buses(
         thermal_suitability,
         thermal_externality,
-        config,
+        selection_config,
         grid,
         start_bus_id=len(buses),
         existing_generation_buses=tuple(bus for bus in buses if bus.kind in {"wind_bus", "pv_bus"}),
@@ -75,15 +84,7 @@ def _size_thermal_capacity_for_adequacy(
 ) -> list[GridBus]:
     if not thermal_buses:
         return thermal_buses
-    load_capacity = sum(float(bus.capacity_mw) for bus in existing_buses if bus.kind == "load_bus")
-    wind_capacity = sum(float(bus.capacity_mw) for bus in existing_buses if bus.kind == "wind_bus")
-    solar_capacity = sum(float(bus.capacity_mw) for bus in existing_buses if bus.kind == "pv_bus")
-    target = max(
-        float(config.thermal_adequacy_load_fraction) * load_capacity
-        - float(config.thermal_wind_capacity_credit) * wind_capacity
-        - float(config.thermal_solar_capacity_credit) * solar_capacity,
-        0.0,
-    )
+    target = _thermal_capacity_target(existing_buses, config)
     capacities = np.asarray([float(bus.capacity_mw) for bus in thermal_buses], dtype=np.float64)
     maximum = max(float(config.thermal_capacity_max_mw), float(config.thermal_capacity_min_mw))
     total_headroom = float(np.maximum(maximum - capacities, 0.0).sum())
@@ -117,6 +118,22 @@ def _size_thermal_capacity_for_adequacy(
         )
         for index, bus in enumerate(thermal_buses)
     ]
+
+
+def _thermal_capacity_target(existing_buses: list[GridBus], config: PowerGridConfig) -> float:
+    """Screening firm-capacity target, not a probabilistically fitted ELCC.
+
+    Scaling the population must allow more plants, not just saturate a fixed
+    four-unit fleet. Siting constraints and subsequent dispatch still decide
+    whether this target is attainable and adequate for the realized weather.
+    """
+    if not np.isfinite(config.thermal_planning_reserve_margin) or config.thermal_planning_reserve_margin < 1:
+        raise ValueError("Thermal planning reserve multiplier must be finite and at least 1")
+    load = sum(bus.capacity_mw for bus in existing_buses if bus.kind == "load_bus")
+    wind = sum(bus.capacity_mw for bus in existing_buses if bus.kind == "wind_bus")
+    solar = sum(bus.capacity_mw for bus in existing_buses if bus.kind == "pv_bus")
+    return max(config.thermal_adequacy_load_fraction * config.thermal_planning_reserve_margin * load
+               - config.thermal_wind_capacity_credit * wind - config.thermal_solar_capacity_credit * solar, 0.0)
 
 
 def _thermal_suitability(

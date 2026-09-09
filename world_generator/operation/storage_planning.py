@@ -85,7 +85,7 @@ def analyze_storage_need(
     suggested_energy = np.where(
         suggested_power > 1e-6,
         np.minimum(
-            np.maximum(max_event_energy, suggested_power * max(config.minimum_duration_hours, 0.0)),
+            np.maximum(max_event_energy / _deliverable_energy_fraction(config), suggested_power * max(config.minimum_duration_hours, 0.0)),
             suggested_power * max(config.maximum_duration_hours, config.minimum_duration_hours, 0.0),
         ),
         0.0,
@@ -168,7 +168,7 @@ def plan_storage_sites(
         power_mw = reserve * base_power
         event_energy = _max_contiguous_energy(profile)
         energy_mwh = max(
-            reserve * event_energy,
+            reserve * event_energy / _deliverable_energy_fraction(config),
             power_mw * max(float(config.minimum_duration_hours), 0.0),
         )
         energy_mwh = min(
@@ -196,6 +196,14 @@ def plan_storage_sites(
         site_support_requirement_mw=profiles,
         sites=tuple(sites),
     )
+
+
+def _deliverable_energy_fraction(config: StorageConfig) -> float:
+    """AC-deliverable energy per nameplate MWh over the allowed SOC range."""
+    fraction = (config.maximum_soc_fraction - config.minimum_soc_fraction) * config.discharge_efficiency
+    if not 0 < fraction <= 1:
+        raise ValueError("Storage sizing requires a positive SOC range and physical discharge efficiency")
+    return float(fraction)
 
 
 def _select_storage_attachment_indices(

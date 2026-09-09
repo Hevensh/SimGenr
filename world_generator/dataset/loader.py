@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -32,7 +33,7 @@ class SimGenrDataset:
             entries = [entry for entry in entries if entry["sample_id"] in allowed]
         if seeds is not None:
             allowed_seeds = {int(seed) for seed in seeds}
-            entries = [entry for entry in entries if int(entry["seed"]) in allowed_seeds]
+            entries = [entry for entry in entries if entry.get("seed") is not None and int(entry["seed"]) in allowed_seeds]
         self.entries = entries
         self.as_torch = bool(as_torch)
         self.cache_size = max(int(cache_size), 0)
@@ -83,7 +84,7 @@ class SimGenrDataset:
         payload = _load_npz(sample_path)
         return {
             "sample_id": str(entry["sample_id"]),
-            "seed": int(entry["seed"]),
+            "seed": int(entry["seed"]) if entry.get("seed") is not None else None,
             "partition": str(entry.get("partition", "unspecified")),
             "static": _extract_group(payload, "static"),
             "dynamic": _extract_group(payload, "dynamic"),
@@ -96,7 +97,12 @@ class SimGenrDataset:
 
 
 class TemporalWindowDataset:
-    """View complete worlds as fixed-length history/forecast windows."""
+    """View worlds as history/target windows, including optional exogenous data.
+
+    `future.weather` is realized weather; a caller must not present it as NWP
+    available at forecast issue time. The final graph and dispatch can also
+    depend on the complete operation period; consult sample metadata.
+    """
 
     def __init__(
         self,
@@ -235,13 +241,22 @@ def _split_operation(
     history: dict[str, Any] = {}
     future: dict[str, Any] = {}
     static: dict[str, Any] = {}
+    temporal_fields = {
+        "timestamps", "node_dynamic", "line_dynamic",
+        "exogenous_p_load_mw", "exogenous_p_gen_available_mw", "exogenous_p_renewable_available_mw",
+        "charge_mw", "discharge_mw", "emergency_discharge_mw", "target_soc_mwh",
+        "total_load_mw", "renewable_available_mw", "baseline_thermal_mw", "scheduled_thermal_mw",
+        "baseline_unserved_mw", "dispatched_unserved_mw", "baseline_curtailed_mw", "dispatched_curtailed_mw",
+    }
     for name, values in operation.items():
-        if not hasattr(values, "shape") or len(values.shape) == 0:
-            static[name] = values
-        elif values.shape[0] == hours:
+        if name in temporal_fields:
+            if not hasattr(values, "shape") or len(values.shape) == 0 or values.shape[0] != hours:
+                raise ValueError(f"Operation time series {name!r} does not match the weather time axis")
             history[name] = values[start:history_end]
             future[name] = values[history_end:forecast_end]
-        elif name == "soc_mwh" and values.shape[0] == hours + 1:
+        elif name == "soc_mwh":
+            if values.shape[0] != hours + 1:
+                raise ValueError("soc_mwh must include the terminal boundary state")
             history[name] = values[start : history_end + 1]
             future[name] = values[history_end : forecast_end + 1]
         else:
@@ -328,6 +343,10 @@ def _unique_tensor_storage_bytes(value: Any) -> int:
 def _collate_values(values: list[Any]) -> Any:
     first = values[0]
     if isinstance(first, dict):
+        if any(not isinstance(value, dict) or set(value) != set(first) for value in values):
+            # Mixed legacy/new samples may lack exogenous targets. Preserve
+            # those records separately instead of dropping fields or inventing zeros.
+            return values
         return {key: _collate_values([value[key] for value in values]) for key in first}
     if _is_torch_tensor(first):
         import torch
@@ -345,11 +364,10 @@ def _collate_values(values: list[Any]) -> Any:
 
 
 def _is_torch_tensor(value: Any) -> bool:
-    try:
-        import torch
-    except ImportError:
-        return False
-    return isinstance(value, torch.Tensor)
+    # An actual tensor implies torch is already loaded. NumPy-only users must
+    # not initialize the heavyweight optional runtime just to collate a string.
+    torch = sys.modules.get("torch")
+    return torch is not None and hasattr(torch, "Tensor") and isinstance(value, torch.Tensor)
 
 
 def _verify_file(path: Path, item: dict[str, Any]) -> None:
