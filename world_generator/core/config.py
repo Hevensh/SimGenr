@@ -435,6 +435,57 @@ class SourceLoadConfig:
     load_residential_fraction: float = 0.55
     load_commercial_fraction: float = 0.30
     load_industrial_fraction: float = 0.15
+    # E/S: the rated wind is nominal at this reference density. Safety cut-in
+    # and cut-out use physical hub wind; density changes the rated onset.
+    wind_reference_density_kg_m3: float = 1.225
+    wind_density_height_mode: str = "isothermal_surface_to_hub"
+    wind_density_fallback: str = "dry_air_then_reference"
+    pv_module_height_m: float = 2.0
+    pv_wind_shear_exponent: float = 0.14
+    load_initial_temperature_mode: str = "first_hour"
+    load_initial_temperature_c: float = 20.0
+    thermal_dispatch_half_distance_km: float = 24.0
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        """Validate once at construction and again through legacy wrappers."""
+        import math
+
+        if any(not math.isfinite(value) for value in vars(self).values() if isinstance(value, (int, float))):
+            raise ValueError("Source/load parameters must be finite")
+        if not 0 <= self.wind_cut_in_mps < self.wind_rated_mps < self.wind_cut_out_mps:
+            raise ValueError("Wind thresholds must satisfy 0 <= cut-in < rated < cut-out")
+        for name in ("wind_reference_height_m", "wind_hub_height_m", "pv_dc_ac_ratio", "pv_heat_loss_constant", "load_spatial_correlation_km", "wind_reference_density_kg_m3", "pv_module_height_m", "thermal_dispatch_half_distance_km"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.wind_density_height_mode not in {"isothermal_surface_to_hub", "surface_proxy"}:
+            raise ValueError("wind_density_height_mode must be isothermal_surface_to_hub or surface_proxy")
+        if self.wind_density_fallback not in {"dry_air_then_reference", "error"}:
+            raise ValueError("wind_density_fallback must be dry_air_then_reference or error")
+        if self.load_initial_temperature_mode not in {"first_hour", "configured"}:
+            raise ValueError("load_initial_temperature_mode must be first_hour or configured")
+        if self.load_initial_temperature_c <= -273.15:
+            raise ValueError("Initial load temperature must exceed absolute zero")
+        if self.pv_temperature_coefficient_per_c > 0:
+            raise ValueError("This PV temperature-loss model requires a nonpositive temperature coefficient")
+        for name in ("wind_system_loss_fraction", "pv_system_loss_fraction", "load_common_variance_fraction"):
+            if not 0 <= getattr(self, name) <= 1:
+                raise ValueError(f"{name} must be between zero and one")
+        if not 0 < self.pv_inverter_efficiency <= 1 or not 0 <= self.pv_ground_albedo <= 1:
+            raise ValueError("PV efficiency and ground albedo must be physical fractions")
+        if not 0 <= self.pv_tilt_degrees <= 90 or not 0 <= self.pv_azimuth_degrees < 360:
+            raise ValueError("PV tilt must be 0..90 degrees and azimuth 0..<360 degrees")
+        if not -1 < self.load_residual_ar1 < 1:
+            raise ValueError("Load AR(1) coefficient must be strictly inside (-1, 1)")
+        for name in ("pv_heat_loss_wind", "load_thermal_memory_hours", "load_residual_std_fraction", "load_heating_sensitivity_per_c", "load_cooling_sensitivity_per_c", "load_residential_fraction", "load_commercial_fraction", "load_industrial_fraction"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be nonnegative")
+        if self.load_heating_balance_c > self.load_cooling_balance_c:
+            raise ValueError("Heating balance temperature must not exceed cooling balance temperature")
+        if self.load_residential_fraction + self.load_commercial_fraction + self.load_industrial_fraction <= 0:
+            raise ValueError("At least one load sector fraction must be positive")
 
 
 @dataclass(frozen=True)

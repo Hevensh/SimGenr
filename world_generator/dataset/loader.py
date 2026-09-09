@@ -84,6 +84,20 @@ class SimGenrDataset:
         payload = _load_npz(sample_path)
         metadata = json.loads(str(payload["metadata_json"]))
         hydrology = _extract_group(payload, "hydrology")
+        source_load = _extract_group(payload, "source_load")
+        source_declaration = metadata.get("source_load", {})
+        if not isinstance(source_declaration, dict):
+            raise ValueError("Dataset source/load metadata must be a mapping")
+        source_mode = source_declaration.get("mode", "legacy_no_diagnostics")
+        if source_mode not in {"legacy_no_diagnostics", "exogenous_realization"} or (source_mode == "exogenous_realization") != bool(source_load):
+            raise ValueError("Dataset source/load appendix differs from its declared mode")
+        if source_load:
+            from world_generator.core.datatypes import SourceLoadForecastStore
+            source_store = SourceLoadForecastStore.from_arrays(source_load)
+            if not np.array_equal(source_store.timestamps, payload["dynamic__timestamps"]):
+                raise ValueError("Dataset source/load timestamps differ from weather")
+            if tuple(source_store.metadata["weather_grid_shape"]) != payload["dynamic__weather"].shape[-2:]:
+                raise ValueError("Dataset source/load sampling grid differs from weather")
         hydrology_declaration = metadata.get("hydrology", {})
         if not isinstance(hydrology_declaration, dict):
             raise ValueError("Dataset hydrology metadata must be a mapping")
@@ -104,6 +118,7 @@ class SimGenrDataset:
             "static": _extract_group(payload, "static"),
             "land": _extract_group(payload, "land"),
             "hydrology": hydrology,
+            "source_load": source_load,
             "dynamic": _extract_group(payload, "dynamic"),
             "graph": _extract_group(payload, "graph"),
             "operation": _extract_group(payload, "operation"),
@@ -165,6 +180,9 @@ class TemporalWindowDataset:
         history_hydrology, future_hydrology, static_hydrology = _split_hydrology(
             world.get("hydrology", {}), start, history_end, forecast_end, hours
         )
+        history_source, future_source, static_source = _split_source_load(
+            world.get("source_load", {}), start, history_end, forecast_end, hours
+        )
         window = {
             "sample_id": world["sample_id"],
             "seed": world["seed"],
@@ -176,14 +194,17 @@ class TemporalWindowDataset:
                 **_slice_weather(world["dynamic"], start, history_end, hours),
                 "operation": history_operation,
                 "hydrology": history_hydrology,
+                "source_load": history_source,
             },
             "future": {
                 **_slice_weather(world["dynamic"], history_end, forecast_end, hours),
                 "operation": future_operation,
                 "hydrology": future_hydrology,
+                "source_load": future_source,
             },
             "operation_static": static_operation,
             "hydrology_static": static_hydrology,
+            "source_load_static": static_source,
             "metadata": world["metadata"],
             "prepared_static": world.get("prepared_static"),
         }
@@ -261,6 +282,39 @@ def _slice_weather(dynamic: dict[str, Any], start: int, end: int, hours: int) ->
                 raise ValueError(f"Weather time series {name!r} does not match the time axis")
             result[name] = values[start:end]
     return result
+
+
+def _split_source_load(
+    source: dict[str, Any], start: int, history_end: int, forecast_end: int, hours: int,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """E names define support; thermal initial state and period totals follow each window."""
+    from world_generator.core.source_load_contracts import (
+        SOURCE_LOAD_STATIC_UNITS, SOURCE_LOAD_DIAGNOSTIC_UNITS, SOURCE_LOAD_ENERGY_POWER_FIELDS,
+        SOURCE_LOAD_CF_POWER_FIELDS, SOURCE_LOAD_BASE_INTERVAL_FIELDS,
+    )
+    if not source:
+        return {}, {}, {}
+    initial = "initial_effective_temperature_c"
+    intervals = set(SOURCE_LOAD_BASE_INTERVAL_FIELDS) | set(SOURCE_LOAD_ENERGY_POWER_FIELDS) | set(SOURCE_LOAD_CF_POWER_FIELDS)
+    intervals |= {f"diag__{name}" for name in SOURCE_LOAD_DIAGNOSTIC_UNITS} | {"timestamps", "time_bounds_hours"}
+    period = {f"period_{name}" for name in SOURCE_LOAD_ENERGY_POWER_FIELDS}
+    static = (set(SOURCE_LOAD_STATIC_UNITS) - {initial}) | {"bus_ids", "bus_kinds", "source_channels", "data_semantics", "source_load_schema_version", "source_load_field_schema_json", "source_load_metadata_json"}
+    if set(source) != intervals | period | static | {initial}:
+        raise ValueError("Window source/load appendix has missing or unknown fields")
+    history, future, shared = {}, {}, {}
+    for name in intervals:
+        values = source[name]
+        if not hasattr(values, "shape") or not values.shape or values.shape[0] != hours:
+            raise ValueError(f"Source/load interval field {name} must have T entries")
+        history[name], future[name] = values[start:history_end], values[history_end:forecast_end]
+    for name in SOURCE_LOAD_ENERGY_POWER_FIELDS:
+        history[f"period_{name}"] = history[name].sum(axis=0)
+        future[f"period_{name}"] = future[name].sum(axis=0)
+    thermal = source["diag__load_effective_temperature_c"]
+    history[initial] = source[initial] if start == 0 else thermal[start - 1]
+    future[initial] = thermal[history_end - 1]
+    shared.update({name: source[name] for name in static})
+    return history, future, shared
 
 
 def _split_hydrology(

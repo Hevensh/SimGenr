@@ -34,6 +34,7 @@ from world_generator.operation.source_load_forecast import generate_source_load_
 from world_generator.operation.stage_cache import (
     load_hourly_weather_checkpoint,
     load_dynamic_hydrology_checkpoint,
+    load_source_load_checkpoint,
     load_stage12_checkpoint,
     load_stage13_checkpoint,
     save_stage12_checkpoint,
@@ -415,6 +416,10 @@ def main() -> None:
                     "start_day_of_year": hourly_weather.start_day_of_year,
                 },
                 "source_load_forecast": source_load_forecast.summary_dict(),
+                "source_load_appendix": {
+                    "schema_version": "source_load_v1", "mode": "exogenous_realization",
+                    "artifact": "stage_11_operation/source_load_forecast.npz",
+                } if source_load_forecast.nameplate_capacity_mw is not None else None,
                 "power_flow": power_flow.summary_dict(),
                 "grid_upgrade_plan": upgrade_plan.summary_dict(),
                 "grid_update_loop": update_loop.summary_dict(),
@@ -706,6 +711,9 @@ def _validate_cached_physics(output_dir: Path, config: object, from_stage: int) 
         raise ValueError(f"Checkpoint uses different physical semantics; regenerate {GENERATOR_VERSION} with --from-stage 1")
     if metadata.get("land_accounting_version") != "land_use_v1":
         raise ValueError("Checkpoint predates independent land-area accounting; regenerate with --from-stage 1")
+    appendix = metadata.get("source_load_appendix")
+    if not isinstance(appendix, dict) or appendix.get("schema_version") != "source_load_v1":
+        raise ValueError("Checkpoint predates source_load_v1 source/load physics; regenerate with --from-stage 1")
     cached = load_world_config(layout.config_snapshot).to_dict()
     current = config.to_dict()
     upstream = set(current) - {"output", "storage"}
@@ -720,6 +728,9 @@ def _validate_cached_physics(output_dir: Path, config: object, from_stage: int) 
                                                     expected_grid_shape=(config.world.height, config.world.width))
         if config.hydrology_dynamic.enabled != (dynamic is not None):
             raise ValueError("Dynamic hydrology mode differs from the requested checkpoint configuration")
+    weather = load_hourly_weather_checkpoint(output_dir)
+    load_source_load_checkpoint(output_dir, expected_timestamps=weather.timestamps,
+                                expected_grid_shape=(config.world.height, config.world.width))
 
 
 if __name__ == "__main__":

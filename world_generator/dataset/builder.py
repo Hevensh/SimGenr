@@ -10,10 +10,10 @@ from tqdm.auto import tqdm
 
 from world_generator.core.output_layout import WorldDataLayout
 from world_generator.core.contracts import entity_ids
-from world_generator.operation.stage_cache import load_stage12_checkpoint, load_dynamic_hydrology_checkpoint, validate_weather_checkpoint_time
+from world_generator.operation.stage_cache import load_stage12_checkpoint, load_dynamic_hydrology_checkpoint, load_source_load_checkpoint, validate_weather_checkpoint_time
 
 
-SCHEMA_VERSION = "0.8.0"
+SCHEMA_VERSION = "0.9.0"
 
 STATIC_CONTINUOUS_CHANNELS = (
     "elevation",
@@ -227,6 +227,8 @@ def package_world(
     hydrology_store = load_dynamic_hydrology_checkpoint(world_dir, expected_timestamps=weather["timestamps"],
                                                        expected_grid_shape=static_source["elevation"].shape)
     hydrology_payload = hydrology_store.as_arrays() if hydrology_store is not None else {}
+    source_load_store = load_source_load_checkpoint(world_dir, expected_timestamps=weather["timestamps"], expected_grid_shape=static_source["elevation"].shape) if exogenous is not None else None
+    source_load_payload = source_load_store.as_arrays() if source_load_store is not None and source_load_store.nameplate_capacity_mw is not None else {}
     dynamic_payload = {
         "timestamps": weather["timestamps"].astype(np.int32),
         "weather": weather["dynamic"].astype(np.float32),
@@ -290,6 +292,13 @@ def package_world(
             "state_support": "T+1 interval boundaries; all mm stores are whole-cell equivalent depths",
             "forcing_availability": "realized hourly precipitation; no implicit NWP or forecast availability",
         },
+        "source_load": {
+            **(source_load_store.metadata if source_load_payload else {"mode": "legacy_no_diagnostics"}),
+            "fields": list(source_load_payload), "source_artifact": "stage_11_operation/source_load_forecast.npz",
+            "semantics": "Exogenous requested load, generation availability and planned generation; no delivery or curtailment claim",
+            "node_identity": "Original Stage11 bus_ids; independent of the final graph's node order",
+            "window_accounting": "period_* are realized summaries, never static inputs; windows recompute them from their own intervals and use the preceding effective-temperature boundary",
+        },
         "dynamic": {
             "weather_generation": json.loads(str(weather["weather_metadata_json"])) if "weather_metadata_json" in weather else {"generation_mode": "unspecified_legacy"},
             "optional_diagnostics": [name for name in dynamic_payload if name.startswith("diagnostic__")],
@@ -321,6 +330,7 @@ def package_world(
         **_prefix_payload("static", static_payload),
         **_prefix_payload("land", land_payload),
         **_prefix_payload("hydrology", hydrology_payload),
+        **_prefix_payload("source_load", source_load_payload),
         **_prefix_payload("dynamic", dynamic_payload),
         **_prefix_payload("graph", graph_payload),
         **_prefix_payload("operation", operation_payload),
@@ -387,6 +397,15 @@ def dataset_schema() -> dict[str, object]:
                 "timestamps/time_bounds_hours/state_time_hours": "[T]/[T,2]/[T+1] hours in local solar convention",
                 "absent": "Legacy or static_only worlds have no simulated dynamic hydrology arrays",
             },
+            "source_load": {
+                "semantics": "Optional complete source_load_v1 Stage11 exogenous appendix; original bus IDs are independent of final graph order",
+                "static_assets": "nameplate_capacity_mw/reference_load_mw/weather_sample_row/weather_sample_col/capacity_factor_valid [N]",
+                "power/energy/CF/diag__*": "Explicit schema fields [T,N]; energy is interval MWh, effective temperature is interval-end state",
+                "initial_effective_temperature_c": "[N] preceding boundary; temporal windows take their own preceding state",
+                "period_*_energy_mwh": "[N] realized whole-period audits or targets, never static input; each temporal window recomputes its own sums",
+                "field_schema": "source_load_field_schema_json declares units and support; no shape-based classification",
+                "absent": "Legacy worlds remain readable without fabricated capacities or diagnostics",
+            },
             "graph": {
                 "semantics": "only node and line are graph entities; A* paths are optional line geometry metadata",
                 "node_id": "int32 [N]",
@@ -404,6 +423,7 @@ def dataset_schema() -> dict[str, object]:
                 },
             },
             "operation": {
+                "source_load_appendix": "Separate source_load group preserves Stage11 original node identity, nameplate/CF, diagnostics and interval/period MWh",
                 "node_dynamic": "float32 [T,C_node,N]",
                 "node_dynamic_semantics": "Stage 14 dispatch quantities; includes storage charging and inverter capacity",
                 "exogenous_p_load_mw": "optional float32 [T,N]: Stage 11 requested demand, without storage charging",

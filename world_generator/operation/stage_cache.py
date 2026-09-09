@@ -19,7 +19,34 @@ from world_generator.core.datatypes import (
     StorageSite,
     WeatherStore,
     HydrologyTimeSeriesStore,
+    SourceLoadForecastStore,
 )
+
+
+def load_source_load_checkpoint(
+    output_dir: Path, *, expected_timestamps: np.ndarray | None = None,
+    expected_grid_shape: tuple[int, int] | None = None,
+) -> SourceLoadForecastStore:
+    """Load Stage11 exogenous power and, when declared, its complete E appendix."""
+    from world_generator.core.source_load_contracts import SOURCE_LOAD_SCHEMA_VERSION, SOURCE_LOAD_MODE
+
+    layout = WorldDataLayout(output_dir / "data")
+    path = layout.existing(layout.operation, "source_load_forecast.npz", layout.root / "source_load_forecast.npz")
+    with np.load(path, allow_pickle=False) as payload:
+        store = SourceLoadForecastStore.from_arrays({name: payload[name].copy() for name in payload.files})
+    metadata = json.loads(layout.metadata.read_text(encoding="utf-8")) if layout.metadata.exists() else {}
+    declaration = metadata.get("source_load_appendix")
+    if declaration is not None:
+        if not isinstance(declaration, dict) or declaration.get("schema_version") != SOURCE_LOAD_SCHEMA_VERSION or declaration.get("mode") != SOURCE_LOAD_MODE or declaration.get("artifact") != "stage_11_operation/source_load_forecast.npz":
+            raise ValueError("Unsupported source/load appendix declaration")
+        if store.nameplate_capacity_mw is None:
+            raise ValueError("Declared source/load appendix is missing from its checkpoint")
+    if expected_timestamps is not None and not np.array_equal(store.timestamps, expected_timestamps):
+        raise ValueError("Source/load checkpoint timestamps differ from hourly weather")
+    if expected_grid_shape is not None and store.nameplate_capacity_mw is not None:
+        if tuple(store.metadata["weather_grid_shape"]) != tuple(expected_grid_shape):
+            raise ValueError("Source/load sampling grid differs from hourly weather")
+    return store
 
 
 def load_dynamic_hydrology_checkpoint(

@@ -11,6 +11,7 @@ from typing import Mapping
 import numpy as np
 
 from world_generator.core.hydrology_contracts import hydrology_field_schema
+from world_generator.core.source_load_contracts import source_load_field_schema
 
 GENERATOR_VERSION = "physics_v4"
 CONTRACT_VERSION = "1.0"
@@ -216,6 +217,13 @@ def field_contract_document(step_hours: float = 1.0) -> dict[str, object]:
             generation_note=("Geometry, unit conversion, sum or balance under the prescribed model"
                              if pure_accounting else "Uncalibrated forcing or scenario closure: bounded soil bucket, linear reservoirs, prescribed geometry or shortwave PET; engineering simplification"),
         )
+    for name, spec in source_load_field_schema().items():
+        add(f"source_load.{name}", spec["unit"], spec["time_kind"], "node", spec["time_kind"],
+            "source_load_forecast", ("source_load_validation", "dataset", "planning_comparison"),
+            spec["generation_relation_type"], "Stage11_exogenous_or_planned_not_delivered")
+        fields[f"source_load.{name}"].update(shape=spec["shape"],
+            generation_relation_type=spec["generation_relation_type"], accounting_relation_type="P",
+            generation_note="Scenario equipment/load diagnostics; energy and capacity-factor accounting use the declared nameplate and intervals")
     for name, unit in WEATHER_UNITS.items():
         add(f"weather.{name}", unit, "accumulation" if name == "precipitation" else "interval_mean", "cell_area_representative", "explicit_interval_bounds_hours", "weather", ("source_load", "hydrology", "daily_aggregation"), "P" if name in {"wind_speed", "humidity", "pressure"} else "E", "exogenous_weather")
     add("weather.diagnostic__specific_humidity_kg_kg", "kg/kg moist air", "interval_representative_primitive", "cell", "explicit_interval_bounds_hours", "weather", ("moist_air_diagnosis", "source_load"), "S", "prescribed_moisture_forcing")
@@ -260,6 +268,7 @@ def field_contract_document(step_hours: float = 1.0) -> dict[str, object]:
         },
         "fields": fields,
         "dynamic_hydrology_field_schema": hydrology_field_schema(),
+        "source_load_field_schema": source_load_field_schema(),
         "artifact_field_overrides": artifact_overrides,
         "matrix_columns": {
             "electrical_buses": ["id:1", "nominal:kV", "P_capacity:MW", "Q_capacity:Mvar", "base_load:MW", "power_factor:1", "voltage_setpoint:pu"],

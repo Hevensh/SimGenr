@@ -22,6 +22,7 @@ from world_generator.core.contracts import integer_labels, entity_ids
 from world_generator.weather.physics import extraterrestrial_hourly_irradiance, latitude_grid
 from world_generator.weather.physics import diagnose_moist_air, saturation_vapor_pressure_hpa
 from scripts.hydrology_validation import check_dynamic_hydrology
+from scripts.source_load_validation import check_source_load_contracts
 
 
 def _npz(path: Path) -> dict[str, np.ndarray]:
@@ -393,6 +394,11 @@ def validate_world(world_dir: Path) -> dict[str, object]:
     source_ids = source["bus_ids"].astype(int)
     source_kinds = np.asarray(source["bus_kinds"])
     original_buses = {int(bus["bus_id"]): bus for bus in metadata["refined_grid_buses"]}
+    source_load_summary = {"mode": "legacy_without_source_load_v1"}
+    if "source_load_schema_version" in source:
+        from world_generator.core.datatypes import SourceLoadForecastStore
+        SourceLoadForecastStore.from_arrays(source)
+        source_load_summary = check_source_load_contracts(checks, source, hourly, config, metadata)
     checks.upper("exogenous_load_nonnegative", -source["p_load_mw"], 0.0, 1e-6, "MW")
     checks.upper("exogenous_availability_nonnegative", -source["p_gen_available_mw"], 0.0, 1e-6, "MW")
     capacity_factors: dict[str, float | None] = {}
@@ -489,7 +495,7 @@ def validate_world(world_dir: Path) -> dict[str, object]:
                     "total_unserved_mwh": float(flow["unserved_load_mw"].sum()),
                     "total_curtailed_mwh": float(flow["curtailed_generation_mw"].sum()),
                     "storage_site_count": int(storage["site_ids"].size), "land_accounting": land_summary,
-                    "dynamic_hydrology": hydrology_summary},
+                    "dynamic_hydrology": hydrology_summary, "source_load": source_load_summary},
         "limitations": "Checks validate exported physical identities and constraints, not empirical realism or forecast accuracy. A PASS can include explicitly reported unserved energy when load shedding is allowed; it does not imply supply adequacy. Capacity factors are descriptive only. Final graph and dispatch use perfect foresight.",
     }
 

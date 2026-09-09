@@ -251,13 +251,20 @@ class SourceLoadForecastStore:
     q_load_mvar: np.ndarray
     source_channels: tuple[str, ...]
     data_semantics: str = "synthetic_realization"
+    nameplate_capacity_mw: np.ndarray | None = None
+    reference_load_mw: np.ndarray | None = None
+    initial_effective_temperature_c: np.ndarray | None = None
+    weather_sample_row: np.ndarray | None = None
+    weather_sample_col: np.ndarray | None = None
+    diagnostics: dict[str, np.ndarray] = field(default_factory=dict)
+    metadata: dict[str, object] = field(default_factory=dict)
 
     def as_arrays(self) -> dict[str, np.ndarray]:
         validate_node_arrays(self.timestamps, self.bus_ids, {
             "p_load_mw": self.p_load_mw, "p_gen_available_mw": self.p_gen_available_mw,
             "p_gen_scheduled_mw": self.p_gen_scheduled_mw, "q_load_mvar": self.q_load_mvar,
         })
-        return {
+        arrays = {
             "timestamps": self.timestamps,
             "bus_ids": self.bus_ids,
             "bus_kinds": np.asarray(self.bus_kinds),
@@ -269,6 +276,99 @@ class SourceLoadForecastStore:
             "data_semantics": np.asarray(self.data_semantics),
             "time_bounds_hours": interval_bounds_hours(self.timestamps, 1.0),
         }
+        optional = (self.nameplate_capacity_mw, self.reference_load_mw, self.initial_effective_temperature_c, self.weather_sample_row, self.weather_sample_col)
+        if not any(value is not None for value in optional) and not self.diagnostics and not self.metadata:
+            return arrays
+        from world_generator.core.contracts import integer_labels, integrate_power_mwh
+        from world_generator.core.source_load_contracts import (
+            SOURCE_LOAD_SCHEMA_VERSION, SOURCE_LOAD_MODE, SOURCE_LOAD_DIAGNOSTIC_APPLICABILITY,
+            SOURCE_LOAD_ENERGY_POWER_FIELDS, SOURCE_LOAD_CF_POWER_FIELDS, source_load_field_schema,
+        )
+        if not all(value is not None for value in optional):
+            raise ValueError("Source/load appendix requires all five node attribute arrays")
+        count, hours = len(self.bus_ids), len(self.timestamps)
+        kinds = np.asarray(self.bus_kinds)
+        if kinds.shape != (count,):
+            raise ValueError("Source/load bus kinds must match bus IDs")
+        if self.metadata.get("schema_version") != SOURCE_LOAD_SCHEMA_VERSION or self.metadata.get("mode") != SOURCE_LOAD_MODE:
+            raise ValueError("Modern source/load metadata must declare source_load_v1 exogenous_realization")
+        if set(self.diagnostics) != set(SOURCE_LOAD_DIAGNOSTIC_APPLICABILITY):
+            raise ValueError("Modern source/load diagnostics must match the six-field source_load_v1 schema")
+        expected_applicability = {name: list(values) for name, values in SOURCE_LOAD_DIAGNOSTIC_APPLICABILITY.items()}
+        if self.metadata.get("diagnostic_applicability") != expected_applicability:
+            raise ValueError("Source/load diagnostic applicability must be explicit and match source_load_v1")
+        grid_shape = np.asarray(self.metadata.get("weather_grid_shape", []))
+        if grid_shape.shape != (2,) or np.any(integer_labels(grid_shape, "weather_grid_shape") <= 0):
+            raise ValueError("Source/load metadata must identify the weather grid shape")
+        for name in ("nameplate_capacity_mw", "reference_load_mw", "initial_effective_temperature_c", "weather_sample_row", "weather_sample_col"):
+            values = np.asarray(getattr(self, name))
+            if values.shape != (count,) or not np.isfinite(values).all():
+                raise ValueError(f"Source/load {name} must be finite [N]")
+            if name != "initial_effective_temperature_c" and np.any(values < 0):
+                raise ValueError(f"Source/load {name} must be nonnegative")
+            arrays[name] = values
+        for index, name in enumerate(("weather_sample_row", "weather_sample_col")):
+            positions = integer_labels(arrays[name], name)
+            if np.any(positions >= grid_shape[index]):
+                raise ValueError("Source/load weather sample coordinates exceed the weather grid")
+        load_mask = kinds == "load_bus"
+        if np.any(arrays["reference_load_mw"][~load_mask] != 0) or np.any(arrays["initial_effective_temperature_c"][~load_mask] != 0):
+            raise ValueError("Load reference and thermal initial state must be zero on non-load buses")
+        for name, applies in SOURCE_LOAD_DIAGNOSTIC_APPLICABILITY.items():
+            values = np.asarray(self.diagnostics[name])
+            if values.shape != (hours, count) or not np.isfinite(values).all():
+                raise ValueError(f"Source/load diagnostic {name} must be finite [T,N]")
+            if np.any(values[:, ~np.isin(kinds, applies)] != 0):
+                raise ValueError(f"Source/load diagnostic {name} is nonzero outside applicable bus kinds")
+            if name in {"hub_wind_speed_mps", "wind_air_density_kg_m3", "pv_poa_w_m2"} and np.any(values < 0):
+                raise ValueError(f"Source/load diagnostic {name} must be nonnegative")
+            arrays[f"diag__{name}"] = values
+        valid = np.isin(kinds, ("wind_bus", "pv_bus", "thermal_bus")) & (arrays["nameplate_capacity_mw"] > 0)
+        arrays["capacity_factor_valid"] = valid
+        duration = arrays["time_bounds_hours"][:, 1] - arrays["time_bounds_hours"][:, 0]
+        for name, power_name in SOURCE_LOAD_ENERGY_POWER_FIELDS.items():
+            power = np.asarray(arrays[power_name], dtype=np.float64)
+            arrays[name] = power * duration[:, None]
+            arrays[f"period_{name}"] = integrate_power_mwh(power, duration)
+        for name, power_name in SOURCE_LOAD_CF_POWER_FIELDS.items():
+            arrays[name] = np.divide(arrays[power_name], arrays["nameplate_capacity_mw"][None, :],
+                                     out=np.zeros((hours, count), dtype=float), where=valid[None, :])
+        arrays["source_load_schema_version"] = np.asarray(SOURCE_LOAD_SCHEMA_VERSION)
+        arrays["source_load_field_schema_json"] = np.asarray(json.dumps(source_load_field_schema(), sort_keys=True))
+        arrays["source_load_metadata_json"] = np.asarray(json.dumps(self.metadata, sort_keys=True, allow_nan=False))
+        return arrays
+
+    @classmethod
+    def from_arrays(cls, arrays: dict[str, np.ndarray]) -> "SourceLoadForecastStore":
+        from world_generator.core.source_load_contracts import SOURCE_LOAD_SCHEMA_VERSION, source_load_field_schema
+
+        base = ("timestamps", "bus_ids", "bus_kinds", "p_load_mw", "p_gen_available_mw", "p_gen_scheduled_mw", "q_load_mvar", "source_channels")
+        if not set(base).issubset(arrays):
+            raise ValueError("Source/load checkpoint is missing required power or identity fields")
+        bounds = interval_bounds_hours(arrays["timestamps"], 1.0)
+        if "time_bounds_hours" in arrays and (np.asarray(arrays["time_bounds_hours"]).shape != bounds.shape or not np.allclose(arrays["time_bounds_hours"], bounds, rtol=0, atol=1e-9)):
+            raise ValueError("Source/load checkpoint has inconsistent interval bounds")
+        kwargs = {}
+        schema = source_load_field_schema()
+        modern = any(name in arrays for name in ("source_load_schema_version", "source_load_metadata_json", "source_load_field_schema_json")) or any(name in arrays for name in schema) or any(name.startswith("diag__") for name in arrays)
+        if modern:
+            if str(arrays.get("source_load_schema_version")) != SOURCE_LOAD_SCHEMA_VERSION or json.loads(str(arrays.get("source_load_field_schema_json", "null"))) != schema:
+                raise ValueError("Source/load appendix schema is missing or inconsistent")
+            expected = set(base) | set(schema) | {"data_semantics", "time_bounds_hours", "source_load_schema_version", "source_load_field_schema_json", "source_load_metadata_json"}
+            if set(arrays) != expected:
+                raise ValueError("Source/load appendix is incomplete or has unknown fields")
+            kwargs = {name: np.asarray(arrays[name]) for name in ("nameplate_capacity_mw", "reference_load_mw", "initial_effective_temperature_c", "weather_sample_row", "weather_sample_col")}
+            kwargs["diagnostics"] = {name.removeprefix("diag__"): np.asarray(arrays[name]) for name in schema if name.startswith("diag__")}
+            kwargs["metadata"] = json.loads(str(arrays["source_load_metadata_json"]))
+        store = cls(np.asarray(arrays["timestamps"]), np.asarray(arrays["bus_ids"]), tuple(str(item) for item in arrays["bus_kinds"]),
+                    *(np.asarray(arrays[name]) for name in ("p_load_mw", "p_gen_available_mw", "p_gen_scheduled_mw", "q_load_mvar")),
+                    tuple(str(item) for item in arrays["source_channels"]), str(arrays.get("data_semantics", "synthetic_realization")), **kwargs)
+        checked = store.as_arrays()
+        if modern:
+            for name in schema:
+                if np.asarray(arrays[name]).shape != np.asarray(checked[name]).shape or not np.allclose(arrays[name], checked[name], rtol=1e-10, atol=1e-10):
+                    raise ValueError(f"Source/load serialized accounting field {name} disagrees with its power basis")
+        return store
 
     def summary_dict(self) -> dict[str, float | int | str | list[str]]:
         total_load = self.p_load_mw.sum(axis=1)

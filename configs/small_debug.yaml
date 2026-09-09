@@ -366,6 +366,14 @@ output:
 
 # Scenario priors; these values require regional data calibration.
 source_load:
+  wind_reference_density_kg_m3: 1.225
+  wind_density_height_mode: isothermal_surface_to_hub
+  wind_density_fallback: dry_air_then_reference
+  pv_module_height_m: 2.0
+  pv_wind_shear_exponent: 0.14
+  load_initial_temperature_mode: first_hour
+  load_initial_temperature_c: 20.0
+  thermal_dispatch_half_distance_km: 24.0
   calendar_start_date: "2025-01-01"
   wind_reference_height_m: 10.0
   wind_hub_height_m: 90.0
