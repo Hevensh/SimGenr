@@ -4,6 +4,8 @@ This project builds a reproducible synthetic world for multimodal source-load-gr
 
 ## 物理模型修订（physics_v3）
 
+完整的十专题文献与机理调查见 [调查入口](docs/mechanism_research/README.md) 与 [综合报告](docs/mechanism_research/synthesis_report.md)，包含因果关系、量纲与时空尺度、代码缺口、分阶段建议和验证协议。该组报告是后续设计依据，提出的新状态和模块尚未在本次研究文档变更中启用。
+
 本次对 14 个阶段完成文献核对和公式修订。请先阅读 [中文研究与修改总览](docs/PHYSICS_REVIEW_ZH.md)、[验证结果](docs/VALIDATION_RESULTS.md)，以及其中链接的地理、气象、源荷、电网与储能分项报告。
 
 关键变化：气候前置于植被；人口/面积/能量守恒；日小时天气一致；风光转换采用物理模型；负荷考虑日历、温度记忆和以 km 计的空间相关；电源候选数量随负荷规模变化；逐岛电力平衡；储能互斥和显式缺供。配置中的经验权重仍是待校准的场景先验。`source_load_forecast` 是兼容名称，数据代表合成实况，最终调度采用全窗口预知规划。
