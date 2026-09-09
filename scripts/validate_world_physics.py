@@ -19,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from world_generator.core.config import load_world_config
 from world_generator.core.output_layout import WorldDataLayout
 from world_generator.weather.physics import extraterrestrial_hourly_irradiance, latitude_grid
+from world_generator.weather.physics import diagnose_moist_air, saturation_vapor_pressure_hpa
 
 
 def _npz(path: Path) -> dict[str, np.ndarray]:
@@ -51,6 +52,101 @@ class Checks:
 
     def condition(self, name: str, passed: bool, note: str = "") -> None:
         self.rows.append({"name": name, "passed": bool(passed), "note": note})
+
+
+def check_weather_contracts(checks: Checks, daily: dict[str, np.ndarray], hourly: dict[str, np.ndarray],
+                            config: object, daily_summary: dict[str, np.ndarray] | None = None) -> None:
+    """B: independently aggregate outputs and enforce only declared anchor constraints.
+
+    A daily average of nonlinear diagnostics is not diagnosed from daily means.
+    The primitive-state identities are checked on the hourly representative state.
+    """
+    meta = json.loads(str(hourly.get("weather_metadata_json", "{}")))
+    mode = meta.get("generation_mode")
+    if mode and daily_summary is None:
+        raise ValueError("Hourly weather with declared primitives requires hourly_daily_summary.npz")
+    reference = daily if daily_summary is None else daily_summary
+    reference_indices = {int(value): index for index, value in enumerate(reference["timestamps"])}
+    anchor_indices = {int(value): index for index, value in enumerate(daily["timestamps"])}
+    channels = {str(name): i for i, name in enumerate(hourly["channel_names"])}
+    reference_channels = {str(name): i for i, name in enumerate(reference["channel_names"])}
+    anchor_channels = {str(name): i for i, name in enumerate(daily["channel_names"])}
+    constraints = meta.get("daily_constraints", list(channels) if not mode else [])
+    stamps = hourly["timestamps"].astype(np.int64)
+    latitude = latitude_grid(config.world, hourly["dynamic"].shape[2:])
+    errors: dict[str, list[np.ndarray]] = {name: [] for name in channels}
+    anchor_errors: dict[str, list[np.ndarray]] = {str(name): [] for name in constraints}
+    night_errors, above_toa = [], []
+    for day in np.unique(stamps // 24):
+        positions = np.flatnonzero(stamps // 24 == day)
+        complete = len(positions) == 24 and np.array_equal(stamps[positions] % 24, np.arange(24)) and int(day) in reference_indices
+        checks.condition(f"complete_daily_alignment_{day}", complete)
+        if not complete:
+            continue
+        block = hourly["dynamic"][positions].astype(np.float64)
+        target = reference["dynamic"][reference_indices[int(day)]].astype(np.float64)
+        anchor_day = int(day) if int(day) in anchor_indices else int(day) % 365
+        for name, index in channels.items():
+            if name not in reference_channels:
+                checks.condition(f"daily_channel_{name}_exists", False)
+                continue
+            aggregate = block[:, index].sum(axis=0) if name == "precipitation" else block[:, index].mean(axis=0)
+            errors[name].append(aggregate - target[reference_channels[name]])
+            if mode and name in anchor_errors:
+                if anchor_day not in anchor_indices or name not in anchor_channels:
+                    checks.condition(f"daily_anchor_{name}_{day}_exists", False)
+                else:
+                    anchor_errors[name].append(aggregate - daily["dynamic"][anchor_indices[anchor_day], anchor_channels[name]])
+        toa = extraterrestrial_hourly_irradiance(latitude, float(day))
+        radiation = block[:, channels["irradiance"]]
+        night_errors.append(radiation[toa <= 1e-8])
+        above_toa.append(radiation - toa)
+    for name, residuals in errors.items():
+        checks.equal(f"daily_hourly_{name}", np.asarray(residuals), 2e-4,
+                     "mm" if name == "precipitation" else "channel native unit",
+                     "rain depth sums; interval means average; reference is realized daily summary when present")
+    if mode:
+        for name, residuals in anchor_errors.items():
+            checks.equal(f"declared_anchor_{name}", np.asarray(residuals), 2e-4,
+                         "mm" if name == "precipitation" else "channel native unit")
+    checks.equal("nighttime_ghi_zero", np.concatenate(night_errors) if night_errors else np.zeros(0), 1e-6, "W/m2", "no-twilight solar model")
+    checks.upper("irradiance_below_toa", np.asarray(above_toa), 0.0, 2e-4, "W/m2", "chosen model excludes lateral cloud-edge enhancement")
+    for name in ("precipitation", "irradiance", "wind_speed"):
+        checks.upper(f"hourly_{name}_nonnegative", -hourly["dynamic"][:, channels[name]], 0.0, 1e-6)
+    for name in ("humidity", "cloud"):
+        values = hourly["dynamic"][:, channels[name]]
+        checks.upper(f"hourly_{name}_lower_bound", -values, 0.0, 1e-6)
+        checks.upper(f"hourly_{name}_upper_bound", values, 1.0, 1e-6)
+    checks.equal("wind_vector_magnitude", np.hypot(hourly["dynamic"][:, channels["wind_u"]], hourly["dynamic"][:, channels["wind_v"]]) - hourly["dynamic"][:, channels["wind_speed"]], 1e-5, "m/s")
+    checks.upper("daily_wind_mean_triangle", np.hypot(reference["dynamic"][:, reference_channels["wind_u"]], reference["dynamic"][:, reference_channels["wind_v"]]), reference["dynamic"][:, reference_channels["wind_speed"]], 1e-5, "m/s")
+    if mode:
+        required = ("specific_humidity_kg_kg", "sea_level_pressure_hpa", "air_density_kg_m3")
+        expected_shape = (len(stamps), *hourly["dynamic"].shape[2:])
+        for name in required:
+            key = f"diagnostic__{name}"
+            if key not in hourly or hourly[key].shape != expected_shape:
+                raise ValueError(f"{key} must be present with shape {expected_shape}")
+        q = hourly["diagnostic__specific_humidity_kg_kg"].astype(np.float64)
+        p0 = hourly["diagnostic__sea_level_pressure_hpa"].astype(np.float64)
+        p = hourly["dynamic"][:, channels["pressure"]].astype(np.float64)
+        t_c = hourly["dynamic"][:, channels["temperature"]].astype(np.float64)
+        height = hourly.get("static_elevation_m")
+        if height is None or height.shape != hourly["dynamic"].shape[2:]:
+            raise ValueError("static_elevation_m is required with shape [H,W] for primitive pressure diagnostics")
+        checks.upper("specific_humidity_nonnegative", -q, 0, 0, "kg/kg")
+        checks.condition("specific_humidity_below_one", bool(np.all(q < 1)))
+        checks.condition("positive_absolute_temperature_and_pressure", bool(np.all(t_c > -273.15) and np.all(p > 0) and np.all(p0 > 0)))
+        # Selected hydrostatic-model consistency; independent gas-law residuals
+        # below also test the exported pressure/RH/density without that kernel.
+        _, expected_pressure, _ = diagnose_moist_air(t_c, q, height, p0)
+        checks.equal("hydrostatic_pressure_from_primitives", p - expected_pressure, 2e-4, "hPa")
+        epsilon = 287.05 / 461.5
+        vapor_hpa = p * q / (epsilon + (1 - epsilon) * q)
+        rh = vapor_hpa / saturation_vapor_pressure_hpa(t_c)
+        checks.equal("relative_humidity_from_primitives", rh - hourly["dynamic"][:, channels["humidity"]], 2e-6, "1")
+        rho = p * 100 / (287.05 * (t_c + 273.15) * (1 + (461.5 / 287.05 - 1) * q))
+        checks.equal("moist_air_density_identity", rho - hourly["diagnostic__air_density_kg_m3"], 2e-6, "kg/m3")
+        checks.condition("positive_moist_air_density", bool(np.all(hourly["diagnostic__air_density_kg_m3"] > 0)))
 
 
 def validate_world(world_dir: Path) -> dict[str, object]:
@@ -86,44 +182,9 @@ def validate_world(world_dir: Path) -> dict[str, object]:
     checks.equal("population_mass", np.asarray(population - city_population), max(0.1, city_population * 2e-6), "persons")
     checks.upper("population_nonnegative", -static["population_density"], 0.0, 1e-7, "persons/km2")
 
-    hourly_channels = {str(name): index for index, name in enumerate(hourly["channel_names"])}
-    daily_channels = {str(name): index for index, name in enumerate(daily["channel_names"])}
-    daily_index = {int(timestamp): index for index, timestamp in enumerate(daily["timestamps"])}
-    latitude = latitude_grid(config.world, hourly["dynamic"].shape[2:])
-    aggregation_errors: dict[str, list[np.ndarray]] = {name: [] for name in hourly_channels}
-    night_errors = []
-    above_toa = []
-    for day in np.unique(stamps // 24):
-        positions = np.flatnonzero(stamps // 24 == day)
-        complete = len(positions) == 24 and np.array_equal(stamps[positions] % 24, np.arange(24)) and int(day) in daily_index
-        checks.condition(f"complete_daily_alignment_{day}", complete)
-        if not complete:
-            continue
-        block = hourly["dynamic"][positions].astype(np.float64)
-        target = daily["dynamic"][daily_index[int(day)]].astype(np.float64)
-        for name, index in hourly_channels.items():
-            if name not in daily_channels:
-                checks.condition(f"daily_channel_{name}_exists", False)
-                continue
-            aggregate = block[:, index].sum(axis=0) if name == "precipitation" else block[:, index].mean(axis=0)
-            aggregation_errors[name].append(aggregate - target[daily_channels[name]])
-        toa = extraterrestrial_hourly_irradiance(latitude, float(day))
-        radiation = block[:, hourly_channels["irradiance"]]
-        night_errors.append(radiation[toa <= 1e-8])
-        above_toa.append(radiation - toa)
-    for name, residuals in aggregation_errors.items():
-        checks.equal(f"daily_hourly_{name}", np.asarray(residuals), 2e-4,
-                     "mm/day" if name == "precipitation" else "channel native unit",
-                     "rain sums; all other channels average over the same solar day")
-    checks.equal("nighttime_ghi_zero", np.concatenate(night_errors) if night_errors else np.zeros(0), 1e-6, "W/m2")
-    checks.upper("irradiance_below_toa", np.asarray(above_toa), 0.0, 2e-4, "W/m2")
-    for name in ("precipitation", "irradiance", "wind_speed"):
-        checks.upper(f"hourly_{name}_nonnegative", -hourly["dynamic"][:, hourly_channels[name]], 0.0, 1e-6)
-    for name in ("humidity", "cloud"):
-        values = hourly["dynamic"][:, hourly_channels[name]]
-        checks.upper(f"hourly_{name}_lower_bound", -values, 0.0, 1e-6)
-        checks.upper(f"hourly_{name}_upper_bound", values, 1.0, 1e-6)
-    checks.equal("wind_vector_magnitude", np.hypot(hourly["dynamic"][:, hourly_channels["wind_u"]], hourly["dynamic"][:, hourly_channels["wind_v"]]) - hourly["dynamic"][:, hourly_channels["wind_speed"]], 1e-5, "m/s")
+    daily_summary_path = layout.weather / "hourly_daily_summary.npz"
+    daily_summary = _npz(daily_summary_path) if daily_summary_path.exists() else None
+    check_weather_contracts(checks, daily, hourly, config, daily_summary)
 
     source_ids = source["bus_ids"].astype(int)
     source_kinds = np.asarray(source["bus_kinds"])

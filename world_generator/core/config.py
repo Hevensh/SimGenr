@@ -116,6 +116,22 @@ class ClimateConfig:
     rain_shadow_factor: float = 0.28
     irradiance_base_w_m2: float = 195.0
     climate_noise_weight: float = 0.12
+    # S: latent Gaussian covariance e-folding distances, not fitted climatology.
+    # Existing positional fields stay in place. Pixel steps apply only in legacy.
+    spatial_scale_mode: str = "physical"
+    climate_correlation_length_km: float = 20.0
+    wind_direction_correlation_length_km: float = 12.0
+    spatial_boundary: str = "reflect"
+
+    def __post_init__(self) -> None:
+        _validate_scale_config(self)
+        if self.spatial_boundary not in {"reflect", "periodic"}:
+            raise ValueError("Climate spatial_boundary must be reflect or periodic")
+        for name in ("climate_correlation_length_km", "wind_direction_correlation_length_km", "water_moderation_km", "humidity_water_decay_km"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
+        if isinstance(self.wind_direction_smoothing_steps, bool) or not isinstance(self.wind_direction_smoothing_steps, int) or self.wind_direction_smoothing_steps < 0:
+            raise ValueError("wind_direction_smoothing_steps must be a nonnegative integer (legacy mode only)")
 
 
 @dataclass(frozen=True)
@@ -155,6 +171,53 @@ class WeatherConfig:
     solar_seasonal_lag_days: float = 4.0
     low_frequency_temperature_c: float = 1.4
     low_frequency_irradiance_weight: float = 0.06
+    # Appended to preserve old positional arguments. Daily files are driver
+    # anchors; aggregate_daily_weather(hourly) provides realized diagnostics.
+    hourly_generation_mode: str = "primitive_hourly"
+    spatial_scale_mode: str = "physical"
+    innovation_correlation_length_km: float = 10.0
+    spatial_boundary: str = "open"
+    temporal_scale_mode: str = "physical"
+    synoptic_memory_hours: float = 288.0
+    hourly_memory_hours: float = 8.0
+    synoptic_advection_speed_km_per_hour: float = 0.12
+    hourly_wind_direction_std_degrees: float = 15.0
+    # Old *_steps, *_cells_per_day and advection_rho are honored only in
+    # explicit legacy modes; they remain readable in old configuration files.
+
+    def __post_init__(self) -> None:
+        _validate_scale_config(self)
+        if self.hourly_generation_mode not in {"primitive_hourly", "daily_conditioned"}:
+            raise ValueError("hourly_generation_mode must be primitive_hourly or daily_conditioned")
+        if self.spatial_boundary not in {"open", "reflect", "periodic"}:
+            raise ValueError("Weather spatial_boundary must be open, reflect or periodic")
+        if self.temporal_scale_mode not in {"physical", "legacy"}:
+            raise ValueError("temporal_scale_mode must be physical or legacy")
+        for name in ("days", "hourly_week_days", "innovation_smoothing_steps"):
+            value = getattr(self, name)
+            if int(value) != value or value < (0 if name.endswith("steps") else 1):
+                raise ValueError(f"{name} must be an integer in its supported range")
+        if int(self.start_day_of_year) != self.start_day_of_year:
+            raise ValueError("start_day_of_year must be an integer day index")
+        for name in ("innovation_correlation_length_km", "synoptic_memory_hours", "hourly_memory_hours", "precipitation_gamma_shape", "pressure_base_hpa"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
+        for name in ("synoptic_advection_speed_km_per_hour", "synoptic_shift_cells_per_day", "hourly_wind_direction_std_degrees", "hourly_temperature_diurnal_c", "hourly_temperature_noise_c", "hourly_wind_variability", "hourly_cloud_variability", "pressure_synoptic_hpa", "hourly_precipitation_burstiness"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be nonnegative")
+        if not 0 <= self.wet_day_probability <= 1 or not 0 <= self.wet_day_persistence < 1 or not 0 <= self.advection_rho < 1:
+            raise ValueError("Wet probability must be [0,1], persistence and advection_rho [0,1)")
+        if not 0 <= self.irradiance_cloud_sensitivity <= 1:
+            raise ValueError("irradiance_cloud_sensitivity must be in [0,1]")
+
+
+def _validate_scale_config(config: object) -> None:
+    import math
+
+    if any(not math.isfinite(value) for value in vars(config).values() if isinstance(value, (int, float))):
+        raise ValueError("Climate/weather parameters must be finite")
+    if config.spatial_scale_mode not in {"physical", "legacy"}:
+        raise ValueError("spatial_scale_mode must be physical or legacy")
 
 
 @dataclass(frozen=True)

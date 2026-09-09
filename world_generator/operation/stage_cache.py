@@ -33,6 +33,9 @@ def load_hourly_weather_checkpoint(output_dir: Path) -> WeatherStore:
             channel_names=tuple(str(value) for value in payload["channel_names"]),
             time_unit=str(payload["time_unit"]),
             start_day_of_year=int(payload["start_day_of_year"]),
+            diagnostics={name.removeprefix("diagnostic__"): payload[name].copy() for name in payload.files if name.startswith("diagnostic__")},
+            metadata=json.loads(str(payload["weather_metadata_json"])) if "weather_metadata_json" in payload else {},
+            static_elevation_m=payload["static_elevation_m"].copy() if "static_elevation_m" in payload else None,
         )
 
 

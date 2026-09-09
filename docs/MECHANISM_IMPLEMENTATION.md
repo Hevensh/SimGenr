@@ -31,3 +31,11 @@
 - 未覆盖：动态水量、天气重构、用途面积、故障与备用尚未由A实现。B应复用本契约并保留九通道读取兼容。
 - 数据集兼容复核：`dataset/builder.py`原先将非physics_v3一律视为旧数据；已加入明确的physics_v3/v4支持集合，继续要求外生源荷并保持人口单位persons/km²。`tests/test_dataset_physics.py`与A契约共19项通过（0.38s）；未知版本仍不自动宣称具有物理单位。
 - 独立复核追加：拒绝小数/非有限业务ID及天气类别，避免映射时整数截断造成负荷别名；日边界在允许误差内取整，避免重复日编号；同名功率字段采用artifact级覆盖，Stage14含储能的请求和Q占位量不再冒充Stage11外生实况。新增反例后，数据集+契约24项通过（0.43s）。
+
+### B：原始天气、诊断与物理尺度（通过）
+
+- 完整交付见 [WORK_PACKAGE_B.md](WORK_PACKAGE_B.md) 和 [气候尺度说明](WORK_PACKAGE_B_CLIMATE.md)，包含文件、配置、公式分类、字段、命令、数值及兼容边界。
+- 生成器回归173项通过；最后接口复核44项通过。可选模型测试因缺少 `torch_geometric` 未运行，未修改环境。
+- 完整64×64、365日驱动/168小时世界：seed42、123各83项物理检查通过；数据集打包、校验和与24/6小时时间窗口均通过。两例起始日为91和103，不能当作同季节成对干预。
+- 缓存恢复实际命令：`/d/anaconda/python.exe -B scripts/generate_static_world.py --config configs/small_debug.yaml --seed 42 --output outputs/work_package_b_resume --from-stage 14 --no-figures`，随后 `validate_world_physics.py` 83项通过。恢复副本与原世界6个上游天气、静态及外生源荷文件SHA-256逐一相同。
+- 新随机场改为公里/小时尺度，同一新配置与seed可复现，旧默认数值不保证不变；legacy模式显式保留。C下一步分离土地身份、评分和可分配面积，不使用短期天气反向修改静态土地。

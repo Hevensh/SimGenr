@@ -68,6 +68,11 @@ land:
   random_patch_count: 5
 
 climate:
+  # S: uncalibrated latent Gaussian covariance lengths, in physical km.
+  spatial_scale_mode: physical
+  climate_correlation_length_km: 20.0
+  wind_direction_correlation_length_km: 12.0
+  spatial_boundary: reflect
   base_temperature_c: 28.0
   latitude_temperature_gradient_c: 12.0
   lapse_rate_c_per_km: 5.8
@@ -79,7 +84,7 @@ climate:
   wind_speed_terrain_factor: 0.35
   wind_direction_terrain_steering: 1.20
   wind_direction_noise_degrees: 28.0
-  wind_direction_smoothing_steps: 6
+  wind_direction_smoothing_steps: 6  # Used only when spatial_scale_mode: legacy.
   humidity_water_decay_km: 10.0
   precipitation_base_mm_year: 760.0
   orographic_precipitation_factor: 0.55
@@ -88,6 +93,17 @@ climate:
   climate_noise_weight: 0.12
 
 weather:
+  # S: conditional hourly realization; daily_weather is driver anchors.
+  # Realized daily statistics are saved in hourly_daily_summary.npz.
+  hourly_generation_mode: primitive_hourly
+  spatial_scale_mode: physical
+  innovation_correlation_length_km: 10.0
+  spatial_boundary: open
+  temporal_scale_mode: physical
+  synoptic_memory_hours: 288.0
+  hourly_memory_hours: 8.0
+  synoptic_advection_speed_km_per_hour: 0.12
+  hourly_wind_direction_std_degrees: 15.0
   wet_day_probability: 0.30
   wet_day_persistence: 0.55
   precipitation_gamma_shape: 1.5

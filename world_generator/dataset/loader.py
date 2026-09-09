@@ -152,15 +152,11 @@ class TemporalWindowDataset:
             "static": world["static"],
             "graph": world["graph"],
             "history": {
-                "timestamps": world["dynamic"]["timestamps"][start:history_end],
-                "weather": world["dynamic"]["weather"][start:history_end],
-                "weather_class": world["dynamic"]["weather_class"][start:history_end],
+                **_slice_weather(world["dynamic"], start, history_end, hours),
                 "operation": history_operation,
             },
             "future": {
-                "timestamps": world["dynamic"]["timestamps"][history_end:forecast_end],
-                "weather": world["dynamic"]["weather"][history_end:forecast_end],
-                "weather_class": world["dynamic"]["weather_class"][history_end:forecast_end],
+                **_slice_weather(world["dynamic"], history_end, forecast_end, hours),
                 "operation": future_operation,
             },
             "operation_static": static_operation,
@@ -229,6 +225,18 @@ def edge_path(graph: dict[str, Any], edge_position: int) -> tuple[Any, Any]:
     start = int(graph["path_ptr"][edge_position])
     end = int(graph["path_ptr"][edge_position + 1])
     return graph["path_row"][start:end], graph["path_col"][start:end]
+
+
+def _slice_weather(dynamic: dict[str, Any], start: int, end: int, hours: int) -> dict[str, Any]:
+    # Explicit field contract: H==T cannot make a static elevation map temporal.
+    temporal = {"timestamps", "weather", "weather_class", "time_bounds_hours"}
+    result = {}
+    for name, values in dynamic.items():
+        if name in temporal or name.startswith("diagnostic__"):
+            if not hasattr(values, "shape") or not values.shape or values.shape[0] != hours:
+                raise ValueError(f"Weather time series {name!r} does not match the time axis")
+            result[name] = values[start:end]
+    return result
 
 
 def _split_operation(

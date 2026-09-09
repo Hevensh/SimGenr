@@ -195,6 +195,11 @@ def field_contract_document(step_hours: float = 1.0) -> dict[str, object]:
     add("protected water_buffer river river_centerline lake urban_mask", "1", "mask", "cell", "static", "land/hydrology/city", ("site_constraints",), "S", "static_design")
     for name, unit in WEATHER_UNITS.items():
         add(f"weather.{name}", unit, "accumulation" if name == "precipitation" else "interval_mean", "cell_area_representative", "explicit_interval_bounds_hours", "weather", ("source_load", "hydrology", "daily_aggregation"), "P" if name in {"wind_speed", "humidity", "pressure"} else "E", "exogenous_weather")
+    add("weather.diagnostic__specific_humidity_kg_kg", "kg/kg moist air", "interval_representative_primitive", "cell", "explicit_interval_bounds_hours", "weather", ("moist_air_diagnosis", "source_load"), "S", "prescribed_moisture_forcing")
+    add("weather.diagnostic__sea_level_pressure_hpa", "hPa", "interval_representative_primitive", "cell", "explicit_interval_bounds_hours", "weather", ("moist_air_diagnosis",), "S", "prescribed_synoptic_forcing")
+    add("weather.diagnostic__air_density_kg_m3", "kg/m3", "diagnostic", "cell", "diagnose_hour_then_aggregate", "weather", ("source_load", "validation"), "P", "synthetic_weather_diagnostic")
+    add("weather.diagnostic__specific_humidity_adjustment_kg_kg", "kg/kg moist air", "scenario_adjustment", "cell", "interval_representative_not_accumulated_water_depth", "weather", ("validation",), "S", "open_reservoir_saturation_adjustment_not_rain")
+    add("weather.static_elevation_m", "m", "state", "cell", "static", "terrain", ("moist_air_diagnosis",), "P", "static_design")
     add("p_load_mw p_gen_available_mw", "MW", "interval_mean", "bus", "hour_interval", "artifact_dependent_see_overrides", ("planning", "dispatch"), "E", "artifact_dependent_see_overrides")
     add("p_gen_scheduled_mw", "MW", "interval_mean", "bus", "hour_interval", "planning_or_dispatch", ("power_flow",), "S", "planned_or_operated_power_by_artifact")
     add("q_load_mvar", "Mvar", "interval_mean", "bus", "hour_interval", "artifact_dependent_see_overrides", ("optional_AC",), "S", "artifact_dependent_see_overrides")
@@ -225,6 +230,11 @@ def field_contract_document(step_hours: float = 1.0) -> dict[str, object]:
         "rain_aggregation": "sum depth_mm; 1000 * depth_mm * area_km2 = volume_m3",
         "power_aggregation": "interval_mean_MW * duration_h = energy_MWh",
         "weather_channel_order": "read channel_names; never assume a new channel index",
+        "weather_daily_roles": {
+            "daily_weather.npz": "conditional_driver_anchors; RH/p/rho diagnose_anchor_state",
+            "hourly_weather_week.npz": "hourly_realization; generation_mode and daily_constraints in weather_metadata_json",
+            "hourly_daily_summary.npz": "mean_of_hourly_diagnostics; precipitation_sum; never_rediagnose_from_daily_mean_primitives",
+        },
         "fields": fields,
         "artifact_field_overrides": artifact_overrides,
         "matrix_columns": {

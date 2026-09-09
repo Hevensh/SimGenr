@@ -43,7 +43,7 @@ from world_generator.terrain.derivatives import derive_terrain_features
 from world_generator.terrain.terrain_generator import generate_terrain_base
 from world_generator.visualization.map_plot import save_static_map_figures
 from world_generator.visualization.storage_figures import save_storage_dispatch_figures, save_storage_need_figures
-from world_generator.weather.weather_generator import generate_daily_weather, generate_hourly_weather_week
+from world_generator.weather.weather_generator import aggregate_daily_weather, generate_daily_weather, generate_hourly_weather_week
 
 
 def main() -> None:
@@ -318,6 +318,7 @@ def main() -> None:
     np.savez_compressed(data_layout.topology / "static_maps.npz", **static_maps)
     np.savez_compressed(data_layout.weather / "daily_weather.npz", **weather.as_arrays())
     np.savez_compressed(data_layout.weather / "hourly_weather_week.npz", **hourly_weather.as_arrays())
+    np.savez_compressed(data_layout.weather / "hourly_daily_summary.npz", **aggregate_daily_weather(hourly_weather).as_arrays())
     np.savez_compressed(data_layout.operation / "source_load_forecast.npz", **source_load_forecast.as_arrays())
     np.savez_compressed(data_layout.operation / "power_flow_hourly.npz", **power_flow.as_arrays())
     np.savez_compressed(data_layout.operation / "grid_upgrade_plan.npz", **upgrade_plan.as_arrays())
@@ -362,6 +363,8 @@ def main() -> None:
                 "module_seeds": rngs.module_seeds,
                 "static_maps": {name: list(value.shape) for name, value in static_maps.items()},
                 "daily_weather": {
+                    "statistic_role": "daily_driver_anchors",
+                    "diagnostic_support": "anchor_state_not_hourly_aggregated_truth",
                     "dynamic": list(weather.dynamic.shape),
                     "weather_class": list(weather.weather_class.shape),
                     "channels": list(weather.channel_names),
@@ -374,6 +377,8 @@ def main() -> None:
                 "refined_grid_edges": refined_topology.edges_as_dicts(),
                 "grid_electrical": grid_electrical.as_dicts(),
                 "hourly_weather_week": {
+                    **hourly_weather.metadata,
+                    "daily_summary_file": "hourly_daily_summary.npz",
                     "dynamic": list(hourly_weather.dynamic.shape),
                     "weather_class": list(hourly_weather.weather_class.shape),
                     "channels": list(hourly_weather.channel_names),

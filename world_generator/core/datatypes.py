@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import json
 
 import numpy as np
 
@@ -117,10 +118,13 @@ class WeatherStore:
     channel_names: tuple[str, ...]
     time_unit: str = "day"
     start_day_of_year: int = 0
+    diagnostics: dict[str, np.ndarray] = field(default_factory=dict)
+    metadata: dict[str, object] = field(default_factory=dict)
+    static_elevation_m: np.ndarray | None = None
 
     def as_arrays(self) -> dict[str, np.ndarray]:
         validate_weather_arrays(self.dynamic, self.weather_class, self.timestamps, self.channel_names, self.time_unit)
-        return {
+        arrays = {
             "dynamic": self.dynamic,
             "weather_class": self.weather_class,
             "timestamps": self.timestamps,
@@ -129,6 +133,17 @@ class WeatherStore:
             "start_day_of_year": np.asarray(self.start_day_of_year, dtype=np.int32),
             "time_bounds_hours": interval_bounds_hours(self.timestamps, 1.0 if self.time_unit == "hour" else 24.0, stamp_unit=self.time_unit),
         }
+        for name, values in self.diagnostics.items():
+            values = np.asarray(values)
+            if values.shape != self.weather_class.shape or not np.isfinite(values).all():
+                raise ValueError(f"Weather diagnostic {name!r} must be finite [T,H,W]")
+            arrays[f"diagnostic__{name}"] = values
+        if self.static_elevation_m is not None:
+            if self.static_elevation_m.shape != self.dynamic.shape[2:] or not np.isfinite(self.static_elevation_m).all():
+                raise ValueError("Weather elevation must be finite [H,W]")
+            arrays["static_elevation_m"] = self.static_elevation_m
+        arrays["weather_metadata_json"] = np.asarray(json.dumps(self.metadata, sort_keys=True, allow_nan=False))
+        return arrays
 
 
 @dataclass(frozen=True)

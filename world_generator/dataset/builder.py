@@ -227,6 +227,13 @@ def package_world(
         "time_unit": weather["time_unit"],
         "start_day_of_year": weather["start_day_of_year"].astype(np.int32),
     }
+    for name, values in weather.items():
+        if name.startswith("diagnostic__"):
+            if values.shape != weather["weather_class"].shape or not np.isfinite(values).all():
+                raise ValueError(f"Weather diagnostic {name!r} must be finite [T,H,W]")
+            dynamic_payload[name] = values.astype(np.float32)
+        elif name in {"time_bounds_hours", "static_elevation_m"}:
+            dynamic_payload[name] = values.copy()
 
     graph_payload, graph_metadata = _graph_payload(topology, electrical)
     operation_payload = _operation_payload(forecast, power_flow, storage, exogenous=exogenous)
@@ -263,6 +270,8 @@ def package_world(
             "continuous_statistics": _channel_statistics(static_continuous, STATIC_CONTINUOUS_CHANNELS),
         },
         "dynamic": {
+            "weather_generation": json.loads(str(weather["weather_metadata_json"])) if "weather_metadata_json" in weather else {"generation_mode": "unspecified_legacy"},
+            "optional_diagnostics": [name for name in dynamic_payload if name.startswith("diagnostic__")],
             "weather_channels": [str(value) for value in weather["channel_names"]],
             "weather_statistics": _channel_statistics(
                 np.moveaxis(weather["dynamic"], 1, 0),
@@ -331,6 +340,9 @@ def dataset_schema() -> dict[str, object]:
             "dynamic": {
                 "weather": "float32 [T,C_weather,H,W]",
                 "weather_class": "int16 [T,H,W]",
+                "diagnostic__*": "optional float32 [T,H,W]; units and statistic support in metadata.dynamic.weather_generation",
+                "time_bounds_hours": "optional float64 [T,2], interval start/end in local solar hours",
+                "static_elevation_m": "optional float32 [H,W], terrain elevation for moist-air diagnostics",
                 "timestamps": "int32 [T] hours from start of year",
             },
             "graph": {

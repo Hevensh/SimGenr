@@ -90,3 +90,63 @@ def surface_pressure_hpa(elevation_m: np.ndarray, temperature_c: np.ndarray, rel
     specific_humidity = 0.622 * vapor / (dry_pressure - 0.378 * vapor)
     virtual_temperature = layer_temperature * (1.0 + 0.61 * specific_humidity)
     return p0 * np.exp(-9.80665 * height / (287.05 * virtual_temperature))
+
+
+def specific_humidity_from_relative_humidity(temperature_c: np.ndarray, relative_humidity: np.ndarray, pressure_hpa: np.ndarray) -> np.ndarray:
+    """Specific humidity kg water / kg moist air; all pressures in hPa.
+
+    Uses the same liquid-water Tetens saturation convention as the generator.
+    No hidden supersaturation clipping: invalid thermodynamic inputs fail.
+    """
+    temperature, humidity, pressure = np.broadcast_arrays(temperature_c, relative_humidity, pressure_hpa)
+    _validate_moist_air_temperature(temperature)
+    if not all(np.isfinite(value).all() for value in (temperature, humidity, pressure)):
+        raise ValueError("Moist-air inputs must be finite")
+    if np.any((humidity < 0) | (humidity > 1)) or np.any(pressure <= 0):
+        raise ValueError("Relative humidity must be [0,1] and pressure positive")
+    vapor = humidity * saturation_vapor_pressure_hpa(temperature)
+    if np.any(vapor >= pressure):
+        raise ValueError("Vapor pressure must be below total pressure")
+    epsilon = 287.05 / 461.5
+    return epsilon * vapor / (pressure - (1.0 - epsilon) * vapor)
+
+
+def diagnose_moist_air(temperature_c: np.ndarray, specific_humidity_kg_kg: np.ndarray, elevation_m: np.ndarray, sea_level_pressure_hpa: np.ndarray | float = 1013.25) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return RH fraction, surface hPa and density kg/m3 from T/q/z/p0.
+
+    P: ideal moist-air gas law, q = water mass / moist-air mass. E: the
+    hydrostatic layer uses surface q and T_surface + 0.00325*z K. This is
+    a reduced column, not a sounding. RH may exceed 1: callers must declare
+    an explicit saturation treatment rather than clipping this diagnostic.
+    """
+    _validate_moist_air_temperature(temperature_c)
+    temperature, humidity, height, p0 = np.broadcast_arrays(
+        np.asarray(temperature_c, dtype=np.float64) + 273.15,
+        np.asarray(specific_humidity_kg_kg, dtype=np.float64),
+        np.asarray(elevation_m, dtype=np.float64),
+        np.asarray(sea_level_pressure_hpa, dtype=np.float64),
+    )
+    if not all(np.isfinite(value).all() for value in (temperature, humidity, height, p0)):
+        raise ValueError("Moist-air primitives must be finite")
+    if np.any(temperature <= 0) or np.any(p0 <= 0) or np.any((humidity < 0) | (humidity >= 1)):
+        raise ValueError("T and p0 must be positive; specific humidity must be [0,1)")
+    virtual_factor = 1.0 + (461.5 / 287.05 - 1.0) * humidity
+    layer_temperature = np.maximum(temperature + 0.00325 * height, 150.0)
+    pressure = p0 * np.exp(-9.80665 * height / (287.05 * layer_temperature * virtual_factor))
+    epsilon = 287.05 / 461.5
+    vapor = pressure * humidity / (epsilon + (1.0 - epsilon) * humidity)
+    relative_humidity = vapor / saturation_vapor_pressure_hpa(temperature - 273.15)
+    density = 100.0 * pressure / (287.05 * temperature * virtual_factor)
+    return relative_humidity, pressure, density
+
+
+def _validate_moist_air_temperature(temperature_c: np.ndarray) -> None:
+    """Numerical domain of our liquid-water approximation, not accuracy bounds.
+
+    The legacy saturation helper clips its input; new thermodynamic kernels
+    reject unsupported primitives so T=80 C cannot silently reuse T=65 C.
+    Supercooled liquid water is a convention here, not mixed-phase physics.
+    """
+    values = np.asarray(temperature_c, dtype=np.float64)
+    if not np.isfinite(values).all() or np.any((values < -90.0) | (values > 65.0)):
+        raise ValueError("Moist-air temperature must be finite and within the supported [-90,65] degC numerical domain")
