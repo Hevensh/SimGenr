@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from world_generator.dataset.builder import (
-    SCHEMA_VERSION, STATIC_UNITS, _exogenous_payload, _world_provenance, dataset_schema,
+    SCHEMA_VERSION, STATIC_UNITS, _exogenous_payload, _has_physical_units, _world_provenance, dataset_schema,
 )
 from world_generator.dataset.loader import SimGenrDataset, TemporalWindowDataset, _split_operation, collate_multimodal
 
@@ -63,6 +63,13 @@ def test_provenance_does_not_rebrand_legacy_output_as_physics_v3():
     assert STATIC_UNITS["population_density"] == "persons/km2"
     assert STATIC_UNITS["water_depth"] == STATIC_UNITS["hydrology_elevation"] == "m"
     assert "exogenous_p_load_mw" in dataset_schema()["sample_file"]["operation"]
+
+
+def test_physics_v4_retains_population_units_and_requires_exogenous_data():
+    assert _has_physical_units({"generator_version": "physics_v4"})
+    assert _has_physical_units({"generator_version": "physics_v3"})
+    assert not _has_physical_units({})
+    assert not _has_physical_units({"generator_version": "unknown_future"})
 
 
 def test_temporal_split_uses_field_semantics_when_nodes_or_sites_equal_hours():

@@ -196,7 +196,7 @@ def package_world(
         layout.config_snapshot,
     ]
     missing = [str(path) for path in required if not path.exists()]
-    if world_metadata.get("generator_version") == "physics_v3" and not exogenous_path.exists():
+    if _has_physical_units(world_metadata) and not exogenous_path.exists():
         missing.append(str(exogenous_path))
     if missing:
         raise FileNotFoundError("World output is incomplete: " + ", ".join(missing))
@@ -242,7 +242,7 @@ def package_world(
     config_path = layout.config_snapshot
     provenance = _world_provenance(world_metadata)
     static_units = dict(STATIC_UNITS)
-    if provenance["generator_version"] != "physics_v3":
+    if not _has_physical_units(provenance):
         # Repackaging old outputs cannot magically convert their normalized
         # density index to persons/km2. Keep the original data and its meaning.
         static_units["population_density"] = "legacy_normalized_index"
@@ -561,6 +561,11 @@ def _exogenous_payload(source: dict[str, np.ndarray], final_bus_ids: np.ndarray,
     payload["exogenous_p_renewable_available_mw"] = payload["exogenous_p_gen_available_mw"] * renewable_mask[None, :]
     payload["exogenous_bus_present"] = np.isin(target_ids, original_ids)
     return payload
+
+
+def _has_physical_units(world_metadata: dict[str, object]) -> bool:
+    # Explicit compatibility, never treat arbitrary future/legacy labels as SI.
+    return world_metadata.get("generator_version") in {"physics_v3", "physics_v4"}
 
 
 def _world_provenance(world_metadata: dict[str, object]) -> dict[str, object]:
