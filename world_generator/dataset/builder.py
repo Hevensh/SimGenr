@@ -10,10 +10,10 @@ from tqdm.auto import tqdm
 
 from world_generator.core.output_layout import WorldDataLayout
 from world_generator.core.contracts import entity_ids
-from world_generator.operation.stage_cache import load_stage12_checkpoint
+from world_generator.operation.stage_cache import load_stage12_checkpoint, load_dynamic_hydrology_checkpoint, validate_weather_checkpoint_time
 
 
-SCHEMA_VERSION = "0.7.0"
+SCHEMA_VERSION = "0.8.0"
 
 STATIC_CONTINUOUS_CHANNELS = (
     "elevation",
@@ -84,6 +84,7 @@ STATIC_UNITS = {
     "hydrology_elevation": "m",
     "population_density": "persons/km2",
     "flow_accumulation": "upstream_cell_count",
+    "catchment_area_km2": "km2",
     "distance_to_water": "km",
     "mean_temperature": "degC",
     "annual_temperature_amplitude": "degC",
@@ -204,6 +205,7 @@ def package_world(
 
     static_source = _load_npz(static_path)
     weather = _load_npz(weather_path)
+    validate_weather_checkpoint_time(weather)
     forecast = _load_npz(forecast_path)
     power_flow = _load_npz(power_flow_path)
     storage = _load_npz(storage_path)
@@ -219,7 +221,12 @@ def package_world(
         "continuous_channels": np.asarray(STATIC_CONTINUOUS_CHANNELS),
         "categorical_channels": np.asarray(STATIC_CATEGORICAL_CHANNELS),
     }
+    if "catchment_area_km2" in static_source:
+        static_payload["catchment_area_km2"] = static_source["catchment_area_km2"].copy()
     land_payload = _land_accounting_payload(layout, static_source, world_metadata)
+    hydrology_store = load_dynamic_hydrology_checkpoint(world_dir, expected_timestamps=weather["timestamps"],
+                                                       expected_grid_shape=static_source["elevation"].shape)
+    hydrology_payload = hydrology_store.as_arrays() if hydrology_store is not None else {}
     dynamic_payload = {
         "timestamps": weather["timestamps"].astype(np.int32),
         "weather": weather["dynamic"].astype(np.float32),
@@ -277,6 +284,12 @@ def package_world(
             "project_area_semantics": "exclusive envelope inside energy_reserve; project areas are nested, not additional top-level fractions or impervious cover",
             "display_compatibility": "legacy static categorical tensor retains mixed land_cover/land_use_zone display encoding; independent land__* arrays preserve actual cover and protection",
         },
+        "hydrology": {
+            **world_metadata.get("dynamic_hydrology", {"mode": "legacy_static_only", "artifact": None}),
+            "fields": list(hydrology_payload),
+            "state_support": "T+1 interval boundaries; all mm stores are whole-cell equivalent depths",
+            "forcing_availability": "realized hourly precipitation; no implicit NWP or forecast availability",
+        },
         "dynamic": {
             "weather_generation": json.loads(str(weather["weather_metadata_json"])) if "weather_metadata_json" in weather else {"generation_mode": "unspecified_legacy"},
             "optional_diagnostics": [name for name in dynamic_payload if name.startswith("diagnostic__")],
@@ -307,6 +320,7 @@ def package_world(
     payload = {
         **_prefix_payload("static", static_payload),
         **_prefix_payload("land", land_payload),
+        **_prefix_payload("hydrology", hydrology_payload),
         **_prefix_payload("dynamic", dynamic_payload),
         **_prefix_payload("graph", graph_payload),
         **_prefix_payload("operation", operation_payload),
@@ -363,6 +377,15 @@ def dataset_schema() -> dict[str, object]:
                 "time_bounds_hours": "optional float64 [T,2], interval start/end in local solar hours",
                 "static_elevation_m": "optional float32 [H,W], terrain elevation for moist-air diagnostics",
                 "timestamps": "int32 [T] hours from start of year",
+            },
+            "hydrology": {
+                "semantics": "Optional hydrology_v1 water account; explicit names and field_schema_json define time support",
+                "state__*": "float64 [T+1,H,W] boundary states; state_time_hours includes terminal boundary",
+                "flux__*": "float64 [T,H,W] interval accumulations, except discharge_m3_s interval mean",
+                "static__*": "[H,W] fixed geometry/parameters; never time-sliced",
+                "budget__*": "float64 [T] world-wide interval water accounts",
+                "timestamps/time_bounds_hours/state_time_hours": "[T]/[T,2]/[T+1] hours in local solar convention",
+                "absent": "Legacy or static_only worlds have no simulated dynamic hydrology arrays",
             },
             "graph": {
                 "semantics": "only node and line are graph entities; A* paths are optional line geometry metadata",

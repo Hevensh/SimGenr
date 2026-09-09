@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from world_generator.core.output_layout import WorldDataLayout
+from world_generator.core.contracts import interval_bounds_hours
 from world_generator.core.datatypes import (
     BranchElectricalParam,
     BusElectricalParam,
@@ -17,7 +18,55 @@ from world_generator.core.datatypes import (
     StoragePlanStore,
     StorageSite,
     WeatherStore,
+    HydrologyTimeSeriesStore,
 )
+
+
+def load_dynamic_hydrology_checkpoint(
+    output_dir: Path, *, expected_timestamps: np.ndarray | None = None,
+    expected_grid_shape: tuple[int, int] | None = None,
+) -> HydrologyTimeSeriesStore | None:
+    """Read declared D output; legacy/static worlds do not acquire fake flows."""
+    from world_generator.core.hydrology_contracts import HYDROLOGY_MODE, HYDROLOGY_SCHEMA_VERSION
+
+    layout = WorldDataLayout(output_dir / "data")
+    metadata = json.loads(layout.metadata.read_text(encoding="utf-8")) if layout.metadata.exists() else {}
+    declaration = metadata.get("dynamic_hydrology")
+    path = layout.dynamic_hydrology / "hourly_hydrology.npz"
+    if declaration is None:
+        if path.exists():
+            raise ValueError("Undeclared dynamic hydrology artifact in legacy metadata")
+        return None
+    if not isinstance(declaration, dict):
+        raise ValueError("Dynamic hydrology declaration must be a mapping")
+    mode = declaration.get("mode")
+    if declaration.get("schema_version") != HYDROLOGY_SCHEMA_VERSION:
+        raise ValueError("Unsupported dynamic hydrology metadata schema")
+    if mode == "static_only":
+        if path.exists() or declaration.get("artifact") is not None:
+            raise ValueError("Static-only hydrology cannot include a dynamic artifact")
+        return None
+    if mode != HYDROLOGY_MODE or declaration.get("artifact") != "dynamic_hydrology/hourly_hydrology.npz":
+        raise ValueError("Unsupported dynamic hydrology mode or artifact path")
+    if not path.exists():
+        raise FileNotFoundError(f"Dynamic hydrology checkpoint is missing: {path}")
+    with np.load(path, allow_pickle=False) as payload:
+        store = HydrologyTimeSeriesStore.from_arrays({name: payload[name].copy() for name in payload.files})
+    if expected_timestamps is not None and not np.array_equal(store.timestamps, expected_timestamps):
+        raise ValueError("Dynamic hydrology timestamps do not match hourly weather")
+    if expected_grid_shape is not None and store.states["soil_storage_mm"].shape[1:] != expected_grid_shape:
+        raise ValueError("Dynamic hydrology grid does not match the static world")
+    return store
+
+
+def validate_weather_checkpoint_time(payload: object) -> None:
+    """Preserve and validate an on-disk interval declaration before decoding."""
+    unit = str(payload["time_unit"])
+    bounds = interval_bounds_hours(payload["timestamps"], 1.0 if unit == "hour" else 24.0, stamp_unit=unit)
+    if "time_bounds_hours" in payload:
+        declared = np.asarray(payload["time_bounds_hours"])
+        if declared.shape != bounds.shape or not np.allclose(declared, bounds, rtol=0, atol=1e-9):
+            raise ValueError("Weather checkpoint interval bounds differ from its timestamps")
 
 
 def load_hourly_weather_checkpoint(output_dir: Path) -> WeatherStore:
@@ -26,6 +75,7 @@ def load_hourly_weather_checkpoint(output_dir: Path) -> WeatherStore:
     if not path.exists():
         raise FileNotFoundError(f"Hourly weather checkpoint is missing: {path}")
     with np.load(path, allow_pickle=False) as payload:
+        validate_weather_checkpoint_time(payload)
         return WeatherStore(
             dynamic=payload["dynamic"].copy(),
             weather_class=payload["weather_class"].copy(),

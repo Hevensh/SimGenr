@@ -82,16 +82,32 @@ class SimGenrDataset:
         if self.verify_checksums:
             _verify_file(sample_path, entry["file"])
         payload = _load_npz(sample_path)
+        metadata = json.loads(str(payload["metadata_json"]))
+        hydrology = _extract_group(payload, "hydrology")
+        hydrology_declaration = metadata.get("hydrology", {})
+        if not isinstance(hydrology_declaration, dict):
+            raise ValueError("Dataset hydrology metadata must be a mapping")
+        hydrology_mode = hydrology_declaration.get("mode", "legacy_static_only")
+        if hydrology_mode not in {"bucket_routing_v1", "static_only", "legacy_static_only"} or (hydrology_mode == "bucket_routing_v1") != bool(hydrology):
+            raise ValueError("Dataset dynamic hydrology arrays do not match their declared mode")
+        if hydrology:
+            from world_generator.core.datatypes import HydrologyTimeSeriesStore
+            store = HydrologyTimeSeriesStore.from_arrays(hydrology)
+            if not np.array_equal(store.timestamps, payload["dynamic__timestamps"]):
+                raise ValueError("Dataset hydrology timestamps differ from weather")
+            if store.states["soil_storage_mm"].shape[1:] != payload["dynamic__weather"].shape[-2:]:
+                raise ValueError("Dataset hydrology grid differs from weather")
         return {
             "sample_id": str(entry["sample_id"]),
             "seed": int(entry["seed"]) if entry.get("seed") is not None else None,
             "partition": str(entry.get("partition", "unspecified")),
             "static": _extract_group(payload, "static"),
             "land": _extract_group(payload, "land"),
+            "hydrology": hydrology,
             "dynamic": _extract_group(payload, "dynamic"),
             "graph": _extract_group(payload, "graph"),
             "operation": _extract_group(payload, "operation"),
-            "metadata": json.loads(str(payload["metadata_json"])),
+            "metadata": metadata,
             "config_yaml": str(payload["config_yaml"]),
             "sample_path": sample_path,
         }
@@ -146,6 +162,9 @@ class TemporalWindowDataset:
         history_operation, future_operation, static_operation = _split_operation(
             world["operation"], start, history_end, forecast_end, hours
         )
+        history_hydrology, future_hydrology, static_hydrology = _split_hydrology(
+            world.get("hydrology", {}), start, history_end, forecast_end, hours
+        )
         window = {
             "sample_id": world["sample_id"],
             "seed": world["seed"],
@@ -156,12 +175,15 @@ class TemporalWindowDataset:
             "history": {
                 **_slice_weather(world["dynamic"], start, history_end, hours),
                 "operation": history_operation,
+                "hydrology": history_hydrology,
             },
             "future": {
                 **_slice_weather(world["dynamic"], history_end, forecast_end, hours),
                 "operation": future_operation,
+                "hydrology": future_hydrology,
             },
             "operation_static": static_operation,
+            "hydrology_static": static_hydrology,
             "metadata": world["metadata"],
             "prepared_static": world.get("prepared_static"),
         }
@@ -239,6 +261,36 @@ def _slice_weather(dynamic: dict[str, Any], start: int, end: int, hours: int) ->
                 raise ValueError(f"Weather time series {name!r} does not match the time axis")
             result[name] = values[start:end]
     return result
+
+
+def _split_hydrology(
+    hydrology: dict[str, Any], start: int, history_end: int, forecast_end: int, hours: int,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Explicit D support: H==T cannot make a lake geometry map temporal."""
+    from world_generator.core.hydrology_contracts import HYDROLOGY_GROUP_UNITS
+
+    if not hydrology:
+        return {}, {}, {}
+    states = {f"state__{name}" for name in HYDROLOGY_GROUP_UNITS["state"]} | {"state_time_hours"}
+    intervals = {f"{group}__{name}" for group in ("flux", "budget") for name in HYDROLOGY_GROUP_UNITS[group]}
+    intervals |= {"timestamps", "time_bounds_hours"}
+    static = {f"static__{name}" for name in HYDROLOGY_GROUP_UNITS["static"]}
+    static |= {"mode", "schema_version", "field_schema_json", "hydrology_metadata_json"}
+    if set(hydrology) != states | intervals | static:
+        raise ValueError("Window hydrology has incomplete or unknown fields")
+    history, future, shared = {}, {}, {}
+    for name, values in hydrology.items():
+        if name in states:
+            if not hasattr(values, "shape") or not values.shape or values.shape[0] != hours + 1:
+                raise ValueError(f"Hydrology boundary state {name} must have T+1 entries")
+            history[name], future[name] = values[start:history_end + 1], values[history_end:forecast_end + 1]
+        elif name in intervals:
+            if not hasattr(values, "shape") or not values.shape or values.shape[0] != hours:
+                raise ValueError(f"Hydrology interval field {name} must have T entries")
+            history[name], future[name] = values[start:history_end], values[history_end:forecast_end]
+        else:
+            shared[name] = values
+    return history, future, shared
 
 
 def _split_operation(

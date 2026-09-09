@@ -87,6 +87,61 @@ class HydrologyConfig:
 
 
 @dataclass(frozen=True)
+class HydrologyDynamicConfig:
+    """S: optional, uncalibrated hourly bucket and routing parameters."""
+
+    enabled: bool = False
+    soil_capacity_mm: float = 150.0
+    initial_soil_fraction: float = 0.35
+    infiltration_capacity_mm_h: float = 20.0
+    soil_field_capacity_fraction: float = 0.65
+    soil_percolation_time_hours: float = 48.0
+    groundwater_capacity_mm: float = 500.0
+    initial_groundwater_fraction: float = 0.10
+    baseflow_time_hours: float = 240.0
+    initial_channel_storage_mm: float = 0.0
+    initial_lake_storage_fraction: float = 0.0
+    routing_velocity_m_s: float = 0.5
+    routing_substeps_per_hour: int = 1
+    interior_sink_policy: str = "closed_storage"
+    pet_shortwave_absorptivity: float = 0.77
+    pet_latent_energy_fraction: float = 0.65
+    latent_heat_vaporization_j_kg: float = 2.45e6
+    budget_absolute_tolerance_m3: float = 1e-5
+    budget_relative_tolerance: float = 1e-10
+    impervious_fraction_by_use: dict[str, float] = field(default_factory=lambda: {
+        "water": 0.0, "wetland": 0.0, "residential": 0.65, "commercial": 0.85,
+        "industrial": 0.8, "agriculture": 0.05, "park_green": 0.02,
+        "natural": 0.02, "energy_reserve": 0.05,
+    })
+
+    def __post_init__(self) -> None:
+        import math
+        if not isinstance(self.enabled, bool):
+            raise ValueError("hydrology_dynamic.enabled must be boolean")
+        for name in ("soil_capacity_mm", "soil_percolation_time_hours", "groundwater_capacity_mm", "baseflow_time_hours", "routing_velocity_m_s", "latent_heat_vaporization_j_kg"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"hydrology_dynamic.{name} must be positive and finite")
+        for name in ("infiltration_capacity_mm_h", "initial_channel_storage_mm", "budget_absolute_tolerance_m3", "budget_relative_tolerance"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(f"hydrology_dynamic.{name} must be finite and nonnegative")
+        if self.budget_absolute_tolerance_m3 == self.budget_relative_tolerance == 0:
+            raise ValueError("At least one water-budget tolerance must be positive")
+        for name in ("initial_soil_fraction", "soil_field_capacity_fraction", "initial_groundwater_fraction", "initial_lake_storage_fraction", "pet_shortwave_absorptivity", "pet_latent_energy_fraction"):
+            if not math.isfinite(getattr(self, name)) or not 0 <= getattr(self, name) <= 1:
+                raise ValueError(f"hydrology_dynamic.{name} must be finite in [0,1]")
+        if isinstance(self.routing_substeps_per_hour, bool) or not isinstance(self.routing_substeps_per_hour, int) or not 1 <= self.routing_substeps_per_hour <= 60:
+            raise ValueError("routing_substeps_per_hour must be an integer in [1,60]")
+        if self.interior_sink_policy not in {"closed_storage", "reject"}:
+            raise ValueError("interior_sink_policy must be closed_storage or reject")
+        required = {"water", "wetland", "residential", "commercial", "industrial", "agriculture", "park_green", "natural", "energy_reserve"}
+        if not isinstance(self.impervious_fraction_by_use, dict) or set(self.impervious_fraction_by_use) != required:
+            raise ValueError("impervious_fraction_by_use must explicitly cover all nine land uses")
+        if any(not math.isfinite(value) or not 0 <= value <= 1 for value in self.impervious_fraction_by_use.values()):
+            raise ValueError("Impervious coefficients must be finite in [0,1]")
+
+
+@dataclass(frozen=True)
 class LandConfig:
     protected_fraction: float = 0.10
     water_buffer_km: float = 1.5
@@ -517,6 +572,7 @@ class WorldConfig:
     storage: StorageConfig = field(default_factory=StorageConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     contracts: ContractConfig = field(default_factory=ContractConfig)
+    hydrology_dynamic: HydrologyDynamicConfig = field(default_factory=HydrologyDynamicConfig)
 
     def __post_init__(self) -> None:
         # P: capacities cannot be negative; do not silently clip bad scenarios.
@@ -554,6 +610,7 @@ def load_world_config(path: str | Path) -> WorldConfig:
         storage=StorageConfig(**data.get("storage", {})),
         output=OutputConfig(**data.get("output", {})),
         contracts=ContractConfig(**data.get("contracts", {})),
+        hydrology_dynamic=HydrologyDynamicConfig(**data.get("hydrology_dynamic", {})),
     )
 
 
@@ -588,24 +645,22 @@ def _load_mapping(path: Path) -> dict[str, Any]:
 
 def _parse_simple_yaml(text: str) -> dict[str, Any]:
     root: dict[str, Any] = {}
-    current: dict[str, Any] | None = None
+    stack: list[tuple[int, dict[str, Any]]] = [(-1, root)]
     for raw_line in text.splitlines():
         line = raw_line.split("#", 1)[0].rstrip()
         if not line:
             continue
-        if not raw_line.startswith(" "):
-            key, value = _split_yaml_pair(line)
-            if value is None:
-                current = {}
-                root[key] = current
-            else:
-                root[key] = _parse_scalar(value)
-                current = None
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        while stack[-1][0] >= indent:
+            stack.pop()
+        key, value = _split_yaml_pair(line.strip())
+        parent = stack[-1][1]
+        if value is None:
+            section: dict[str, Any] = {}
+            parent[key] = section
+            stack.append((indent, section))
         else:
-            if current is None:
-                raise ValueError(f"Nested value without section: {raw_line}")
-            key, value = _split_yaml_pair(line.strip())
-            current[key] = _parse_scalar(value)
+            parent[key] = _parse_scalar(value)
     return root
 
 

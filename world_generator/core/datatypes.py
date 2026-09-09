@@ -50,9 +50,10 @@ class HydrologyState:
     watershed_id: np.ndarray
     distance_to_water: FloatMap
     flood_risk: FloatMap
+    catchment_area_km2: FloatMap | None = None
 
     def as_maps(self) -> dict[str, np.ndarray]:
-        return {
+        maps = {
             "flow_direction": self.flow_direction,
             "flow_accumulation": self.flow_accumulation,
             "river_centerline": self.river_centerline,
@@ -64,6 +65,82 @@ class HydrologyState:
             "distance_to_water": self.distance_to_water,
             "flood_risk": self.flood_risk,
         }
+        if self.catchment_area_km2 is not None:
+            maps["catchment_area_km2"] = self.catchment_area_km2
+        return maps
+
+
+@dataclass(frozen=True)
+class HydrologyTimeSeriesStore:
+    """D: six explicit boundary states, interval fluxes and static water geometry."""
+
+    timestamps: np.ndarray
+    time_bounds_hours: np.ndarray
+    state_time_hours: np.ndarray
+    states: dict[str, np.ndarray]
+    fluxes: dict[str, np.ndarray]
+    static_maps: dict[str, np.ndarray]
+    budgets: dict[str, np.ndarray]
+    metadata: dict[str, object] = field(default_factory=dict)
+
+    def as_arrays(self) -> dict[str, np.ndarray]:
+        from world_generator.core.contracts import integer_labels
+        from world_generator.core.hydrology_contracts import HYDROLOGY_GROUP_UNITS, HYDROLOGY_MODE, HYDROLOGY_SCHEMA_VERSION, hydrology_field_schema
+
+        bounds = interval_bounds_hours(self.timestamps, 1.0)
+        if self.time_bounds_hours.shape != bounds.shape or not np.allclose(self.time_bounds_hours, bounds, rtol=0, atol=1e-9):
+            raise ValueError("Hydrology interval bounds must match consecutive hourly timestamps")
+        state_time = np.r_[bounds[:, 0], bounds[-1, 1]]
+        if self.state_time_hours.shape != state_time.shape or not np.allclose(self.state_time_hours, state_time, rtol=0, atol=1e-9):
+            raise ValueError("Hydrology state_time_hours must have the T+1 interval boundaries")
+        groups = {"state": self.states, "flux": self.fluxes, "static": self.static_maps, "budget": self.budgets}
+        for group, values in groups.items():
+            if set(values) != set(HYDROLOGY_GROUP_UNITS[group]):
+                raise ValueError(f"Hydrology {group} fields must exactly match hydrology_v1")
+        soil = np.asarray(self.states["soil_storage_mm"])
+        if soil.ndim != 3 or min(soil.shape[1:]) < 1:
+            raise ValueError("Hydrology states require T+1,H,W")
+        shape, hours = soil.shape[1:], bounds.shape[0]
+        expected = {"state": (hours + 1, *shape), "flux": (hours, *shape), "static": shape, "budget": (hours,)}
+        arrays = {"timestamps": np.asarray(self.timestamps), "time_bounds_hours": np.asarray(self.time_bounds_hours),
+                  "state_time_hours": np.asarray(self.state_time_hours), "schema_version": np.asarray(HYDROLOGY_SCHEMA_VERSION),
+                  "mode": np.asarray(HYDROLOGY_MODE), "field_schema_json": np.asarray(json.dumps(hydrology_field_schema(), sort_keys=True)),
+                  "hydrology_metadata_json": np.asarray(json.dumps(self.metadata, sort_keys=True, allow_nan=False))}
+        signed = {"lake_water_level_m", "lake_bed_elevation_m", "lake_spill_elevation_m", "routing_receiver_flat_index", "cell_budget_residual_m3", "residual_m3"}
+        for group, values in groups.items():
+            for name, array in values.items():
+                array = np.asarray(array)
+                if array.shape != expected[group] or not np.isfinite(array).all():
+                    raise ValueError(f"Hydrology {group} field {name} must be finite {expected[group]}")
+                if name not in signed and np.any(array < 0):
+                    raise ValueError(f"Hydrology {name} cannot be negative")
+                if name.endswith("_fraction") and np.any(array > 1):
+                    raise ValueError(f"Hydrology {name} cannot exceed one")
+                if name in {"lake_id", "routing_receiver_flat_index"}: integer_labels(array, f"hydrology {name}")
+                if name == "routing_receiver_flat_index" and np.any((array < -2) | (array >= np.prod(shape))):
+                    raise ValueError("Hydrology receiver must be a valid cell index or -1/-2")
+                if name == "closed_sink_mask" and not np.isin(array, [0, 1]).all():
+                    raise ValueError("closed_sink_mask must be boolean")
+                arrays[f"{group}__{name}"] = array
+        return arrays
+
+    @classmethod
+    def from_arrays(cls, arrays: dict[str, np.ndarray]) -> "HydrologyTimeSeriesStore":
+        from world_generator.core.hydrology_contracts import HYDROLOGY_GROUP_UNITS, HYDROLOGY_MODE, HYDROLOGY_SCHEMA_VERSION, hydrology_field_schema
+
+        if str(arrays.get("schema_version")) != HYDROLOGY_SCHEMA_VERSION or str(arrays.get("mode")) != HYDROLOGY_MODE:
+            raise ValueError("Unsupported or missing dynamic hydrology schema/mode")
+        if json.loads(str(arrays.get("field_schema_json", "null"))) != hydrology_field_schema():
+            raise ValueError("Hydrology field schema is missing or differs from hydrology_v1")
+        expected = {f"{group}__{name}" for group, names in HYDROLOGY_GROUP_UNITS.items() for name in names}
+        expected |= {"timestamps", "time_bounds_hours", "state_time_hours", "schema_version", "mode", "field_schema_json", "hydrology_metadata_json"}
+        if set(arrays) != expected:
+            raise ValueError("Hydrology checkpoint has missing or unrecognized fields")
+        groups = [{name: np.asarray(arrays[f"{group}__{name}"]) for name in names} for group, names in HYDROLOGY_GROUP_UNITS.items()]
+        store = cls(np.asarray(arrays["timestamps"]), np.asarray(arrays["time_bounds_hours"]), np.asarray(arrays["state_time_hours"]),
+                    *groups, json.loads(str(arrays["hydrology_metadata_json"])))
+        store.as_arrays()
+        return store
 
 
 @dataclass(frozen=True)

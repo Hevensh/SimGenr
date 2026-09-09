@@ -10,6 +10,8 @@ from typing import Mapping
 
 import numpy as np
 
+from world_generator.core.hydrology_contracts import hydrology_field_schema
+
 GENERATOR_VERSION = "physics_v4"
 CONTRACT_VERSION = "1.0"
 
@@ -187,7 +189,8 @@ def field_contract_document(step_hours: float = 1.0) -> dict[str, object]:
     add("elevation hydrology_elevation water_depth", "m", "state", "cell", "static", "terrain/hydrology", ("land", "climate", "routing"), "P", "static_design")
     add("slope roughness aspect_sin aspect_cos", "1", "diagnostic", "cell_with_declared_derivative_support", "static", "terrain", ("land", "climate", "routing"), "P", "static_design")
     add("curvature", "1/m", "diagnostic", "cell", "static", "terrain", ("hydrology",), "P", "static_design")
-    add("flow_accumulation", "km2", "diagnostic", "upstream_catchment", "static", "hydrology", ("river_geometry",), "P", "static_design")
+    add("flow_accumulation", "upstream_cell_count", "diagnostic", "upstream_catchment", "static", "hydrology", ("river_geometry",), "P", "static_D8_count_not_discharge")
+    add("catchment_area_km2", "km2", "area", "upstream_catchment", "static", "hydrology", ("river_geometry", "validation", "dataset"), "P", "static_D8_area_not_discharge")
     add("distance_to_water", "km", "diagnostic", "cell", "static", "hydrology", ("city", "land"), "P", "static_design")
     add("population_density", "persons/km2", "density", "cell_area_mean", "static", "city", ("load", "land_use"), "S", "static_design")
     add("buildability terrain_cost vegetation flood_risk city_suitability urban_core_suitability waterfront_amenity urban_density economic_activity residential commercial industrial agriculture park_green load_density_base wind_suitability pv_suitability thermal_suitability thermal_externality load_node_density", "1", "score", "cell", "static", "land/city/energy", ("site_ranking", "display"), "S", "static_design")
@@ -197,6 +200,22 @@ def field_contract_document(step_hours: float = 1.0) -> dict[str, object]:
     add("protected_mask wind_land_eligible pv_land_eligible thermal_land_eligible", "1", "mask", "cell", "static_or_project_planning", "land/energy", ("hard_area_constraints", "dataset", "validation"), "S", "hard_land_identity_or_eligibility")
     add("allocatable_land_fraction " + " ".join(f"land_use_fraction_{name}" for name in ("water", "wetland", "residential", "commercial", "industrial", "agriculture", "park_green", "natural", "energy_reserve")), "1", "area_fraction", "whole_cell_area", "static_planning", "land/land_use", ("city", "energy", "dataset", "validation"), "S", "exclusive_land_budget")
     add("energy_available_area_km2 energy_wind_project_area_km2 energy_pv_project_area_km2 energy_unallocated_area_km2 thermal_allocated_area_km2 energy_unallocated_after_thermal_area_km2 energy_project_area_by_cell_km2 thermal_project_area_by_cell_km2", "km2", "allocated_area", "cell_or_project_by_cell", "static_planning", "energy/grid_nodes", ("capacity_bounds", "dataset", "validation"), "P", "exclusive_project_envelope_accounting")
+    for name, spec in hydrology_field_schema().items():
+        pure_accounting = (name.startswith("budget__") or name in {
+            "state__lake_water_level_m", "state__lake_wetted_area_m2", "static__lake_capacity_m3",
+            "flux__discharge_m3_s", "flux__actual_et_m3", "flux__cell_budget_residual_m3",
+        })
+        generation_relation = "P" if pure_accounting else "S"
+        add(f"dynamic_hydrology.{name}", spec["unit"], spec["time_kind"], spec["spatial_support"],
+            "explicit_hourly_intervals_and_T_plus_1_boundaries", "dynamic_hydrology",
+            ("water_budget_validation", "dataset", "optional_future_consumers"),
+            generation_relation,
+            "optional_synthetic_water_account_not_flood_forecast")
+        fields[f"dynamic_hydrology.{name}"].update(
+            generation_relation_type=generation_relation, accounting_relation_type="P",
+            generation_note=("Geometry, unit conversion, sum or balance under the prescribed model"
+                             if pure_accounting else "Uncalibrated forcing or scenario closure: bounded soil bucket, linear reservoirs, prescribed geometry or shortwave PET; engineering simplification"),
+        )
     for name, unit in WEATHER_UNITS.items():
         add(f"weather.{name}", unit, "accumulation" if name == "precipitation" else "interval_mean", "cell_area_representative", "explicit_interval_bounds_hours", "weather", ("source_load", "hydrology", "daily_aggregation"), "P" if name in {"wind_speed", "humidity", "pressure"} else "E", "exogenous_weather")
     add("weather.diagnostic__specific_humidity_kg_kg", "kg/kg moist air", "interval_representative_primitive", "cell", "explicit_interval_bounds_hours", "weather", ("moist_air_diagnosis", "source_load"), "S", "prescribed_moisture_forcing")
@@ -240,6 +259,7 @@ def field_contract_document(step_hours: float = 1.0) -> dict[str, object]:
             "hourly_daily_summary.npz": "mean_of_hourly_diagnostics; precipitation_sum; never_rediagnose_from_daily_mean_primitives",
         },
         "fields": fields,
+        "dynamic_hydrology_field_schema": hydrology_field_schema(),
         "artifact_field_overrides": artifact_overrides,
         "matrix_columns": {
             "electrical_buses": ["id:1", "nominal:kV", "P_capacity:MW", "Q_capacity:Mvar", "base_load:MW", "power_factor:1", "voltage_setpoint:pu"],

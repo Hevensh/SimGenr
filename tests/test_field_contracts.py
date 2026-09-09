@@ -70,7 +70,8 @@ def test_config_snapshot_and_field_semantics(tmp_path):
     assert fields["weather.precipitation"]["quantity_kind"] == "accumulation"
     assert fields["soc_mwh"]["time_support"] == "T+1_interval_boundaries"
     assert fields["buildability"]["quantity_kind"] == "score"
-    assert fields["flow_accumulation"]["unit"] == "km2"
+    assert fields["flow_accumulation"]["unit"] == "upstream_cell_count"
+    assert fields["catchment_area_km2"]["unit"] == "km2"
 
 
 def test_daily_indices_do_not_truncate_accepted_timestamp_roundoff():

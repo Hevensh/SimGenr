@@ -21,6 +21,7 @@ from world_generator.core.output_layout import WorldDataLayout
 from world_generator.core.contracts import integer_labels, entity_ids
 from world_generator.weather.physics import extraterrestrial_hourly_irradiance, latitude_grid
 from world_generator.weather.physics import diagnose_moist_air, saturation_vapor_pressure_hpa
+from scripts.hydrology_validation import check_dynamic_hydrology
 
 
 def _npz(path: Path) -> dict[str, np.ndarray]:
@@ -40,10 +41,16 @@ class Checks:
     def __init__(self) -> None:
         self.rows: list[dict[str, object]] = []
 
-    def equal(self, name: str, residual: np.ndarray, tolerance: float, unit: str = "", note: str = "") -> None:
-        error = _max_abs(np.asarray(residual, dtype=np.float64))
-        self.rows.append({"name": name, "passed": bool(np.isfinite(error) and error <= tolerance),
-                          "max_error": error, "tolerance": tolerance, "unit": unit, "note": note})
+    def equal(self, name: str, residual: np.ndarray, tolerance: float, unit: str = "", note: str = "",
+              *, relative_tolerance: float = 0.0, scale: np.ndarray | float = 0.0) -> None:
+        values = np.asarray(residual, dtype=np.float64)
+        allowed = tolerance + relative_tolerance * np.abs(np.asarray(scale, dtype=np.float64))
+        if tolerance < 0 or relative_tolerance < 0 or not np.isfinite(allowed).all():
+            raise ValueError("Check tolerances and scales must be finite and nonnegative")
+        error = _max_abs(values)
+        self.rows.append({"name": name, "passed": bool(np.isfinite(values).all() and np.all(np.abs(values) <= allowed)),
+                          "max_error": error, "tolerance": tolerance, "relative_tolerance": relative_tolerance,
+                          "unit": unit, "note": note})
 
     def upper(self, name: str, values: np.ndarray, upper: np.ndarray | float, tolerance: float, unit: str = "", note: str = "") -> None:
         residual = np.asarray(values, dtype=np.float64) - upper
@@ -360,6 +367,9 @@ def validate_world(world_dir: Path) -> dict[str, object]:
     city_population = float(sum(city["population"] for city in metadata["cities"]))
     checks.equal("population_mass", np.asarray(population - city_population), max(0.1, city_population * 2e-6), "persons")
     checks.upper("population_nonnegative", -static["population_density"], 0.0, 1e-7, "persons/km2")
+    if "catchment_area_km2" in static:
+        checks.equal("static_catchment_physical_area", static["catchment_area_km2"] - static["flow_accumulation"] * config.world.cell_size_km**2,
+                     1e-6, "km2", "legacy upstream cell count converted to physical area; never interpreted as current discharge")
 
     land_summary = {}
     if metadata.get("land_accounting_version") == "land_use_v1":
@@ -369,6 +379,16 @@ def validate_world(world_dir: Path) -> dict[str, object]:
     daily_summary_path = layout.weather / "hourly_daily_summary.npz"
     daily_summary = _npz(daily_summary_path) if daily_summary_path.exists() else None
     check_weather_contracts(checks, daily, hourly, config, daily_summary)
+
+    hydrology_summary = {"mode": "legacy_static_unspecified"}
+    if "dynamic_hydrology" in metadata:
+        from world_generator.operation.stage_cache import load_dynamic_hydrology_checkpoint
+        hydro = load_dynamic_hydrology_checkpoint(world_dir, expected_timestamps=hourly["timestamps"],
+                                                   expected_grid_shape=(config.world.height, config.world.width))
+        checks.condition("hydrology_mode_matches_configuration", (hydro is not None) == config.hydrology_dynamic.enabled)
+        hydrology_summary = {"mode": "static_only", "dynamic_water_balance": "NOT_RUN"}
+        if hydro is not None:
+            hydrology_summary = check_dynamic_hydrology(checks, hydro.as_arrays(), hourly, static, config)
 
     source_ids = source["bus_ids"].astype(int)
     source_kinds = np.asarray(source["bus_kinds"])
@@ -468,7 +488,8 @@ def validate_world(world_dir: Path) -> dict[str, object]:
                     "peak_exogenous_load_mw": float(source["p_load_mw"].sum(axis=1).max(initial=0.0)),
                     "total_unserved_mwh": float(flow["unserved_load_mw"].sum()),
                     "total_curtailed_mwh": float(flow["curtailed_generation_mw"].sum()),
-                    "storage_site_count": int(storage["site_ids"].size), "land_accounting": land_summary},
+                    "storage_site_count": int(storage["site_ids"].size), "land_accounting": land_summary,
+                    "dynamic_hydrology": hydrology_summary},
         "limitations": "Checks validate exported physical identities and constraints, not empirical realism or forecast accuracy. A PASS can include explicitly reported unserved energy when load shedding is allowed; it does not imply supply adequacy. Capacity factors are descriptive only. Final graph and dispatch use perfect foresight.",
     }
 

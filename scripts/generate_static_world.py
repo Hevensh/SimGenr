@@ -33,6 +33,7 @@ from world_generator.operation.power_flow import solve_dc_power_flow
 from world_generator.operation.source_load_forecast import generate_source_load_forecast
 from world_generator.operation.stage_cache import (
     load_hourly_weather_checkpoint,
+    load_dynamic_hydrology_checkpoint,
     load_stage12_checkpoint,
     load_stage13_checkpoint,
     save_stage12_checkpoint,
@@ -119,7 +120,7 @@ def main() -> None:
     if args.from_stage != 1:
         parser.error("--from-stage currently supports only 1, 13, or 14")
 
-    progress = tqdm(total=15, unit="stage", dynamic_ncols=True)
+    progress = tqdm(total=15 + int(config.hydrology_dynamic.enabled), unit="stage", dynamic_ncols=True)
     progress.set_description("Stage 01 terrain")
     terrain_base = generate_terrain_base(config.world, config.terrain, rngs.generator("terrain"))
     terrain_features = derive_terrain_features(terrain_base, config.world)
@@ -183,6 +184,15 @@ def main() -> None:
         config.land_use,
     )
     progress.update()
+    dynamic_hydrology = None
+    if config.hydrology_dynamic.enabled:
+        progress.set_description("Stage 07b dynamic hydrology")
+        from world_generator.hydrology.dynamic_hydrology import generate_dynamic_hydrology
+
+        dynamic_hydrology = generate_dynamic_hydrology(
+            terrain_features, hydrology, land_use, hourly_weather, config.world, config.hydrology_dynamic,
+        )
+        progress.update()
     progress.set_description("Stage 08 energy sites")
     climate_maps = climate.as_maps()
     energy = generate_energy_candidates(
@@ -319,6 +329,13 @@ def main() -> None:
     np.savez_compressed(data_layout.weather / "daily_weather.npz", **weather.as_arrays())
     np.savez_compressed(data_layout.weather / "hourly_weather_week.npz", **hourly_weather.as_arrays())
     np.savez_compressed(data_layout.weather / "hourly_daily_summary.npz", **aggregate_daily_weather(hourly_weather).as_arrays())
+    hydrology_artifact = data_layout.dynamic_hydrology / "hourly_hydrology.npz"
+    if dynamic_hydrology is not None:
+        data_layout.dynamic_hydrology.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(hydrology_artifact, **dynamic_hydrology.as_arrays())
+    elif hydrology_artifact.exists():
+        # Do not leave a stale enabled artifact after a static-only re-generation.
+        hydrology_artifact.unlink()
     np.savez_compressed(data_layout.operation / "source_load_forecast.npz", **source_load_forecast.as_arrays())
     np.savez_compressed(data_layout.operation / "power_flow_hourly.npz", **power_flow.as_arrays())
     np.savez_compressed(data_layout.operation / "grid_upgrade_plan.npz", **upgrade_plan.as_arrays())
@@ -355,9 +372,17 @@ def main() -> None:
                 "land_cover_compatibility": "land_cover is the legacy mixed display label; landform, land_cover_type and protected_mask are independent axes",
                 "energy_land_semantics": "exclusive_project_envelopes_within_energy_reserve_not_impervious_area",
                 "city_population_budget": city.population_budget,
+                "dynamic_hydrology": {
+                    "mode": "bucket_routing_v1" if dynamic_hydrology is not None else "static_only",
+                    "schema_version": "hydrology_v1",
+                    "artifact": "dynamic_hydrology/hourly_hydrology.npz" if dynamic_hydrology is not None else None,
+                    "after_stage": 7,
+                    "feedback_to_static_planning": False,
+                    "boundary_forcing": "zero_external_inflow" if dynamic_hydrology is not None else "not_simulated",
+                },
                 "field_contracts": "field_contracts.json" if config.contracts.export_field_contracts else None,
                 "time_step_hours": config.contracts.time_step_hours,
-                "execution_stage_order": [1, 2, 4, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+                "execution_stage_order": [1, 2, 4, 3, 5, 6, 7] + (["dynamic_hydrology"] if dynamic_hydrology is not None else []) + [8, 9, 10, 11, 12, 13, 14],
                 "scenario_semantics": "synthetic_realization_with_perfect_foresight_planning",
                 "grid_model": "single_voltage_lossless_DC_transmission_equivalent",
                 "stage14_line_expansion": "thermal_rerating_fixed_impedance",
@@ -689,6 +714,12 @@ def _validate_cached_physics(output_dir: Path, config: object, from_stage: int) 
         raise ValueError(f"Upstream configuration changed ({', '.join(changed)}); run --from-stage 1")
     if from_stage == 14 and cached["storage"] != current["storage"]:
         raise ValueError("Storage parameters changed; rerun storage sizing with --from-stage 13")
+    if config.hydrology_dynamic.enabled or metadata.get("dynamic_hydrology") is not None:
+        weather = load_hourly_weather_checkpoint(output_dir)
+        dynamic = load_dynamic_hydrology_checkpoint(output_dir, expected_timestamps=weather.timestamps,
+                                                    expected_grid_shape=(config.world.height, config.world.width))
+        if config.hydrology_dynamic.enabled != (dynamic is not None):
+            raise ValueError("Dynamic hydrology mode differs from the requested checkpoint configuration")
 
 
 if __name__ == "__main__":

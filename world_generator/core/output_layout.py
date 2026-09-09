@@ -13,6 +13,10 @@ class WorldDataLayout:
         return self.root / "stage_05_weather"
 
     @property
+    def dynamic_hydrology(self) -> Path:
+        return self.root / "dynamic_hydrology"
+
+    @property
     def energy(self) -> Path:
         return self.root / "stage_08_energy_sites"
 
