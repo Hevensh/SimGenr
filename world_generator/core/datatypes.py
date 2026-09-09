@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from world_generator.core.contracts import interval_bounds_hours, validate_node_arrays, validate_weather_arrays
+
 
 FloatMap = np.ndarray
 BoolMap = np.ndarray
@@ -117,6 +119,7 @@ class WeatherStore:
     start_day_of_year: int = 0
 
     def as_arrays(self) -> dict[str, np.ndarray]:
+        validate_weather_arrays(self.dynamic, self.weather_class, self.timestamps, self.channel_names, self.time_unit)
         return {
             "dynamic": self.dynamic,
             "weather_class": self.weather_class,
@@ -124,6 +127,7 @@ class WeatherStore:
             "channel_names": np.asarray(self.channel_names),
             "time_unit": np.asarray(self.time_unit),
             "start_day_of_year": np.asarray(self.start_day_of_year, dtype=np.int32),
+            "time_bounds_hours": interval_bounds_hours(self.timestamps, 1.0 if self.time_unit == "hour" else 24.0, stamp_unit=self.time_unit),
         }
 
 
@@ -140,6 +144,10 @@ class SourceLoadForecastStore:
     data_semantics: str = "synthetic_realization"
 
     def as_arrays(self) -> dict[str, np.ndarray]:
+        validate_node_arrays(self.timestamps, self.bus_ids, {
+            "p_load_mw": self.p_load_mw, "p_gen_available_mw": self.p_gen_available_mw,
+            "p_gen_scheduled_mw": self.p_gen_scheduled_mw, "q_load_mvar": self.q_load_mvar,
+        })
         return {
             "timestamps": self.timestamps,
             "bus_ids": self.bus_ids,
@@ -150,6 +158,7 @@ class SourceLoadForecastStore:
             "q_load_mvar": self.q_load_mvar,
             "source_channels": np.asarray(self.source_channels),
             "data_semantics": np.asarray(self.data_semantics),
+            "time_bounds_hours": interval_bounds_hours(self.timestamps, 1.0),
         }
 
     def summary_dict(self) -> dict[str, float | int | str | list[str]]:

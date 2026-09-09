@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from world_generator.core.config import dump_config_snapshot, load_world_config
+from world_generator.core.contracts import GENERATOR_VERSION, field_contract_document
 from world_generator.core.output_layout import WorldDataLayout
 from world_generator.core.random_state import build_rng_registry
 from world_generator.climate.climate_generator import generate_climate_baseline
@@ -340,11 +341,17 @@ def main() -> None:
     if update_loop.iterations:
         save_stage12_checkpoint(update_loop.iterations[-1], data_layout.grid_update)
     dump_config_snapshot(config, data_layout.config_snapshot)
+    if config.contracts.export_field_contracts:
+        (data_dir / "field_contracts.json").write_text(
+            json.dumps(field_contract_document(config.contracts.time_step_hours), indent=2), encoding="utf-8"
+        )
     data_layout.metadata.write_text(
         json.dumps(
             {
                 "world_id": world_id,
-                "generator_version": "physics_v3",
+                "generator_version": GENERATOR_VERSION,
+                "field_contracts": "field_contracts.json" if config.contracts.export_field_contracts else None,
+                "time_step_hours": config.contracts.time_step_hours,
                 "execution_stage_order": [1, 2, 4, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
                 "scenario_semantics": "synthetic_realization_with_perfect_foresight_planning",
                 "grid_model": "single_voltage_lossless_DC_transmission_equivalent",
@@ -659,10 +666,10 @@ def _validate_cached_physics(output_dir: Path, config: object, from_stage: int) 
     """Prevent silent mixtures of old equations, new parameters and stale worlds."""
     layout = WorldDataLayout(output_dir / "data")
     if not layout.metadata.exists() or not layout.config_snapshot.exists():
-        raise ValueError("No complete physics_v3 checkpoint; run --from-stage 1 first")
+        raise ValueError(f"No complete {GENERATOR_VERSION} checkpoint; run --from-stage 1 first")
     metadata = json.loads(layout.metadata.read_text(encoding="utf-8"))
-    if metadata.get("generator_version") != "physics_v3":
-        raise ValueError("Checkpoint predates physics_v3; regenerate with --from-stage 1")
+    if metadata.get("generator_version") != GENERATOR_VERSION:
+        raise ValueError(f"Checkpoint uses different physical semantics; regenerate {GENERATOR_VERSION} with --from-stage 1")
     cached = load_world_config(layout.config_snapshot).to_dict()
     current = config.to_dict()
     upstream = set(current) - {"output", "storage"}

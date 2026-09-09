@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from world_generator.core.contracts import positive_finite
+
 
 @dataclass(frozen=True)
 class WorldGridConfig:
@@ -13,6 +15,26 @@ class WorldGridConfig:
     origin_x_km: float = 0.0
     origin_y_km: float = 0.0
     latitude_center_degrees: float = 35.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.height, int) or not isinstance(self.width, int) or min(self.height, self.width) < 1:
+            raise ValueError("world height/width must be positive integers")
+        positive_finite(self.cell_size_km, "world.cell_size_km")
+        if not -90 <= self.latitude_center_degrees <= 90:
+            raise ValueError("world.latitude_center_degrees must be in [-90,90]")
+
+
+@dataclass(frozen=True)
+class ContractConfig:
+    """S: interface choices; P: unit conversions are defined in core.contracts."""
+
+    time_step_hours: float = 1.0
+    export_field_contracts: bool = True
+
+    def __post_init__(self) -> None:
+        positive_finite(self.time_step_hours, "contracts.time_step_hours")
+        if self.time_step_hours != 1.0:
+            raise ValueError("The current generator supports exactly 1 h intervals; conversion helpers support other durations")
 
 
 @dataclass(frozen=True)
@@ -364,6 +386,21 @@ class WorldConfig:
     power_grid: PowerGridConfig = field(default_factory=PowerGridConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    contracts: ContractConfig = field(default_factory=ContractConfig)
+
+    def __post_init__(self) -> None:
+        # P: capacities cannot be negative; do not silently clip bad scenarios.
+        import math
+
+        for section_name in ("energy", "power_grid", "storage"):
+            section = asdict(getattr(self, section_name))
+            for name, value in section.items():
+                if "capacity" in name and isinstance(value, (int, float)):
+                    if not math.isfinite(value) or value < 0:
+                        raise ValueError(f"{section_name}.{name} must be finite and nonnegative")
+        for kind in ("wind", "pv", "load"):
+            if getattr(self.energy, f"{kind}_capacity_min_mw") > getattr(self.energy, f"{kind}_capacity_max_mw"):
+                raise ValueError(f"energy.{kind} capacity minimum exceeds maximum")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -386,6 +423,7 @@ def load_world_config(path: str | Path) -> WorldConfig:
         power_grid=PowerGridConfig(**data.get("power_grid", {})),
         storage=StorageConfig(**data.get("storage", {})),
         output=OutputConfig(**data.get("output", {})),
+        contracts=ContractConfig(**data.get("contracts", {})),
     )
 
 

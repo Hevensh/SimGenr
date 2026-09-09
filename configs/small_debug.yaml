@@ -1,5 +1,11 @@
 seed: 42
 
+# S: the public generator currently supports one-hour intervals only.
+# P: all integrations and accumulated depths carry explicit time support.
+contracts:
+  time_step_hours: 1.0
+  export_field_contracts: true
+
 world:
   height: 64
   width: 64
