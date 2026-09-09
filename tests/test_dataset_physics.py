@@ -59,7 +59,7 @@ def test_provenance_does_not_rebrand_legacy_output_as_physics_v3():
     current = _world_provenance(source)
     assert all(current[key] == value for key, value in source.items())
     assert current["dispatch_semantics"] == "perfect_foresight_dispatch"
-    assert SCHEMA_VERSION == "0.6.0"
+    assert SCHEMA_VERSION == "0.7.0"
     assert STATIC_UNITS["population_density"] == "persons/km2"
     assert STATIC_UNITS["water_depth"] == STATIC_UNITS["hydrology_elevation"] == "m"
     assert "exogenous_p_load_mw" in dataset_schema()["sample_file"]["operation"]
@@ -116,6 +116,9 @@ def test_loader_roundtrip_new_fields_and_legacy_compatibility():
             if seed == 1:
                 operation.update(exogenous)
             payload = {f"operation__{key}": value for key, value in operation.items()}
+            if seed == 1:
+                payload["land__land_use_fraction_energy_reserve"] = np.full((4, 4), .25)
+                payload["land__energy_project_area_by_cell_km2"] = np.zeros((4, 4, 4))
             payload.update({
                 "dynamic__timestamps": np.arange(4), "dynamic__weather": np.zeros((4, 9, 1, 1)),
                 "dynamic__weather_class": np.zeros((4, 1, 1)), "graph__node_id": source["bus_ids"],
@@ -133,6 +136,9 @@ def test_loader_roundtrip_new_fields_and_legacy_compatibility():
         assert windows[0]["future"]["operation"]["exogenous_p_load_mw"].shape == (2, 4)
         assert windows[0]["operation_static"]["exogenous_bus_present"].shape == (4,)
         assert worlds[0]["metadata"]["generator_version"] == "physics_v3"
+        assert worlds[1]["land"] == {}
+        assert windows[0]["land"] is worlds[0]["land"]
+        assert windows[0]["land"]["energy_project_area_by_cell_km2"].shape == (4, 4, 4)
         batch = collate_multimodal([worlds[0], worlds[1]])
         assert isinstance(batch["operation"], list)  # Missing old fields are never fabricated.
     finally:

@@ -74,9 +74,22 @@ class StaticLandState:
     buildability: FloatMap
     terrain_cost: FloatMap
     water_buffer: BoolMap
+    landform: np.ndarray | None = None
+    land_cover_type: np.ndarray | None = None
+    allocatable_land_fraction: FloatMap | None = None
+
+    def __post_init__(self) -> None:
+        axes = (self.landform, self.land_cover_type, self.allocatable_land_fraction)
+        if any(values is not None for values in axes):
+            if not all(values is not None and values.shape == self.land_cover.shape for values in axes):
+                raise ValueError("New land axes must all be present as HxW maps")
+
+    @property
+    def protected_mask(self) -> np.ndarray:
+        return self.protected
 
     def as_maps(self) -> dict[str, np.ndarray]:
-        return {
+        maps = {
             "land_cover": self.land_cover,
             "vegetation": self.vegetation,
             "protected": self.protected,
@@ -84,6 +97,10 @@ class StaticLandState:
             "terrain_cost": self.terrain_cost,
             "water_buffer": self.water_buffer,
         }
+        if self.landform is not None:
+            maps.update(landform=self.landform, land_cover_type=self.land_cover_type,
+                        protected_mask=self.protected_mask, allocatable_land_fraction=self.allocatable_land_fraction)
+        return maps
 
 
 @dataclass(frozen=True)
@@ -622,6 +639,7 @@ class CityState:
     urban_density: FloatMap
     urban_mask: BoolMap
     city_id_map: np.ndarray
+    population_budget: dict[str, float | int] = field(default_factory=dict)
 
     def as_maps(self) -> dict[str, np.ndarray]:
         return {
@@ -660,9 +678,10 @@ class LandUseState:
     park_green: FloatMap
     load_density_base: FloatMap
     land_use_zone: np.ndarray
+    use_fractions: dict[str, np.ndarray] = field(default_factory=dict)
 
     def as_maps(self) -> dict[str, np.ndarray]:
-        return {
+        maps = {
             "residential": self.residential,
             "commercial": self.commercial,
             "industrial": self.industrial,
@@ -671,6 +690,8 @@ class LandUseState:
             "load_density_base": self.load_density_base,
             "land_use_zone": self.land_use_zone,
         }
+        maps.update({f"land_use_fraction_{name}": values for name, values in self.use_fractions.items()})
+        return maps
 
 
 @dataclass(frozen=True)
@@ -697,9 +718,16 @@ class EnergyCandidateState:
     wind_candidates: tuple[EnergyCandidate, ...]
     pv_candidates: tuple[EnergyCandidate, ...]
     load_candidates: tuple[EnergyCandidate, ...]
+    land_accounting_maps: dict[str, np.ndarray] = field(default_factory=dict)
+    project_land_ledger: np.ndarray | None = None
+    project_area_by_cell_km2: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        _validate_project_land_arrays(self.project_land_ledger, self.project_area_by_cell_km2,
+                                      self.wind_suitability.shape, "energy")
 
     def as_maps(self) -> dict[str, np.ndarray]:
-        return {
+        maps = {
             "wind_suitability": self.wind_suitability,
             "pv_suitability": self.pv_suitability,
             "load_node_density": self.load_node_density,
@@ -708,6 +736,7 @@ class EnergyCandidateState:
             "source_candidate_map": self.source_candidate_map,
             "load_candidate_map": self.load_candidate_map,
         }
+        return maps | self.land_accounting_maps
 
     def candidates_as_dicts(self) -> dict[str, list[dict[str, float | int | str]]]:
         return {
@@ -717,11 +746,34 @@ class EnergyCandidateState:
         }
 
     def candidates_as_arrays(self) -> dict[str, np.ndarray]:
-        return {
+        arrays = {
             "wind_candidates": _candidates_to_array(self.wind_candidates),
             "pv_candidates": _candidates_to_array(self.pv_candidates),
             "load_candidates": _candidates_to_array(self.load_candidates),
         }
+        if self.project_land_ledger is not None:
+            arrays.update(energy_project_land_ledger=self.project_land_ledger,
+                          energy_project_area_by_cell_km2=self.project_area_by_cell_km2,
+                          energy_project_land_columns=np.asarray(ENERGY_PROJECT_LAND_COLUMNS))
+        return arrays
+
+
+ENERGY_PROJECT_LAND_COLUMNS = (
+    "project_id", "technology_code", "candidate_id", "row", "col", "reserved_area_km2",
+    "capacity_mw", "capacity_density_mw_km2", "capacity_equivalent_area_km2",
+)
+
+
+def _validate_project_land_arrays(ledger: np.ndarray | None, cube: np.ndarray | None,
+                                  shape: tuple[int, ...], label: str) -> None:
+    if (ledger is None) != (cube is None):
+        raise ValueError(f"{label} project ledger and area cube must be supplied together")
+    if ledger is None:
+        return
+    if ledger.ndim != 2 or ledger.shape[1] != 9 or cube.shape != (ledger.shape[0], *shape):
+        raise ValueError(f"{label} project ledger must be Nx9 and area cube NxHxW")
+    if not np.isfinite(ledger).all() or not np.isfinite(cube).all() or np.any(cube < 0):
+        raise ValueError(f"{label} project ledger and area cube must be finite with nonnegative area")
 
 
 def _candidate_as_dict(candidate: EnergyCandidate) -> dict[str, float | int | str]:
@@ -750,7 +802,7 @@ def _candidates_to_array(candidates: tuple[EnergyCandidate, ...]) -> np.ndarray:
         ]
         for item in candidates
     ]
-    return np.asarray(rows, dtype=np.float32)
+    return np.asarray(rows, dtype=np.float32).reshape(-1, 7)
 
 
 @dataclass(frozen=True)
@@ -777,9 +829,19 @@ class GridNodeState:
     source_bus_map: np.ndarray
     thermal_bus_map: np.ndarray
     buses: tuple[GridBus, ...]
+    land_accounting_maps: dict[str, np.ndarray] = field(default_factory=dict)
+    thermal_project_land_ledger: np.ndarray | None = None
+    thermal_project_area_by_cell_km2: np.ndarray | None = None
+    thermal_land_accounting_mode: str = "legacy_no_land_guarantee"
+
+    def __post_init__(self) -> None:
+        _validate_project_land_arrays(self.thermal_project_land_ledger, self.thermal_project_area_by_cell_km2,
+                                      self.thermal_suitability.shape, "thermal")
+        if self.thermal_land_accounting_mode != "legacy_no_land_guarantee" and self.thermal_project_land_ledger is None:
+            raise ValueError("Modern thermal land accounting requires a project ledger and area cube")
 
     def as_maps(self) -> dict[str, np.ndarray]:
-        return {
+        maps = {
             "thermal_suitability": self.thermal_suitability,
             "thermal_externality": self.thermal_externality,
             "bus_site_map": self.bus_site_map,
@@ -787,12 +849,18 @@ class GridNodeState:
             "source_bus_map": self.source_bus_map,
             "thermal_bus_map": self.thermal_bus_map,
         }
+        return maps | self.land_accounting_maps
 
     def buses_as_dicts(self) -> list[dict[str, float | int | str]]:
         return [_bus_as_dict(item) for item in self.buses]
 
     def buses_as_arrays(self) -> dict[str, np.ndarray]:
-        return {"grid_buses": _buses_to_array(self.buses)}
+        arrays = {"grid_buses": _buses_to_array(self.buses), "thermal_land_accounting_mode": np.asarray(self.thermal_land_accounting_mode)}
+        if self.thermal_project_land_ledger is not None:
+            arrays.update(thermal_land_ledger=self.thermal_project_land_ledger,
+                          thermal_project_area_by_cell_km2=self.thermal_project_area_by_cell_km2,
+                          thermal_land_columns=np.asarray(("bus_id", "row", "col", "reserved_area_km2", "capacity_mw", "capacity_density_mw_km2", "capacity_equivalent_area_km2", "land_capacity_upper_bound_mw", "requested_capacity_mw")))
+        return arrays
 
 
 def _bus_as_dict(bus: GridBus) -> dict[str, float | int | str]:

@@ -87,6 +87,7 @@ class SimGenrDataset:
             "seed": int(entry["seed"]) if entry.get("seed") is not None else None,
             "partition": str(entry.get("partition", "unspecified")),
             "static": _extract_group(payload, "static"),
+            "land": _extract_group(payload, "land"),
             "dynamic": _extract_group(payload, "dynamic"),
             "graph": _extract_group(payload, "graph"),
             "operation": _extract_group(payload, "operation"),
@@ -150,6 +151,7 @@ class TemporalWindowDataset:
             "seed": world["seed"],
             "window_start": start,
             "static": world["static"],
+            "land": world.get("land", {}),
             "graph": world["graph"],
             "history": {
                 **_slice_weather(world["dynamic"], start, history_end, hours),

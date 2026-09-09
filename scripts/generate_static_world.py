@@ -351,6 +351,10 @@ def main() -> None:
             {
                 "world_id": world_id,
                 "generator_version": GENERATOR_VERSION,
+                "land_accounting_version": "land_use_v1",
+                "land_cover_compatibility": "land_cover is the legacy mixed display label; landform, land_cover_type and protected_mask are independent axes",
+                "energy_land_semantics": "exclusive_project_envelopes_within_energy_reserve_not_impervious_area",
+                "city_population_budget": city.population_budget,
                 "field_contracts": "field_contracts.json" if config.contracts.export_field_contracts else None,
                 "time_step_hours": config.contracts.time_step_hours,
                 "execution_stage_order": [1, 2, 4, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
@@ -675,6 +679,8 @@ def _validate_cached_physics(output_dir: Path, config: object, from_stage: int) 
     metadata = json.loads(layout.metadata.read_text(encoding="utf-8"))
     if metadata.get("generator_version") != GENERATOR_VERSION:
         raise ValueError(f"Checkpoint uses different physical semantics; regenerate {GENERATOR_VERSION} with --from-stage 1")
+    if metadata.get("land_accounting_version") != "land_use_v1":
+        raise ValueError("Checkpoint predates independent land-area accounting; regenerate with --from-stage 1")
     cached = load_world_config(layout.config_snapshot).to_dict()
     current = config.to_dict()
     upstream = set(current) - {"output", "storage"}

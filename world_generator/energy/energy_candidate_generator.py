@@ -13,6 +13,7 @@ from world_generator.core.datatypes import (
     StaticLandState,
     TerrainFeatures,
 )
+from world_generator.land.land_generator import hard_allocatable_land_fraction
 
 
 def generate_energy_candidates(
@@ -35,12 +36,15 @@ def generate_energy_candidates(
     # This cubic index is a resource ranking, not a turbine capacity factor.
     wind_n = np.clip(wind_speed / 12.0, 0.0, 1.0) ** 3
     irradiance_n = np.clip(climate_maps["mean_irradiance"] / 250.0, 0.0, 1.0)
-    city_distance = _distance_to_mask(city.urban_density > 0.18, grid)
+    urban_footprint = city.urban_density > config.urban_exclusion_density_threshold
+    city_distance = _distance_to_mask(urban_footprint, grid) if urban_footprint.any() else np.full(water.shape, np.inf)
     wind_city_ramp = _distance_ramp(city_distance, config.wind_min_city_distance_km)
     wind_city_decay = _half_life_decay(
         np.maximum(city_distance - config.wind_min_city_distance_km, 0.0),
         config.wind_city_half_distance_km,
     )
+    if not urban_footprint.any():
+        wind_city_decay = np.ones(water.shape)
     wind_city_ok = wind_city_ramp * wind_city_decay
     pv_city_ok = _distance_ramp(city_distance, config.pv_min_city_distance_km)
     local_flatness = np.clip(1.0 - slope_n, 0.0, 1.0)
@@ -54,6 +58,9 @@ def generate_energy_candidates(
 
     source_allowed = developable.copy()
     source_allowed[water | protected] = 0.0
+    hard_land = hard_allocatable_land_fraction(land, hydrology)
+    wind_eligible = (hard_land > 0.0) & (city_distance >= config.wind_min_city_distance_km) & (terrain.slope <= config.wind_max_project_slope)
+    pv_eligible = (hard_land > 0.0) & (city_distance >= config.pv_min_city_distance_km) & (terrain.slope <= config.pv_max_project_slope)
     sparse_land = np.clip(1.0 - 0.72 * city.urban_density - 0.18 * land_use.residential - 0.10 * land_use.commercial, 0.0, 1.0)
 
     wind_suitability = np.clip(
@@ -65,7 +72,7 @@ def generate_energy_candidates(
         * (1.0 - 0.55 * hydrology.flood_risk),
         0.0, 1.0,
     )
-    wind_suitability[water | protected | (city_distance < config.wind_min_city_distance_km)] = 0.0
+    wind_suitability[~wind_eligible] = 0.0
 
     pv_suitability = np.clip(
         irradiance_n
@@ -76,7 +83,7 @@ def generate_energy_candidates(
         0.0, 1.0,
     )
     # mean_irradiance is already all-sky GHI; do not attenuate clouds twice.
-    pv_suitability[water | protected | (city_distance < config.pv_min_city_distance_km)] = 0.0
+    pv_suitability[~pv_eligible] = 0.0
     wind_selection_utility = _local_source_utility(wind_suitability, config.wind_selection_radius_km, grid)
     pv_selection_utility = _local_source_utility(pv_suitability, config.pv_selection_radius_km, grid)
 
@@ -134,8 +141,13 @@ def generate_energy_candidates(
         hard_min_distance_km=config.min_source_distance_km,
         avoid_distance_km=config.min_cross_source_distance_km,
     )
-    wind_candidates, pv_candidates = _allocate_source_capacity(
-        wind_candidates, pv_candidates, source_allowed * (city.urban_density <= 0.18), grid, config,
+    # The reserve is already withdrawn from other uses. Legacy hand-built
+    # LandUseState objects have no area axis and use explicit hard land only.
+    reserve = land_use.use_fractions.get("energy_reserve", hard_land)
+    reserve = np.minimum(np.asarray(reserve), hard_land)
+    wind_candidates, pv_candidates, ledger, project_areas, land_accounting = _allocate_source_capacity(
+        wind_candidates, pv_candidates, reserve, grid, config,
+        wind_eligible=wind_eligible, pv_eligible=pv_eligible, return_accounting=True,
     )
     load_candidates = _select_load_candidates(
         load_node_density,
@@ -161,6 +173,9 @@ def generate_energy_candidates(
         wind_candidates=tuple(wind_candidates),
         pv_candidates=tuple(pv_candidates),
         load_candidates=tuple(load_candidates),
+        land_accounting_maps=land_accounting,
+        project_land_ledger=ledger,
+        project_area_by_cell_km2=project_areas,
     )
 
 
@@ -340,7 +355,9 @@ def _make_candidate(
 def _allocate_source_capacity(
     wind: list[EnergyCandidate], pv: list[EnergyCandidate],
     available_land: np.ndarray, grid: WorldGridConfig, config: EnergyConfig,
-) -> tuple[list[EnergyCandidate], list[EnergyCandidate]]:
+    *, wind_eligible: np.ndarray | None = None, pv_eligible: np.ndarray | None = None,
+    return_accounting: bool = False,
+) -> tuple:
     """P_nameplate <= usable project area (km2) * installed density (MW/km2).
 
     Share each subcell between the nearest eligible project, including between
@@ -348,25 +365,55 @@ def _allocate_source_capacity(
     it is an approximation, not cadastral parcel geometry.
     """
     candidates = wind + pv
-    if not candidates:
-        return [], []
     if min(config.wind_capacity_density_mw_km2, config.pv_capacity_density_mw_km2) <= 0.0:
         raise ValueError("Installed capacity density must be positive")
-    areas = np.zeros(len(candidates), dtype=np.float64)
+    available_land = np.asarray(available_land, dtype=np.float64)
+    if available_land.shape != (grid.height, grid.width):
+        raise ValueError("Energy available land shape must match the configured grid")
+    if not np.isfinite(available_land).all() or np.any((available_land < 0) | (available_land > 1)):
+        raise ValueError("Energy available land must be a finite physical fraction in [0, 1]")
+    if grid.cell_size_km <= 0.0:
+        raise ValueError("Project area requires a positive cell size")
+    for expected_kind, items in (("wind", wind), ("pv", pv)):
+        seen_ids = set()
+        for item in items:
+            coordinates = np.asarray([item.row, item.col, item.candidate_id], dtype=float)
+            if not np.isfinite(coordinates).all() or not np.equal(coordinates, np.floor(coordinates)).all():
+                raise ValueError("Energy project coordinates and candidate IDs must be finite integers")
+            if item.kind != expected_kind or not (0 <= item.row < grid.height and 0 <= item.col < grid.width):
+                raise ValueError("Energy project technology and coordinates must match its grid")
+            if item.candidate_id < 0 or item.candidate_id in seen_ids:
+                raise ValueError("Each energy technology requires unique nonnegative candidate IDs")
+            seen_ids.add(item.candidate_id)
+    wind_eligible = np.ones(available_land.shape, dtype=bool) if wind_eligible is None else np.asarray(wind_eligible, dtype=bool)
+    pv_eligible = np.ones(available_land.shape, dtype=bool) if pv_eligible is None else np.asarray(pv_eligible, dtype=bool)
+    if wind_eligible.shape != available_land.shape or pv_eligible.shape != available_land.shape:
+        raise ValueError("Project eligibility masks must match the available land grid")
+    for candidate in candidates:
+        eligible = wind_eligible if candidate.kind == "wind" else pv_eligible
+        if not eligible[int(candidate.row), int(candidate.col)]:
+            raise ValueError("Energy project centre must satisfy its technology's hard eligibility")
+    project_areas = np.zeros((len(candidates), *available_land.shape), dtype=np.float64)
     rows, cols = np.indices(available_land.shape)
-    for subrow in (-0.375, -0.125, 0.125, 0.375):
-        for subcol in (-0.375, -0.125, 0.125, 0.375):
+    subdivisions = config.project_area_subcells_per_axis
+    offsets = (np.arange(subdivisions) + 0.5) / subdivisions - 0.5
+    for subrow in offsets:
+        for subcol in offsets:
             nearest = np.full(available_land.shape, np.inf)
             owner = np.full(available_land.shape, -1, dtype=np.int32)
             for index, candidate in enumerate(candidates):
                 radius = config.wind_cluster_radius_km if candidate.kind == "wind" else config.pv_cluster_radius_km
                 distance = np.hypot(rows + subrow - candidate.row, cols + subcol - candidate.col) * grid.cell_size_km
-                take = (distance <= max(radius, 0.0)) & (distance < nearest)
+                eligible = wind_eligible if candidate.kind == "wind" else pv_eligible
+                take = (distance <= max(radius, 0.0)) & (distance < nearest) & eligible & (available_land > 0.0)
                 nearest[take], owner[take] = distance[take], index
             for index in range(len(candidates)):
-                areas[index] += np.clip(available_land[owner == index], 0.0, 1.0).sum() * grid.cell_size_km**2 / 16.0
+                owned = owner == index
+                project_areas[index, owned] += available_land[owned] * grid.cell_size_km**2 / subdivisions**2
+    areas = project_areas.sum(axis=(1, 2))
     result: list[EnergyCandidate] = []
-    for candidate, area in zip(candidates, areas):
+    kept_indices, ledger_rows = [], []
+    for index, (candidate, area) in enumerate(zip(candidates, areas)):
         is_wind = candidate.kind == "wind"
         density = config.wind_capacity_density_mw_km2 if is_wind else config.pv_capacity_density_mw_km2
         design_max = (config.wind_capacity_max_mw * config.wind_cluster_capacity_max_multiplier if is_wind
@@ -374,9 +421,31 @@ def _allocate_source_capacity(
         capacity = min(float(area) * density, design_max)
         if capacity <= 0.0:
             continue
+        kept_indices.append(index)
+        ledger_rows.append([len(result), 1 if is_wind else 2, candidate.candidate_id, candidate.row, candidate.col,
+                            area, capacity, density, capacity / density])
         result.append(EnergyCandidate(candidate.candidate_id, candidate.kind, candidate.row, candidate.col,
                                       candidate.x, candidate.y, capacity, candidate.suitability))
-    return [item for item in result if item.kind == "wind"], [item for item in result if item.kind == "pv"]
+    wind_result = [item for item in result if item.kind == "wind"]
+    pv_result = [item for item in result if item.kind == "pv"]
+    if not return_accounting:
+        return wind_result, pv_result
+    project_areas = project_areas[kept_indices]
+    ledger = np.asarray(ledger_rows, dtype=np.float64).reshape(-1, 9)
+    wind_area = project_areas[ledger[:, 1] == 1].sum(axis=0)
+    pv_area = project_areas[ledger[:, 1] == 2].sum(axis=0)
+    available_area = available_land * grid.cell_size_km**2
+    unused = available_area - wind_area - pv_area
+    if np.any(unused < -max(grid.cell_size_km**2 * 1e-12, 1e-12)):
+        raise ValueError("Renewable project areas overdraw the shared land reserve")
+    accounting = {
+        "energy_available_area_km2": available_area,
+        "energy_wind_project_area_km2": wind_area,
+        "energy_pv_project_area_km2": pv_area,
+        "energy_unallocated_area_km2": np.maximum(unused, 0.0),
+        "wind_land_eligible": wind_eligible, "pv_land_eligible": pv_eligible,
+    }
+    return wind_result, pv_result, ledger, project_areas, accounting
 
 
 def _allocate_load_capacity(

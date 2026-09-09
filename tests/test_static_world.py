@@ -131,7 +131,8 @@ def test_scale_aware_city_targets_grow_sublinearly_with_effective_area() -> None
     config = replace(
         WorldConfig().city,
         scaling_mode="scale_aware",
-        reference_effective_area_km2=2048.0,
+        # A score of 0.5 ranks land; it no longer halves the geometric area.
+        reference_effective_area_km2=4096.0,
     )
     land_64, hydrology_64 = states((64, 64))
     land_128, hydrology_128 = states((128, 128))

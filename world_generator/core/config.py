@@ -94,6 +94,28 @@ class LandConfig:
     high_flood_threshold: float = 0.70
     vegetation_noise_weight: float = 0.25
     random_patch_count: int = 5
+    # S: independent geomorphology/cover classification and hard allocation.
+    hill_elevation_m: float = 1800.0
+    mountain_elevation_m: float = 2800.0
+    hill_slope_threshold: float = 0.12
+    mountain_slope_threshold: float = 0.22
+    wetland_flood_threshold: float = 0.45
+    bare_vegetation_threshold: float = 0.12
+    woodland_vegetation_threshold: float = 0.45
+    allocatable_max_slope: float = 0.35
+
+    def __post_init__(self) -> None:
+        import math
+        for name in ("hill_elevation_m", "mountain_elevation_m", "hill_slope_threshold", "mountain_slope_threshold", "allocatable_max_slope"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+        for name in ("protected_fraction", "wetland_flood_threshold", "bare_vegetation_threshold", "woodland_vegetation_threshold"):
+            if not math.isfinite(getattr(self, name)) or not 0 <= getattr(self, name) <= 1:
+                raise ValueError(f"{name} must be in [0, 1]")
+        if self.hill_elevation_m > self.mountain_elevation_m or self.hill_slope_threshold > self.mountain_slope_threshold:
+            raise ValueError("Landform hill thresholds must not exceed mountain thresholds")
+        if self.bare_vegetation_threshold > self.woodland_vegetation_threshold:
+            raise ValueError("Bare cover threshold must not exceed woodland threshold")
 
 
 @dataclass(frozen=True)
@@ -255,6 +277,20 @@ class LandUseConfig:
     load_residential_weight: float = 0.48
     load_commercial_weight: float = 0.34
     load_industrial_weight: float = 0.18
+    # S: disjoint area budgets, separate from the legacy suitability maps.
+    built_population_density_persons_km2: float = 6000.0
+    maximum_built_fraction: float = 0.80
+    agriculture_fraction_of_remaining: float = 0.45
+    park_fraction_of_remaining: float = 0.10
+    energy_reserve_fraction_of_remaining: float = 0.50
+
+    def __post_init__(self) -> None:
+        import math
+        if not math.isfinite(self.built_population_density_persons_km2) or self.built_population_density_persons_km2 <= 0:
+            raise ValueError("built_population_density_persons_km2 must be positive and finite")
+        for name in ("maximum_built_fraction", "agriculture_fraction_of_remaining", "park_fraction_of_remaining", "energy_reserve_fraction_of_remaining"):
+            if not math.isfinite(getattr(self, name)) or not 0 <= getattr(self, name) <= 1:
+                raise ValueError(f"{name} must be in [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -292,6 +328,23 @@ class EnergyConfig:
     wind_capacity_density_mw_km2: float = 3.0
     pv_capacity_density_mw_km2: float = 35.0
     per_capita_peak_load_kw: float = 1.5
+    project_area_subcells_per_axis: int = 4
+    urban_exclusion_density_threshold: float = 0.18
+    wind_max_project_slope: float = 0.35
+    pv_max_project_slope: float = 0.24
+
+    def __post_init__(self) -> None:
+        import math
+        if isinstance(self.project_area_subcells_per_axis, bool) or not isinstance(self.project_area_subcells_per_axis, int) or not 1 <= self.project_area_subcells_per_axis <= 32:
+            raise ValueError("project_area_subcells_per_axis must be an integer in [1, 32]")
+        for name in ("wind_capacity_density_mw_km2", "pv_capacity_density_mw_km2"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive and finite")
+        for name in ("wind_cluster_radius_km", "pv_cluster_radius_km", "wind_min_city_distance_km", "pv_min_city_distance_km", "wind_max_project_slope", "pv_max_project_slope"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+        if not math.isfinite(self.urban_exclusion_density_threshold) or not 0 <= self.urban_exclusion_density_threshold <= 1:
+            raise ValueError("urban_exclusion_density_threshold must be in [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -381,6 +434,20 @@ class PowerGridConfig:
     near_parallel_min_cost_improvement: float = 0.05
     low_utilization_peak_ratio: float = 0.45
     downgrade_max_network_loading: float = 0.90
+    thermal_capacity_density_mw_km2: float = 200.0
+    thermal_project_radius_km: float = 2.0
+    thermal_project_area_subcells_per_axis: int = 4
+    thermal_residential_score_threshold: float = 0.22
+
+    def __post_init__(self) -> None:
+        import math
+        for name in ("thermal_capacity_density_mw_km2", "thermal_project_radius_km"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive and finite")
+        if isinstance(self.thermal_project_area_subcells_per_axis, bool) or not isinstance(self.thermal_project_area_subcells_per_axis, int) or not 1 <= self.thermal_project_area_subcells_per_axis <= 32:
+            raise ValueError("thermal_project_area_subcells_per_axis must be an integer in [1, 32]")
+        if not math.isfinite(self.thermal_residential_score_threshold) or not 0 <= self.thermal_residential_score_threshold <= 1:
+            raise ValueError("thermal_residential_score_threshold must be finite in [0, 1]")
 
 
 @dataclass(frozen=True)

@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from world_generator.core.config import load_world_config
 from world_generator.core.output_layout import WorldDataLayout
+from world_generator.core.contracts import integer_labels, entity_ids
 from world_generator.weather.physics import extraterrestrial_hourly_irradiance, latitude_grid
 from world_generator.weather.physics import diagnose_moist_air, saturation_vapor_pressure_hpa
 
@@ -149,6 +150,184 @@ def check_weather_contracts(checks: Checks, daily: dict[str, np.ndarray], hourly
         checks.condition("positive_moist_air_density", bool(np.all(hourly["diagnostic__air_density_kg_m3"] > 0)))
 
 
+def check_land_accounting(checks: Checks, static: dict[str, np.ndarray],
+                          candidates: dict[str, np.ndarray], metadata: dict[str, object],
+                          config: object) -> dict[str, float]:
+    """C: independently close whole-cell use and exclusive project-area ledgers.
+
+    Land-use fractions are dimensionless areas, not suitability probabilities.
+    Project envelopes subdivide energy_reserve; they are not a tenth land use.
+    """
+    shape = (config.world.height, config.world.width)
+    area = float(config.world.cell_size_km) ** 2
+
+    def raster(name: str) -> np.ndarray:
+        if name not in static or np.shape(static[name]) != shape:
+            raise ValueError(f"Land accounting field {name} must have shape {shape}")
+        values = np.asarray(static[name], dtype=np.float64)
+        if not np.isfinite(values).all():
+            raise ValueError(f"Land accounting field {name} must be finite")
+        return values
+
+    water = raster("river").astype(bool) | raster("lake").astype(bool)
+    protected = raster("protected_mask")
+    checks.equal("protected_mask_compatibility", protected - raster("protected"), 0)
+    checks.condition("protected_mask_boolean", bool(np.isin(protected, [0, 1]).all()))
+    cover = integer_labels(raster("land_cover_type"), "land_cover_type")
+    form = integer_labels(raster("landform"), "landform")
+    checks.condition("land_cover_type_supported", bool(np.isin(cover, [1, 2, 3, 4, 5]).all()))
+    checks.condition("landform_supported", bool(np.isin(form, [1, 2, 3]).all()))
+    checks.equal("land_cover_water_mask", (cover == 1).astype(float) - water, 0)
+    names = ("water", "wetland", "residential", "commercial", "industrial", "agriculture",
+             "park_green", "natural", "energy_reserve")
+    fractions = {name: raster(f"land_use_fraction_{name}") for name in names}
+    stacked = np.stack(list(fractions.values()))
+    checks.upper("land_use_fraction_nonnegative", -stacked, 0, 1e-7, "1")
+    checks.upper("land_use_fraction_upper_bound", stacked, 1, 1e-7, "1")
+    checks.equal("land_use_fraction_cell_closure", stacked.sum(axis=0) - 1, 2e-7, "1")
+    checks.equal("land_use_water_area", fractions["water"] - water, 1e-7, "1")
+    checks.equal("land_use_wetland_area", fractions["wetland"] - (cover == 2), 1e-7, "1")
+    allocatable = raster("allocatable_land_fraction")
+    checks.upper("allocatable_fraction_nonnegative", -allocatable, 0, 0, "1")
+    checks.upper("allocatable_fraction_upper_bound", allocatable, 1, 0, "1")
+    blocked = water | protected.astype(bool) | (cover == 2)
+    checks.equal("allocatable_land_hard_exclusions", np.where(blocked, allocatable, 0), 0, "1")
+    developed = sum(fractions[name] for name in ("residential", "commercial", "industrial", "agriculture", "energy_reserve"))
+    checks.upper("allocated_uses_within_hard_land_budget", developed, allocatable, 2e-7, "1")
+    checks.equal("population_land_support", np.where(allocatable <= 0, raster("population_density"), 0), 1e-7, "persons/km2")
+
+    available = raster("energy_available_area_km2")
+    wind_area = raster("energy_wind_project_area_km2")
+    pv_area = raster("energy_pv_project_area_km2")
+    unused = raster("energy_unallocated_area_km2")
+    for name, values in (("available", available), ("wind", wind_area), ("pv", pv_area), ("unused", unused)):
+        checks.upper(f"energy_{name}_area_nonnegative", -values, 0, 1e-9, "km2")
+    checks.equal("energy_available_from_reserved_use", available - fractions["energy_reserve"] * area, 2e-7 * area, "km2")
+    checks.equal("energy_cell_area_budget", wind_area + pv_area + unused - available, 2e-7 * area, "km2")
+    checks.equal("energy_project_hard_exclusions", np.where(blocked, wind_area + pv_area, 0), 1e-9, "km2")
+
+    columns = ("project_id", "technology_code", "candidate_id", "row", "col", "reserved_area_km2",
+               "capacity_mw", "capacity_density_mw_km2", "capacity_equivalent_area_km2")
+    if tuple(str(x) for x in candidates.get("energy_project_land_columns", [])) != columns:
+        raise ValueError("energy_project_land_columns does not match the declared C ledger schema")
+    ledger = np.asarray(candidates["energy_project_land_ledger"], dtype=np.float64)
+    if ledger.ndim != 2 or ledger.shape[1] != len(columns) or not np.isfinite(ledger).all():
+        raise ValueError("energy_project_land_ledger must be finite [N,9]")
+    cube = np.asarray(candidates["energy_project_area_by_cell_km2"], dtype=np.float64)
+    if cube.shape != (len(ledger), *shape) or not np.isfinite(cube).all():
+        raise ValueError("energy_project_area_by_cell_km2 must be finite [N,H,W]")
+    entity_ids(ledger[:, 0], "energy project ids")
+    integer_labels(ledger[:, 1:5], "energy project type/candidate/grid ids")
+    checks.condition("energy_project_technology_codes", bool(np.isin(ledger[:, 1], [1, 2]).all()))
+    checks.condition("energy_project_coordinates", bool(np.all((ledger[:, 3] >= 0) & (ledger[:, 3] < shape[0]) & (ledger[:, 4] >= 0) & (ledger[:, 4] < shape[1]))))
+    checks.condition("energy_project_unique_candidate_keys", len(set(map(tuple, ledger[:, 1:3]))) == len(ledger))
+    checks.upper("energy_project_cell_area_nonnegative", -cube, 0, 1e-9, "km2")
+    checks.equal("energy_project_area_integration", cube.sum(axis=(1, 2)) - ledger[:, 5], 2e-6 * max(1, area), "km2")
+    checks.upper("energy_projects_no_double_allocation", cube.sum(axis=0), available, 2e-7 * area, "km2")
+    checks.condition("energy_project_density_positive", bool(np.all(ledger[:, 7] > 0)))
+    checks.upper("energy_project_capacity_nonnegative", -ledger[:, 6], 0, 0, "MW")
+    checks.upper("energy_project_capacity_area_bound", ledger[:, 6], ledger[:, 5] * ledger[:, 7], 2e-5, "MW")
+    checks.equal("energy_capacity_equivalent_area_identity", ledger[:, 8] * ledger[:, 7] - ledger[:, 6], 2e-5, "MW")
+    for code, kind, total_area in ((1, "wind", wind_area), (2, "pv", pv_area)):
+        selected = ledger[:, 1] == code
+        eligible = raster(f"{kind}_land_eligible")
+        checks.condition(f"{kind}_land_eligible_boolean", bool(np.isin(eligible, [0, 1]).all()))
+        checks.equal(f"{kind}_project_area_raster", cube[selected].sum(axis=0) - total_area, 2e-7 * area, "km2")
+        checks.equal(f"{kind}_project_full_envelope_eligible", np.where(eligible > 0, 0, total_area), 1e-9, "km2")
+        density = getattr(config.energy, f"{kind}_capacity_density_mw_km2")
+        checks.equal(f"{kind}_project_config_density", ledger[selected, 7] - density, 1e-7, "MW/km2")
+        rows = np.asarray(candidates[f"{kind}_candidates"])
+        if rows.size == 0:
+            rows = np.empty((0, 7))
+        if rows.ndim != 2 or rows.shape[1] != 7:
+            raise ValueError(f"{kind}_candidates must preserve the legacy [N,7] layout")
+        ids = entity_ids(rows[:, 0], f"{kind} candidate ids")
+        by_id = {int(row[0]): row for row in rows}
+        checks.condition(f"{kind}_candidate_ledger_membership", set(ids) == set(ledger[selected, 2]))
+        for row in ledger[selected]:
+            key = int(row[2])
+            if key in by_id:
+                checks.equal(f"{kind}_candidate_{key}_ledger_identity", row[[3, 4, 6]] - by_id[key][[1, 2, 5]], 2e-5, "row,col,MW")
+
+    budget = metadata.get("city_population_budget")
+    if not isinstance(budget, dict):
+        raise ValueError("city_population_budget is required for land_use_v1")
+    city_total = sum(float(city["population"]) for city in metadata["cities"])
+    effective_area = float(allocatable.sum() * area)
+    if config.city.scaling_mode == "fixed":
+        target_population = float(config.city.total_population)
+    elif effective_area <= 0:
+        target_population = 0.0
+    else:
+        # S: project scale-aware population prior, independently from the maps.
+        target_population = float(config.city.total_population) * max(effective_area / config.city.reference_effective_area_km2, 1e-6) ** config.city.population_area_exponent
+    tolerance = max(0.1, target_population * 2e-6)
+    checks.equal("population_target_not_silently_dropped", np.asarray(city_total - target_population), tolerance, "persons")
+    checks.equal("population_budget_declared_target", np.asarray(float(budget["target_population_persons"]) - target_population), tolerance, "persons")
+    checks.equal("population_budget_declared_allocation", np.asarray(float(budget["allocated_population_persons"]) - city_total), tolerance, "persons")
+    checks.equal("population_budget_configured_prior", np.asarray(float(budget["configured_population_persons"]) - config.city.total_population), tolerance, "persons")
+    checks.equal("population_budget_land_area", np.asarray(float(budget["allocatable_land_area_km2"]) - effective_area), 2e-7 * max(1, effective_area), "km2")
+    checks.condition("city_budget_placed_count", int(budget["placed_city_count"]) == len(metadata["cities"]))
+    return {"domain_area_km2": float(np.prod(shape) * area), "allocatable_area_km2": effective_area,
+            "energy_reserved_area_km2": float(available.sum()), "wind_project_area_km2": float(wind_area.sum()),
+            "pv_project_area_km2": float(pv_area.sum()), "unallocated_energy_area_km2": float(unused.sum()),
+            "target_population_persons": target_population}
+
+
+def check_thermal_land(checks: Checks, static: dict[str, np.ndarray], nodes: dict[str, np.ndarray],
+                       metadata: dict[str, object], config: object) -> dict[str, float]:
+    """C: Stage 09 thermal footprints consume only the Stage 08 remaining area."""
+    shape = (config.world.height, config.world.width)
+    columns = ("bus_id", "row", "col", "reserved_area_km2", "capacity_mw", "capacity_density_mw_km2",
+               "capacity_equivalent_area_km2", "land_capacity_upper_bound_mw", "requested_capacity_mw")
+    if tuple(str(x) for x in nodes.get("thermal_land_columns", [])) != columns:
+        raise ValueError("thermal_land_columns does not match the C Stage 09 schema")
+    ledger = np.asarray(nodes["thermal_land_ledger"], dtype=np.float64)
+    if ledger.ndim != 2 or ledger.shape[1] != 9 or not np.isfinite(ledger).all():
+        raise ValueError("thermal_land_ledger must be finite [N,9]")
+    cube = np.asarray(nodes["thermal_project_area_by_cell_km2"], dtype=np.float64)
+    if cube.shape != (len(ledger), *shape) or not np.isfinite(cube).all():
+        raise ValueError("thermal_project_area_by_cell_km2 must be finite [N,H,W]")
+    maps = {}
+    for name in ("energy_unallocated_area_km2", "thermal_allocated_area_km2", "energy_unallocated_after_thermal_area_km2", "thermal_land_eligible"):
+        values = np.asarray(static[name], dtype=np.float64)
+        if values.shape != shape or not np.isfinite(values).all():
+            raise ValueError(f"{name} must be finite [H,W]")
+        maps[name] = values
+    available, occupied, remaining, eligible = maps.values()
+    area_tol = 2e-7 * config.world.cell_size_km ** 2
+    ids = entity_ids(ledger[:, 0], "thermal land bus ids")
+    integer_labels(ledger[:, 1:3], "thermal land grid coordinates")
+    checks.condition("thermal_land_coordinates", bool(np.all((ledger[:, 1] >= 0) & (ledger[:, 1] < shape[0]) & (ledger[:, 2] >= 0) & (ledger[:, 2] < shape[1]))))
+    checks.condition("thermal_land_eligible_boolean", bool(np.isin(eligible, [0, 1]).all()))
+    checks.upper("thermal_project_cell_area_nonnegative", -cube, 0, 1e-9, "km2")
+    checks.upper("thermal_unallocated_area_nonnegative", -remaining, 0, 1e-9, "km2")
+    checks.equal("thermal_project_area_integration", cube.sum(axis=(1, 2)) - ledger[:, 3], 2e-6, "km2")
+    checks.equal("thermal_project_area_raster", cube.sum(axis=0) - occupied, area_tol, "km2")
+    checks.equal("thermal_stage09_remaining_area_budget", occupied + remaining - available, area_tol, "km2")
+    checks.upper("thermal_cannot_reuse_wind_pv_land", cube.sum(axis=0), available, area_tol, "km2")
+    checks.equal("thermal_project_full_envelope_eligible", np.where(eligible > 0, 0, occupied), 1e-9, "km2")
+    checks.equal("thermal_project_hard_land_exclusions", np.where(static["allocatable_land_fraction"] > 0, 0, occupied), 1e-9, "km2")
+    checks.condition("thermal_project_density_positive", bool(np.all(ledger[:, 5] > 0)))
+    checks.equal("thermal_project_config_density", ledger[:, 5] - config.power_grid.thermal_capacity_density_mw_km2, 1e-7, "MW/km2")
+    checks.equal("thermal_land_supported_capacity", ledger[:, 7] - ledger[:, 3] * ledger[:, 5], 2e-5, "MW")
+    checks.equal("thermal_capacity_equivalent_area", ledger[:, 6] * ledger[:, 5] - ledger[:, 4], 2e-5, "MW")
+    checks.upper("thermal_stage09_capacity_within_land", ledger[:, 4], ledger[:, 7], 2e-5, "MW")
+    checks.upper("thermal_stage09_capacity_within_request", ledger[:, 4], ledger[:, 8], 2e-5, "MW")
+    checks.upper("thermal_stage09_capacity_nonnegative", -ledger[:, 4], 0, 0, "MW")
+    buses = {int(bus["bus_id"]): bus for bus in metadata["grid_buses"] if bus["kind"] == "thermal_bus"}
+    checks.condition("thermal_land_bus_membership", set(ids) == set(buses))
+    for row in ledger:
+        key = int(row[0])
+        if key in buses:
+            bus = buses[key]
+            checks.equal(f"thermal_bus_{key}_land_identity", row[[1, 2, 4]] - [bus["row"], bus["col"], bus["capacity_mw"]], 2e-5, "row,col,MW")
+    return {"thermal_project_area_km2": float(occupied.sum()),
+            "unallocated_after_thermal_area_km2": float(remaining.sum()),
+            "thermal_stage09_capacity_mw": float(ledger[:, 4].sum()),
+            "thermal_land_supported_capacity_mw": float(ledger[:, 7].sum())}
+
+
 def validate_world(world_dir: Path) -> dict[str, object]:
     world_dir = world_dir.resolve()
     layout = WorldDataLayout(world_dir / "data")
@@ -181,6 +360,11 @@ def validate_world(world_dir: Path) -> dict[str, object]:
     city_population = float(sum(city["population"] for city in metadata["cities"]))
     checks.equal("population_mass", np.asarray(population - city_population), max(0.1, city_population * 2e-6), "persons")
     checks.upper("population_nonnegative", -static["population_density"], 0.0, 1e-7, "persons/km2")
+
+    land_summary = {}
+    if metadata.get("land_accounting_version") == "land_use_v1":
+        land_summary = check_land_accounting(checks, static, _npz(layout.energy / "source_load_candidates.npz"), metadata, config)
+        land_summary.update(check_thermal_land(checks, static, _npz(layout.buses / "grid_nodes.npz"), metadata, config))
 
     daily_summary_path = layout.weather / "hourly_daily_summary.npz"
     daily_summary = _npz(daily_summary_path) if daily_summary_path.exists() else None
@@ -284,7 +468,7 @@ def validate_world(world_dir: Path) -> dict[str, object]:
                     "peak_exogenous_load_mw": float(source["p_load_mw"].sum(axis=1).max(initial=0.0)),
                     "total_unserved_mwh": float(flow["unserved_load_mw"].sum()),
                     "total_curtailed_mwh": float(flow["curtailed_generation_mw"].sum()),
-                    "storage_site_count": int(storage["site_ids"].size)},
+                    "storage_site_count": int(storage["site_ids"].size), "land_accounting": land_summary},
         "limitations": "Checks validate exported physical identities and constraints, not empirical realism or forecast accuracy. A PASS can include explicitly reported unserved energy when load shedding is allowed; it does not imply supply adequacy. Capacity factors are descriptive only. Final graph and dispatch use perfect foresight.",
     }
 

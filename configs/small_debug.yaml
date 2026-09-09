@@ -60,6 +60,15 @@ hydrology:
   depression_fill_epsilon_m: 0.02
 
 land:
+  # S: synthetic cover/landform labels and hard terrain eligibility.
+  hill_elevation_m: 1800.0
+  mountain_elevation_m: 2800.0
+  hill_slope_threshold: 0.12
+  mountain_slope_threshold: 0.22
+  wetland_flood_threshold: 0.45
+  bare_vegetation_threshold: 0.12
+  woodland_vegetation_threshold: 0.45
+  allocatable_max_slope: 0.35
   protected_fraction: 0.10
   water_buffer_km: 1.5
   steep_slope_threshold: 0.22
@@ -162,6 +171,12 @@ city:
   city_size_alpha: 1.25
 
 land_use:
+  # S: sequential whole-cell area budgets; these are not suitability scores.
+  built_population_density_persons_km2: 6000.0
+  maximum_built_fraction: 0.80
+  agriculture_fraction_of_remaining: 0.45
+  park_fraction_of_remaining: 0.10
+  energy_reserve_fraction_of_remaining: 0.50
   industrial_edge_preference: 0.55
   park_waterfront_weight: 0.55
   agriculture_max_urban_density: 0.22
@@ -174,6 +189,11 @@ land_use:
   load_industrial_weight: 0.18
 
 energy:
+  # S: quadrature resolution and technology-specific hard project boundaries.
+  project_area_subcells_per_axis: 4
+  urban_exclusion_density_threshold: 0.18
+  wind_max_project_slope: 0.35
+  pv_max_project_slope: 0.24
   wind_capacity_density_mw_km2: 3.0
   pv_capacity_density_mw_km2: 35.0
   per_capita_peak_load_kw: 1.5
@@ -209,6 +229,11 @@ energy:
   load_capacity_max_mw: 120.0
 
 power_grid:
+  # S: exclusive thermal project envelopes, consuming the unused energy reserve.
+  thermal_capacity_density_mw_km2: 200.0
+  thermal_project_radius_km: 2.0
+  thermal_project_area_subcells_per_axis: 4
+  thermal_residential_score_threshold: 0.22
   nominal_voltage_kv: 220.0
   thermal_scale_with_load: true
   thermal_planning_reserve_margin: 1.15

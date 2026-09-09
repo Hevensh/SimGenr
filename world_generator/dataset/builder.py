@@ -13,7 +13,7 @@ from world_generator.core.contracts import entity_ids
 from world_generator.operation.stage_cache import load_stage12_checkpoint
 
 
-SCHEMA_VERSION = "0.6.0"
+SCHEMA_VERSION = "0.7.0"
 
 STATIC_CONTINUOUS_CHANNELS = (
     "elevation",
@@ -219,6 +219,7 @@ def package_world(
         "continuous_channels": np.asarray(STATIC_CONTINUOUS_CHANNELS),
         "categorical_channels": np.asarray(STATIC_CATEGORICAL_CHANNELS),
     }
+    land_payload = _land_accounting_payload(layout, static_source, world_metadata)
     dynamic_payload = {
         "timestamps": weather["timestamps"].astype(np.int32),
         "weather": weather["dynamic"].astype(np.float32),
@@ -269,6 +270,13 @@ def package_world(
             "categorical_channels": list(STATIC_CATEGORICAL_CHANNELS),
             "continuous_statistics": _channel_statistics(static_continuous, STATIC_CONTINUOUS_CHANNELS),
         },
+        "land": {
+            "accounting_version": world_metadata.get("land_accounting_version", "legacy_no_land_guarantee"),
+            "fields": list(land_payload),
+            "fraction_support": "whole_cell; nine mutually exclusive land_use_fraction maps sum to one",
+            "project_area_semantics": "exclusive envelope inside energy_reserve; project areas are nested, not additional top-level fractions or impervious cover",
+            "display_compatibility": "legacy static categorical tensor retains mixed land_cover/land_use_zone display encoding; independent land__* arrays preserve actual cover and protection",
+        },
         "dynamic": {
             "weather_generation": json.loads(str(weather["weather_metadata_json"])) if "weather_metadata_json" in weather else {"generation_mode": "unspecified_legacy"},
             "optional_diagnostics": [name for name in dynamic_payload if name.startswith("diagnostic__")],
@@ -298,6 +306,7 @@ def package_world(
     sample_path = sample_root / sample_name
     payload = {
         **_prefix_payload("static", static_payload),
+        **_prefix_payload("land", land_payload),
         **_prefix_payload("dynamic", dynamic_payload),
         **_prefix_payload("graph", graph_payload),
         **_prefix_payload("operation", operation_payload),
@@ -336,6 +345,16 @@ def dataset_schema() -> dict[str, object]:
             "static": {
                 "continuous": "float32 [C_static,H,W]",
                 "categorical": "int32 [C_categorical,H,W]",
+            },
+            "land": {
+                "semantics": "Optional complete land_use_v1 appendix; static/background cover, planned whole-cell fractions and Stage8/9 project budgets. Never time-sliced.",
+                "landform/land_cover_type": "integer [H,W]; separate geomorphology and potential background cover",
+                "protected_mask/*_land_eligible": "bool [H,W]; hard identities and project exclusions",
+                "allocatable_land_fraction/land_use_fraction_*": "float [H,W]; fractions of whole-cell area, use fractions sum to one",
+                "*_area_km2": "float [H,W]; allocated or residual geometric budget",
+                "energy_project_land_ledger/thermal_land_ledger": "float64 [N,9]; named columns preserve identity, reserved area and capacity",
+                "*_project_area_by_cell_km2": "float64 [N,H,W]; project-by-cell reserved areas",
+                "wind_candidates/pv_candidates/load_candidates": "legacy [N,7] tables, kept unchanged",
             },
             "dynamic": {
                 "weather": "float32 [T,C_weather,H,W]",
@@ -579,12 +598,44 @@ def _has_physical_units(world_metadata: dict[str, object]) -> bool:
     return world_metadata.get("generator_version") in {"physics_v3", "physics_v4"}
 
 
+def _land_accounting_payload(layout: WorldDataLayout, static: dict[str, np.ndarray], metadata: dict[str, object]) -> dict[str, np.ndarray]:
+    """Append C axes/ledgers without changing legacy model tensor channels."""
+    version = metadata.get("land_accounting_version")
+    has_new_fields = any(name in static for name in ("landform", "land_cover_type", "allocatable_land_fraction"))
+    if version is None and not has_new_fields:
+        return {}
+    if version != "land_use_v1":
+        raise ValueError("New land fields require the explicit land_use_v1 accounting version")
+    maps = ("landform", "land_cover_type", "protected_mask", "allocatable_land_fraction",
+            "energy_available_area_km2", "energy_wind_project_area_km2", "energy_pv_project_area_km2", "energy_unallocated_area_km2",
+            "wind_land_eligible", "pv_land_eligible", "thermal_land_eligible", "thermal_allocated_area_km2", "energy_unallocated_after_thermal_area_km2")
+    maps += tuple(f"land_use_fraction_{name}" for name in ("water", "wetland", "residential", "commercial", "industrial", "agriculture", "park_green", "natural", "energy_reserve"))
+    missing = [name for name in maps if name not in static]
+    if missing:
+        raise ValueError(f"Incomplete modern land accounting maps: {missing}")
+    shape = static["elevation"].shape
+    for name in maps:
+        if static[name].shape != shape or not np.isfinite(static[name]).all():
+            raise ValueError(f"Land map {name} must be finite HxW")
+    payload = {name: static[name].copy() for name in maps}
+    candidates = _load_npz(layout.existing(layout.energy, "source_load_candidates.npz", layout.root / "source_load_candidates.npz"))
+    nodes = _load_npz(layout.existing(layout.buses, "grid_nodes.npz", layout.root / "grid_nodes.npz"))
+    for source, names in ((candidates, ("wind_candidates", "pv_candidates", "load_candidates", "energy_project_land_ledger", "energy_project_land_columns", "energy_project_area_by_cell_km2")),
+                          (nodes, ("thermal_land_ledger", "thermal_land_columns", "thermal_project_area_by_cell_km2", "thermal_land_accounting_mode"))):
+        for name in names:
+            if name not in source:
+                raise ValueError(f"Incomplete modern project land accounting: {name}")
+            payload[name] = source[name].copy()
+    return payload
+
+
 def _world_provenance(world_metadata: dict[str, object]) -> dict[str, object]:
     return {
         "generator_version": world_metadata.get("generator_version", "legacy_unspecified"),
         "scenario_semantics": world_metadata.get("scenario_semantics", "unspecified_legacy"),
         "time_convention": world_metadata.get("time_convention", "unspecified_legacy"),
         "execution_stage_order": world_metadata.get("execution_stage_order", []),
+        "land_accounting_version": world_metadata.get("land_accounting_version", "legacy_no_land_guarantee"),
         "dispatch_semantics": "perfect_foresight_dispatch",
         "forecast_feature_availability": "Future weather is realized; final topology, capacities and dispatch use the full operation period.",
     }
