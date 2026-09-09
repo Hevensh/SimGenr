@@ -10,8 +10,10 @@ import numpy as np
 from scipy.ndimage import label
 
 from world_generator.core.datatypes import HydrologyTimeSeriesStore
+from scripts.validation_checks import validation_context
 
 
+@validation_context(stage="D_dynamic_hydrology",fields=["state__*","flux__*","budget__*","static__*"],time_support="explicit_check_axis_or_aggregate",engineering_simplification="Conservative soil bucket, linear reservoirs and prescribed lake geometry; not a hydraulic flood model")
 def check_dynamic_hydrology(checks, arrays, hourly, static, config):
     store = HydrologyTimeSeriesStore.from_arrays(arrays)
     s, f, m, b = store.states, store.fluxes, store.static_maps, store.budgets
@@ -30,9 +32,9 @@ def check_dynamic_hydrology(checks, arrays, hourly, static, config):
     if rain.shape != f["precipitation_mm"].shape:
         raise ValueError("Dynamic hydrology forcing shape differs from hourly weather")
 
-    def water_equal(name, residual, scale=0.0):
+    def water_equal(name, residual, scale=0.0, **annotations):
         checks.equal("hydrology_" + name, residual, cfg.budget_absolute_tolerance_m3, "m3",
-                     relative_tolerance=cfg.budget_relative_tolerance, scale=scale)
+                     relative_tolerance=cfg.budget_relative_tolerance, scale=scale, **annotations)
 
     water = np.asarray(static["river"], bool) | np.asarray(static["lake"], bool)
     lake = np.asarray(static["lake"], bool)
@@ -41,7 +43,7 @@ def check_dynamic_hydrology(checks, arrays, hourly, static, config):
                               for name, coefficient in cfg.impervious_fraction_by_use.items())
     expected_impervious = np.where(water, 0.0, expected_impervious)
     checks.equal("hydrology_land_partition", pervious + impervious + water - 1, 2e-6, "1")
-    checks.equal("hydrology_impervious_scenario_rule", impervious - expected_impervious, 2e-6, "1")
+    checks.equal("hydrology_impervious_scenario_rule", impervious - expected_impervious, 2e-6, "1",relation_class="S",axes=("row","col"),fields=["static__impervious_fraction","land_use_fraction_*"])
     checks.equal("hydrology_soil_capacity_support", m["soil_capacity_mm"] - cfg.soil_capacity_mm * pervious, 1e-8, "mm")
     checks.equal("hydrology_groundwater_capacity_support", m["groundwater_capacity_mm"] - cfg.groundwater_capacity_mm * ~water, 1e-8, "mm")
     for name, capacity in (("soil_storage_mm", "soil_capacity_mm"), ("groundwater_storage_mm", "groundwater_capacity_mm"), ("lake_storage_m3", "lake_capacity_m3")):
@@ -51,7 +53,7 @@ def check_dynamic_hydrology(checks, arrays, hourly, static, config):
     water_equal("channel_initial_state", s["channel_storage_m3"][0] - cfg.initial_channel_storage_mm * mm_volume * ~lake)
     checks.equal("hydrology_precipitation_forcing", f["precipitation_mm"] - rain, 1e-8, "mm")
     expected_pet = ghi * cfg.pet_shortwave_absorptivity * cfg.pet_latent_energy_fraction * dt * 3600 / cfg.latent_heat_vaporization_j_kg
-    checks.equal("hydrology_pet_scenario_rule", f["potential_et_mm"] - expected_pet, 1e-8, "mm")
+    checks.equal("hydrology_pet_scenario_rule", f["potential_et_mm"] - expected_pet, 1e-8, "mm",relation_class="S",axes=("time","row","col"),timestamps=store.timestamps,fields=["flux__potential_et_mm","hourly.irradiance"],time_support="hour_interval_accumulation")
     checks.upper("hydrology_infiltration_rain_bound", f["infiltration_mm"], rain * pervious, 1e-8, "mm")
     checks.upper("hydrology_infiltration_rate_bound", f["infiltration_mm"], cfg.infiltration_capacity_mm_h * pervious * dt, 1e-8, "mm")
     checks.upper("hydrology_soil_et_energy_bound", f["soil_evapotranspiration_mm"], expected_pet * pervious, 1e-8, "mm")
@@ -59,9 +61,9 @@ def check_dynamic_hydrology(checks, arrays, hourly, static, config):
     soil_change = np.diff(s["soil_storage_mm"], axis=0)
     groundwater_change = np.diff(s["groundwater_storage_mm"], axis=0)
     water_equal("soil_balance", (soil_change - f["infiltration_mm"] + f["soil_evapotranspiration_mm"] + f["percolation_mm"]) * mm_volume,
-                s["soil_storage_mm"][:-1] * mm_volume)
+                s["soil_storage_mm"][:-1] * mm_volume,axes=("time","row","col"),timestamps=store.timestamps,fields=["state__soil_storage_mm","flux__infiltration_mm","flux__soil_evapotranspiration_mm","flux__percolation_mm"],time_support="hour_interval_mass_balance")
     water_equal("groundwater_balance", (groundwater_change - f["percolation_mm"] + f["baseflow_mm"] + f["groundwater_overflow_mm"]) * mm_volume,
-                s["groundwater_storage_mm"][:-1] * mm_volume)
+                s["groundwater_storage_mm"][:-1] * mm_volume,axes=("time","row","col"),timestamps=store.timestamps,fields=["state__groundwater_storage_mm","flux__percolation_mm","flux__baseflow_mm","flux__groundwater_overflow_mm"],time_support="hour_interval_mass_balance")
     water_equal("dry_soil_cannot_gain", np.where(rain == 0, np.maximum(soil_change, 0), 0) * mm_volume)
     checks.equal("hydrology_surface_runoff_partition", f["surface_runoff_mm"] + f["infiltration_mm"] - rain * ~lake, 1e-8, "mm")
     water_equal("actual_et_partition", f["actual_et_m3"] - f["soil_evapotranspiration_mm"] * mm_volume - f["open_water_evaporation_m3"])
@@ -128,20 +130,20 @@ def check_dynamic_hydrology(checks, arrays, hourly, static, config):
     outputs = f["actual_et_m3"] + f["boundary_outflow_m3"] + f["routing_outflow_m3"] + f["lake_mixing_outflow_m3"]
     residual = storage[:-1] + inputs - storage[1:] - outputs
     scale = np.maximum(storage[:-1] + inputs, storage[1:] + outputs)
-    water_equal("cell_water_balance", residual, scale)
-    water_equal("reported_cell_residual", f["cell_budget_residual_m3"] - residual, scale)
+    water_equal("cell_water_balance", residual, scale,axes=("time","row","col"),timestamps=store.timestamps,fields=["state__soil_storage_mm","state__groundwater_storage_mm","state__channel_storage_m3","state__lake_storage_m3","flux__precipitation_mm","flux__actual_et_m3","flux__routing_inflow_m3","flux__routing_outflow_m3","flux__boundary_inflow_m3","flux__boundary_outflow_m3","flux__lake_mixing_inflow_m3","flux__lake_mixing_outflow_m3"],time_support="hour_interval_mass_balance")
+    water_equal("reported_cell_residual", f["cell_budget_residual_m3"] - residual, scale,axes=("time","row","col"),timestamps=store.timestamps,fields=["flux__cell_budget_residual_m3","state__*","flux__*"],time_support="hour_interval_mass_balance")
     totals = {"initial_storage_m3": storage[:-1].sum(axis=(1, 2)), "final_storage_m3": storage[1:].sum(axis=(1, 2)),
               "precipitation_m3": rain.sum(axis=(1, 2)) * mm_volume}
     totals.update({name: f[name].sum(axis=(1, 2)) for name in ("boundary_inflow_m3", "actual_et_m3", "boundary_outflow_m3")})
     lhs = totals["initial_storage_m3"] + totals["precipitation_m3"] + totals["boundary_inflow_m3"]
     rhs = totals["final_storage_m3"] + totals["actual_et_m3"] + totals["boundary_outflow_m3"]
     totals["residual_m3"] = lhs - rhs
-    water_equal("domain_interval_balance", lhs - rhs, np.maximum(lhs, rhs))
+    water_equal("domain_interval_balance", lhs - rhs, np.maximum(lhs, rhs),axes=("time",),timestamps=store.timestamps,time_support="hour_interval_domain_mass_balance")
     for name, expected in totals.items():
-        water_equal("reported_budget_" + name, b[name] - expected, np.maximum(lhs, rhs) if name == "residual_m3" else expected)
+        water_equal("reported_budget_" + name, b[name] - expected, np.maximum(lhs, rhs) if name == "residual_m3" else expected,axes=("time",),timestamps=store.timestamps,fields=["budget__"+name],time_support="hour_interval_domain_account")
     window_input = storage[0].sum() + totals["precipitation_m3"].sum() + totals["boundary_inflow_m3"].sum()
     window_output = storage[-1].sum() + totals["actual_et_m3"].sum() + totals["boundary_outflow_m3"].sum()
-    water_equal("whole_window_balance", window_input - window_output, max(window_input, window_output))
+    water_equal("whole_window_balance", window_input - window_output, max(window_input, window_output),axes=(),time_support="whole_window_aggregate_not_a_time_point")
     return {"mode": "bucket_routing_v1", "initial_storage_m3": float(storage[0].sum()), "final_storage_m3": float(storage[-1].sum()),
             "precipitation_m3": float(totals["precipitation_m3"].sum()), "actual_et_m3": float(totals["actual_et_m3"].sum()),
             "boundary_inflow_m3": float(totals["boundary_inflow_m3"].sum()), "boundary_outflow_m3": float(totals["boundary_outflow_m3"].sum()),

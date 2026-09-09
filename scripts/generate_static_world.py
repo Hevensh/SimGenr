@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from world_generator.core.config import dump_config_snapshot, load_world_config
 from world_generator.core.contracts import GENERATOR_VERSION, field_contract_document
+from world_generator.core.errors import generation_failure_category
 from world_generator.core.output_layout import WorldDataLayout
 from world_generator.core.random_state import build_rng_registry
 from world_generator.climate.climate_generator import generate_climate_baseline
@@ -53,7 +54,65 @@ from world_generator.visualization.storage_figures import save_storage_dispatch_
 from world_generator.weather.weather_generator import aggregate_daily_weather, generate_daily_weather, generate_hourly_weather_week
 
 
+@dataclass
+class GenerationContext:
+    output_dir: Path | None = None
+    config_path: str | None = None
+    seed: int | None = None
+    stage: str | None = None
+    resolved_config: dict[str, object] | None = None
+
+
+def _failure_marker(context: GenerationContext) -> Path | None:
+    if context.output_dir is None:
+        return None
+    directory = context.output_dir.resolve()
+    if not directory.is_relative_to(PROJECT_ROOT.resolve()) or directory == PROJECT_ROOT.resolve():
+        return None
+    return directory / "generation_failure.json"
+
+
+def _record_generation_failure(context: GenerationContext, error: BaseException) -> None:
+    marker = _failure_marker(context)
+    if marker is None:
+        return
+    stage = getattr(error, "stage", None) or context.stage
+    payload = {
+        "schema_version": "generation_failure_v1", "status": "FAIL",
+        "category": generation_failure_category(error, stage=stage),
+        "stage": stage, "error_type": type(error).__name__, "message": str(error),
+        "config": context.config_path, "seed": context.seed,
+        "resolved_config": context.resolved_config,
+        "world_directory": str(marker.parent),
+    }
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError as reporting_error:
+        # Reporting must not replace the original solver/input failure.
+        print(f"Could not write generation failure record: {reporting_error}", file=sys.stderr)
+
+
 def main() -> None:
+    context = GenerationContext()
+    try:
+        _generate(context)
+    except (Exception, SystemExit) as error:
+        if not isinstance(error, SystemExit) or error.code not in (None, 0):
+            _record_generation_failure(context, error)
+        raise
+    else:
+        marker = _failure_marker(context)
+        if marker is not None and marker.exists():
+            marker.unlink()
+
+
+def _set_stage(context: GenerationContext, progress: object, description: str) -> None:
+    context.stage = description
+    progress.set_description(description)
+
+
+def _generate(context: GenerationContext) -> None:
     parser = argparse.ArgumentParser(description="Generate a reproducible static terrain world.")
     parser.add_argument("--config", default="configs/small_debug.yaml")
     parser.add_argument("--output", default=None)
@@ -86,6 +145,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    context.config_path = str(Path(args.config).resolve())
+    context.seed = args.seed
+    context.stage = "configuration"
     config = load_world_config(args.config)
     if args.seed is not None:
         config = replace(config, seed=args.seed)
@@ -94,9 +156,15 @@ def main() -> None:
             parser.error("--start-day must be in 0..364")
         config = replace(config, weather=replace(config.weather, start_day_of_year=args.start_day))
     rngs = build_rng_registry(config.seed)
+    context.resolved_config = config.to_dict()
     output_root = Path(args.output or config.output.root)
     world_id = f"{config.output.world_name}_seed{config.seed}"
+    if Path(world_id).name != world_id or "/" in world_id or "\\" in world_id:
+        raise ValueError("Output world_name must be a single directory name")
     output_dir = output_root / world_id
+    context.output_dir = output_dir.resolve()
+    context.seed = config.seed
+    context.stage = "cached_input_validation" if args.from_stage in (13, 14) else "output_setup"
     data_dir = output_dir / "data"
     data_layout = WorldDataLayout(data_dir)
     figure_dir = output_dir / "figures"
@@ -104,6 +172,7 @@ def main() -> None:
         _validate_cached_physics(output_dir, config, args.from_stage)
     data_layout.create()
     if args.from_stage == 13:
+        context.stage = "cached_stages_13_14"
         _run_stage13_from_cache(
             config,
             output_dir,
@@ -114,6 +183,7 @@ def main() -> None:
         )
         return
     if args.from_stage == 14:
+        context.stage = "cached_stage_14"
         _run_stage14_from_cache(
             config,
             output_dir,
@@ -127,14 +197,14 @@ def main() -> None:
         parser.error("--from-stage currently supports only 1, 13, or 14")
 
     progress = tqdm(total=15 + int(config.hydrology_dynamic.enabled), unit="stage", dynamic_ncols=True)
-    progress.set_description("Stage 01 terrain")
+    _set_stage(context, progress, "Stage 01 terrain")
     terrain_base = generate_terrain_base(config.world, config.terrain, rngs.generator("terrain"))
     terrain_features = derive_terrain_features(terrain_base, config.world)
     progress.update()
-    progress.set_description("Stage 02 hydrology")
+    _set_stage(context, progress, "Stage 02 hydrology")
     hydrology = generate_hydrology(terrain_features, config.world, config.hydrology)
     progress.update()
-    progress.set_description("Stage 04 climate")
+    _set_stage(context, progress, "Stage 04 climate")
     climate = generate_climate_baseline(
         terrain_features,
         hydrology,
@@ -143,7 +213,7 @@ def main() -> None:
         rngs.generator("climate"),
     )
     progress.update()
-    progress.set_description("Stage 03 static land (climate conditioned)")
+    _set_stage(context, progress, "Stage 03 static land (climate conditioned)")
     land = generate_static_land(
         terrain_features,
         hydrology,
@@ -153,7 +223,7 @@ def main() -> None:
         climate=climate,
     )
     progress.update()
-    progress.set_description("Stage 05 weather")
+    _set_stage(context, progress, "Stage 05 weather")
     weather = generate_daily_weather(
         terrain_features,
         hydrology,
@@ -169,7 +239,7 @@ def main() -> None:
         grid=config.world,
     )
     progress.update()
-    progress.set_description("Stage 06 cities")
+    _set_stage(context, progress, "Stage 06 cities")
     city = generate_initial_cities(
         terrain_features,
         hydrology,
@@ -180,7 +250,7 @@ def main() -> None:
         rngs.generator("evolution"),
     )
     progress.update()
-    progress.set_description("Stage 07 land use")
+    _set_stage(context, progress, "Stage 07 land use")
     land_use = generate_land_use_zones(
         terrain_features,
         hydrology,
@@ -192,14 +262,14 @@ def main() -> None:
     progress.update()
     dynamic_hydrology = None
     if config.hydrology_dynamic.enabled:
-        progress.set_description("Stage 07b dynamic hydrology")
+        _set_stage(context, progress, "Stage 07b dynamic hydrology")
         from world_generator.hydrology.dynamic_hydrology import generate_dynamic_hydrology
 
         dynamic_hydrology = generate_dynamic_hydrology(
             terrain_features, hydrology, land_use, hourly_weather, config.world, config.hydrology_dynamic,
         )
         progress.update()
-    progress.set_description("Stage 08 energy sites")
+    _set_stage(context, progress, "Stage 08 energy sites")
     climate_maps = climate.as_maps()
     energy = generate_energy_candidates(
         terrain_features,
@@ -212,7 +282,7 @@ def main() -> None:
         config.energy,
     )
     progress.update()
-    progress.set_description("Stage 09 grid buses")
+    _set_stage(context, progress, "Stage 09 grid buses")
     grid_nodes = build_grid_nodes(
         terrain_features,
         hydrology,
@@ -223,7 +293,7 @@ def main() -> None:
         config.power_grid,
     )
     progress.update()
-    progress.set_description("Stage 10 topology")
+    _set_stage(context, progress, "Stage 10 topology")
     grid_topology = build_grid_topology(
         terrain_features,
         hydrology,
@@ -243,7 +313,7 @@ def main() -> None:
     )
     grid_electrical = build_grid_electrical(refined_topology, config.power_grid.nominal_voltage_kv)
     progress.update()
-    progress.set_description("Stage 11 operation")
+    _set_stage(context, progress, "Stage 11 operation")
     source_load_forecast = generate_source_load_forecast(
         hourly_weather,
         refined_topology,
@@ -264,7 +334,7 @@ def main() -> None:
         power_grid=config.power_grid,
     )
     progress.update()
-    progress.set_description(f"Stages 12-14 asset planning: {config.planning.mode}")
+    _set_stage(context, progress, f"Stages 12-14 asset planning: {config.planning.mode}")
     asset_result = run_asset_planning(
         config=config, terrain=terrain_features, hydrology=hydrology, climate=climate,
         land=land, land_use=land_use, topology=refined_topology, base_topology=grid_topology,
@@ -277,7 +347,7 @@ def main() -> None:
     storage_dispatch, storage_dispatch_forecast = asset_result.storage_dispatch, asset_result.dispatched_forecast
     storage_dispatch_power_flow, storage_dispatch_electrical = asset_result.dispatched_power_flow, asset_result.dispatched_electrical
     progress.update(3)
-    progress.set_description("Writing outputs")
+    _set_stage(context, progress, "Writing outputs")
     static_maps = (
         terrain_features.as_maps()
         | hydrology.as_maps()
@@ -714,7 +784,7 @@ def _validate_cached_physics(output_dir: Path, config: object, from_stage: int) 
         raise ValueError("Checkpoint predates source_load_v1 source/load physics; regenerate with --from-stage 1")
     cached = load_world_config(layout.config_snapshot).to_dict()
     current = config.to_dict()
-    upstream = set(current) - {"output", "storage"}
+    upstream = set(current) - {"output", "storage", "validation"}
     changed = sorted(name for name in upstream if cached[name] != current[name])
     if changed:
         raise ValueError(f"Upstream configuration changed ({', '.join(changed)}); run --from-stage 1")

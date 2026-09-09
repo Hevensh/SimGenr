@@ -1,30 +1,68 @@
 # Procedural Multimodal Source-Load-Grid World Generator
 
-This project builds a reproducible synthetic world for multimodal source-load-grid experiments. The physics_v3 pipeline derives terrain and drainage first, then climate, climate-conditioned land, consistent daily/hourly weather, cities, land use, sources, the grid, and constrained operation.
+This project builds a reproducible synthetic world for multimodal source-load-grid experiments. The current physics_v4 pipeline derives terrain and drainage first, then climate, climate-conditioned land, hourly weather with explicit diagnostics, cities, land use, sources, the grid, and constrained operation.
 
-## 物理模型修订（physics_v3）
+## 当前实现入口（physics_v4，A–G）
 
-完整的十专题文献与机理调查见 [调查入口](docs/mechanism_research/README.md) 与 [综合报告](docs/mechanism_research/synthesis_report.md)，包含因果关系、量纲与时空尺度、代码缺口、分阶段建议和验证协议。该组报告是后续设计依据，提出的新状态和模块尚未在本次研究文档变更中启用。
+完整的十专题文献与机理调查见 [调查入口](docs/mechanism_research/README.md) 与 [综合报告](docs/mechanism_research/synthesis_report.md)。当前已实现范围、单位、验证结果与剩余边界见 [physics_v4 实现总结](docs/IMPLEMENTATION_SUMMARY.md) 和 [A–G 实现映射及验收记录](docs/MECHANISM_IMPLEMENTATION.md)。文献建议不等于已启用的功能；以实现总结和字段契约为准。
 
-本次对 14 个阶段完成文献核对和公式修订。请先阅读 [中文研究与修改总览](docs/PHYSICS_REVIEW_ZH.md)、[验证结果](docs/VALIDATION_RESULTS.md)，以及其中链接的地理、气象、源荷、电网与储能分项报告。
+| 工作包 | 当前实现 |
+|---|---|
+| A–B | 单位/实体/时间契约；小时原始天气、统一湿空气诊断与真实日汇总 |
+| C–D | 独立土地轴、人口/项目用地账；可选小时土壤、河道与湖泊水量账 |
+| E | 共同天气驱动风光与部门负荷，显式热初态、容量因子和能量积分 |
+| F | 固定/事前/oracle 资产模式，岛内调度、SOC、临时故障与备用 |
+| G | 可定位的四态校验、成对机理干预、跨世界比较和结构化生成失败 |
 
-关键变化：气候前置于植被；人口/面积/能量守恒；日小时天气一致；风光转换采用物理模型；负荷考虑日历、温度记忆和以 km 计的空间相关；电源候选数量随负荷规模变化；逐岛电力平衡；储能互斥和显式缺供。配置中的经验权重仍是待校准的场景先验。`source_load_forecast` 是兼容名称，数据代表合成实况，最终调度采用全窗口预知规划。
+配置中的经验权重仍是待校准的场景先验。`source_load_forecast` 是兼容名称，Stage11 数据代表外生合成实况与初步计划；Stage14 的供电、弃电、缺供和储能是运行结果。历史 physics_v3 的 [修改总览](docs/PHYSICS_REVIEW_ZH.md) 与 [验证记录](docs/VALIDATION_RESULTS.md) 保留供追溯。
 
-在仓库根目录 PowerShell 中使用已有的 D 盘 Anaconda：
+在仓库根目录 Git Bash 中使用已有的 D 盘 Anaconda（以下 `python` 均由此 PATH 选择）：
 
-```powershell
-$env:PYTHONDONTWRITEBYTECODE = '1'
-$env:MPLCONFIGDIR = Join-Path $PWD 'outputs/.mplconfig'
-$env:TEMP = Join-Path $PWD 'outputs/.tmp'
-$env:TMP = $env:TEMP
-New-Item -ItemType Directory -Force $env:TEMP | Out-Null
-& D:/anaconda/python.exe -B scripts/generate_static_world.py --config configs/small_debug.yaml --seed 42 --no-figures
-& D:/anaconda/python.exe -B scripts/validate_world_physics.py outputs/small_debug_seed42
+```bash
+export PATH="/d/anaconda:/usr/bin:/bin:$PATH"
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8 PYTHONDONTWRITEBYTECODE=1
+mkdir -p outputs/.mplconfig outputs/.tmp
+export MPLCONFIGDIR="$(cygpath -m "$PWD/outputs/.mplconfig")"
+export TEMP="$(cygpath -m "$PWD/outputs/.tmp")"
+export TMP="$TEMP"
+python -B scripts/generate_static_world.py --config configs/small_debug.yaml --seed 42 --no-figures
+python -B scripts/validate_world_physics.py outputs/small_debug_seed42
 ```
 
 增加 `--start-day 180 --output outputs/summer` 可检查夏季。移除 `--no-figures` 可保留原有分阶段可视化。生成依赖见 [requirements-generator.txt](requirements-generator.txt)，所有运行输出默认位于仓库 `outputs/`。
 
-数据集为 0.6.0，新增未混入储能操作的外生源荷数组，旧字段兼容保留，参见 [字段和预测语义](datasets/DATA_DESCRIPTION.md)。旧版输出必须重新生成；新版缓存恢复会检查物理版本与上游配置。
+数据集 schema 为 **0.10.0**，兼容旧主字段并附加天气诊断、水文状态、外生源荷、初始/冻结资产及运行明细。详见 [字段和预测语义](datasets/DATA_DESCRIPTION.md)。现代恢复要求相应契约、规划输入和资产哈希；缺少必要标记的旧世界须从 Stage1 重新生成。
+
+当前 [requirements-generator.txt](requirements-generator.txt) 覆盖生成、可视化、独立物理验证和 NumPy 数据打包的运行依赖。模型训练依赖另行准备；本次环境缺少可选 `torch_geometric`，未安装，也不将模型测试计入生成器验收。
+
+### 资产模式与信息边界
+
+在配置文件设置 `planning.mode`：
+
+| 模式 | 资产来源 | 运行期间 |
+|---|---|---|
+| `fixed_assets` | 静态生成资产，储能仅由 `planning.fixed_storage_sites` 明确指定，默认无储能 | 不扩容，不按运行周重新选址 |
+| `preplanned` | 独立设计天气/源荷、配置、随机流及时间轴，设计后冻结 | 保留完整运行周，用固定容量调度 |
+| `full_window_planning`（默认） | 使用完整运行实况规划，明确标为 oracle | 允许配置边界内的联合扩容 |
+
+三种模式的调度器当前都使用完整运行窗口，不能据此声称在线预测控制。规划快照、内容哈希和输入边界保存在 `data/planning/`。详见 [资产规划说明](docs/WORK_PACKAGE_F_PLANNING.md)。
+
+### 单位、小时/日支撑与验证
+
+主生成入口使用 1h 区间。天气九通道顺序保留；温度为 °C，RH 为 %，压强为 hPa，风为 m/s，GHI 为区间平均 W/m²，降雨为区间累计 mm。小时导出的真实日统计在 `hourly_daily_summary.npz`；`daily_weather.npz` 是日驱动锚点，不把日均 RH 或标量风速强制等同于由日均原始态重算的诊断。当前无曙暮光/人工照明的太阳模式夜间 GHI 为零。
+
+高程为 m，坡度为 rise/run，曲率为 m⁻¹，汇水面积为 km²；功率为 MW，区间能量为 MW×h 得到的 MWh。SOC/水库存有 T+1 个边界，区间通量有 T 个值。完整来源、形状和时间支撑见各世界 `data/field_contracts.json` 及各附录字段 schema。
+
+```bash
+# 已生成世界的独立检查，输出写在各世界目录中
+python scripts/validate_world_physics.py outputs/small_debug_seed42
+# 同资产、同时间轴、共同随机流的成对机理干预
+python scripts/validate_mechanism_interventions.py --seeds 42 123 --output-dir outputs/validation/interventions
+# 仅当两个世界都已生成时，比较各自检查和描述性统计
+python scripts/validate_world_matrix.py outputs/small_debug_seed42 outputs/small_debug_seed123 --output outputs/validation/world_matrix.json
+```
+
+验证区分 `PASS`、`FAIL`、`NOT_RUN`、`UNSUPPORTED`；PASS 不代表零缺供、现实校准或 AC 安全认证。种子/分辨率比较也不等同于成对因果干预。生成异常在能确定合法世界目录后记录 `generation_failure.json`，保持非零退出；合法 ENS 样本仍可通过物理检查，见 [失败分类说明](docs/WORK_PACKAGE_G_FAILURES.md)。
 
 Project repository: <https://github.com/Hevensh/SimGenr>
 
@@ -34,8 +72,6 @@ For an inspectable single world, run the following commands from the repository 
 with any integer seed:
 
 ```bash
-source /c/ProgramData/miniconda3/etc/profile.d/conda.sh
-conda activate myEnv
 python scripts/generate_static_world.py \
   --config configs/small_debug.yaml \
   --seed 42
@@ -84,6 +120,7 @@ outputs/small_debug_seed42/
 Each output run contains:
 
 - `data/stage_05_weather/`: daily and hourly weather arrays.
+- `data/dynamic_hydrology/`: optional hourly water states, fluxes and budgets.
 - `data/stage_08_energy_sites/`: wind, photovoltaic, and load candidate arrays and metadata.
 - `data/stage_09_grid_buses/`: load, wind, PV, and thermal bus candidates.
 - `data/stage_10_grid_topology/`: integrated static maps, A* topology, and initial electrical parameters.
@@ -91,6 +128,7 @@ Each output run contains:
 - `data/stage_12_grid_update/`: final updated topology, electrical state, and power flow.
 - `data/stage_13_storage_planning/`: storage need analysis and selected sites.
 - `data/stage_14_storage_dispatch/`: final dispatch, expansion, SOC, and network operation.
+- `data/planning/`: independent design inputs when applicable, initial/frozen assets and information-boundary hashes.
 - `data/metadata.json`: world-wide dimensions, module seeds, and summaries.
 - `data/config_snapshot.yaml`: the exact config used for this run.
 - `figures/`: staged visualization outputs for inspection.
@@ -109,11 +147,15 @@ To rerun Stage 13 and all later stages from the cached final Stage 12 state:
 python scripts/generate_static_world.py --config configs/small_debug.yaml --seed 42 --from-stage 13
 ```
 
+In fixed/preplanned modes, Stage13 resume reuses the frozen site plan; it does not select sites from cached operation weather. Changes to their storage configuration currently require Stage1 regeneration. Oracle mode retains Stage13 replanning. Stage14 resume requires unchanged storage settings and verifies the asset boundary.
+
 The batch script forwards the same argument to every configured seed:
 
 ```bash
-bash scripts/generate_all.sh --from-stage 13
+PYTHON_BIN=/d/anaconda/python.exe CONFIGS=configs/small_debug.yaml bash scripts/generate_all.sh --from-stage 13
 ```
+
+The batch script resolves relative config/output paths from the repository root and can be invoked from another directory. Its default config path supports spaces in the checkout path. `CONFIGS="configs/first.yaml configs/second.yaml"` preserves the whitespace-separated multi-config interface; `SEEDS="42 123"` selects seeds.
 
 To retain the existing storage plan and rerun only Stage 14 dispatch:
 
@@ -162,7 +204,7 @@ python scripts/train_physics_gst.py \
   --config configs/models/physics_gst_24to24.yaml
 ```
 
-Stage 14 solves a multi-period DC optimal power flow with bounded investment, nodal active-power balance, line limits, thermal capacity/ramping, storage power/energy limits and exclusive charge/discharge modes. Cyclic SOC is the default; a fixed initial SOC is available. If generation or the network remains insufficient after bounded additions, high-penalty nodal load shedding is explicitly reported. Set `storage.allow_load_shedding: false` to require zero shortfall. This is perfect-foresight planning; a validation PASS confirms physical accounting and constraints, not supply adequacy or empirical realism.
+Stage 14 solves a multi-period DC optimal power flow with mode-dependent investment bounds, nodal active-power balance, line limits, thermal capacity/ramping, storage power/energy limits and exclusive charge/discharge modes. Cyclic SOC is the default; a fixed prior SOC is available. Insufficient supply is explicitly reported as nodal load shedding when allowed. Set `storage.allow_load_shedding: false` to require zero shortfall; an infeasible solve then fails explicitly. Dispatch has full-window foresight in every asset mode. A validation PASS confirms evaluated physical accounting and constraints, not supply adequacy or empirical realism.
 
 Both full and resumed runs show a stage-level `tqdm` progress bar.
 
@@ -206,6 +248,8 @@ The `conditioned_v2` hydrology path fills closed DEM depressions for drainage, i
 ### Stage 03: Static Land
 
 Folder: `outputs/<world_id>/figures/stage_03_static_land/`
+
+`land_cover` remains a legacy mixed display label. The current data also expose independent `landform`, `land_cover_type`, and `protected_mask` axes; protection is not treated as a vegetation class.
 
 - `static_land_overview.png`: overview of land cover, vegetation, protected areas, buildability, and terrain cost.
 - `land_cover.png`: categorical land cover map, including plains, hills, mountains, water, wetlands, and protected land.

@@ -8,8 +8,10 @@ from __future__ import annotations
 import numpy as np
 
 from world_generator.core.contracts import entity_ids, integer_labels
+from scripts.validation_checks import validation_context
 
 
+@validation_context(stage="E_source_load",fields=["source_load.*","hourly_weather.*","refined_grid_buses"],time_support="explicit_check_axis_or_aggregate",engineering_simplification="Engineering wind/PV curves and causal thermal proxy; configured regional priors are not calibrated observations")
 def check_source_load_contracts(checks, source, hourly, config, metadata):
     ids = entity_ids(source["bus_ids"], "source/load bus IDs")
     kinds = np.asarray(source["bus_kinds"])
@@ -51,8 +53,8 @@ def check_source_load_contracts(checks, source, hourly, config, metadata):
         actual = source[prefix + "_energy_mwh"]
         if actual.shape != shape:
             raise ValueError(f"Source/load {prefix} interval energy must be [T,N]")
-        checks.equal("source_load_interval_energy_" + prefix, actual - expected, 1e-7, "MWh")
-        checks.equal("source_load_period_energy_" + prefix, source["period_" + prefix + "_energy_mwh"] - expected.sum(axis=0), 1e-6, "MWh")
+        checks.equal("source_load_interval_energy_" + prefix, actual - expected, 1e-7, "MWh",axes=("time","bus"),timestamps=source["timestamps"],fields=[prefix+"_energy_mwh",power,"time_bounds_hours"],time_support="hour_interval_energy")
+        checks.equal("source_load_period_energy_" + prefix, source["period_" + prefix + "_energy_mwh"] - expected.sum(axis=0), 1e-6, "MWh",axes=("bus",),fields=["period_"+prefix+"_energy_mwh",power],time_support="whole_period_per_bus_aggregate_not_a_time_point")
         energies[prefix + "_mwh"] = float(expected.sum())
     valid = generators & (nameplate > 0)
     checks.condition("source_load_capacity_factor_valid_mask", np.array_equal(source["capacity_factor_valid"], valid))
@@ -81,7 +83,7 @@ def check_source_load_contracts(checks, source, hourly, config, metadata):
         checks.equal("source_load_diagnostic_applicability_" + name, values[:, ~mask], 1e-9, "native")
     wind_mask = kinds == "wind_bus"
     expected_hub_wind = wind[:, wind_mask] * (cfg.wind_hub_height_m / cfg.wind_reference_height_m) ** cfg.wind_shear_exponent
-    checks.equal("source_load_hub_height_wind", source["diag__hub_wind_speed_mps"][:, wind_mask] - expected_hub_wind, 2e-5, "m/s")
+    checks.equal("source_load_hub_height_wind", source["diag__hub_wind_speed_mps"][:, wind_mask] - expected_hub_wind, 2e-5, "m/s",relation_class="E",axes=("time","wind_bus_subset"),timestamps=source["timestamps"],fields=["diag__hub_wind_speed_mps","hourly.wind_speed"],time_support="hour_interval_representative")
     pressure = np.asarray(hourly["dynamic"][:, channels["pressure"], rows, cols], dtype=float) if "pressure" in channels else None
     if not np.any(wind_mask):
         surface_density = np.full(shape, cfg.wind_reference_density_kg_m3)
@@ -105,7 +107,7 @@ def check_source_load_contracts(checks, source, hourly, config, metadata):
                             (cfg.wind_rated_mps**3 - cfg.wind_cut_in_mps**3), 0, 1)
     wind_fraction = np.where((expected_hub_wind >= cfg.wind_cut_in_mps) & (expected_hub_wind < cfg.wind_cut_out_mps), wind_fraction, 0)
     expected_wind_power = nameplate[None, wind_mask] * (1 - cfg.wind_system_loss_fraction) * wind_fraction
-    checks.equal("source_load_wind_engineering_curve", source["p_gen_available_mw"][:, wind_mask] - expected_wind_power, 2e-4, "MW", "continuous density scaling; nominal rated speed at reference density; actual hub speed controls shutdown")
+    checks.equal("source_load_wind_engineering_curve", source["p_gen_available_mw"][:, wind_mask] - expected_wind_power, 2e-4, "MW", "continuous density scaling; nominal rated speed at reference density; actual hub speed controls shutdown",relation_class="E",axes=("time","wind_bus_subset"),timestamps=source["timestamps"],fields=["p_gen_available_mw","diag__hub_wind_speed_mps","diag__wind_air_density_kg_m3"],time_support="hour_interval_mean")
     pv = kinds == "pv_bus"
     poa = np.asarray(source["diag__pv_poa_w_m2"][:, pv], dtype=float)
     ghi = np.asarray(hourly["dynamic"][:, channels["irradiance"], rows, cols], dtype=float)[:, pv]
@@ -113,21 +115,21 @@ def check_source_load_contracts(checks, source, hourly, config, metadata):
     checks.equal("source_load_zero_ghi_zero_poa", poa[ghi == 0], 1e-6, "W/m2")
     module_wind = wind[:, pv] * (cfg.pv_module_height_m / cfg.wind_reference_height_m) ** cfg.pv_wind_shear_exponent
     module_temperature = temperature[:, pv] + poa / (cfg.pv_heat_loss_constant + cfg.pv_heat_loss_wind * module_wind)
-    checks.equal("source_load_pv_module_temperature", source["diag__pv_module_temperature_c"][:, pv] - module_temperature, 2e-5, "degC", "Faiman engineering closure at configured module-height wind")
+    checks.equal("source_load_pv_module_temperature", source["diag__pv_module_temperature_c"][:, pv] - module_temperature, 2e-5, "degC", "Faiman engineering closure at configured module-height wind",relation_class="E",axes=("time","pv_bus_subset"),timestamps=source["timestamps"],fields=["diag__pv_module_temperature_c","diag__pv_poa_w_m2","hourly.temperature","hourly.wind_speed"],time_support="hour_interval_representative")
     expected_pv = np.clip(nameplate[None, pv] * cfg.pv_dc_ac_ratio * poa / 1000 *
                           np.maximum(1 + cfg.pv_temperature_coefficient_per_c * (module_temperature - 25), 0) *
                           (1 - cfg.pv_system_loss_fraction) * cfg.pv_inverter_efficiency, 0, nameplate[None, pv])
-    checks.equal("source_load_pv_ac_conversion", source["p_gen_available_mw"][:, pv] - expected_pv, 2e-4, "MW", "GHI already includes cloud effects; no second cloud multiplier")
+    checks.equal("source_load_pv_ac_conversion", source["p_gen_available_mw"][:, pv] - expected_pv, 2e-4, "MW", "GHI already includes cloud effects; no second cloud multiplier",relation_class="E",axes=("time","pv_bus_subset"),timestamps=source["timestamps"],fields=["p_gen_available_mw","diag__pv_module_temperature_c","diag__pv_poa_w_m2"],time_support="hour_interval_mean")
     initial = np.asarray(source["initial_effective_temperature_c"])
     if initial.shape != (len(ids),) or not np.isfinite(initial).all():
         raise ValueError("Source/load thermal initial boundary must be finite [N]")
     checks.equal("source_load_thermal_initial_applicability", initial[~loads], 1e-9, "degC")
     expected_initial = temperature[0, loads] if cfg.load_initial_temperature_mode == "first_hour" else cfg.load_initial_temperature_c
-    checks.equal("source_load_thermal_initial_configuration", initial[loads] - expected_initial, 1e-5, "degC")
+    checks.equal("source_load_thermal_initial_configuration", initial[loads] - expected_initial, 1e-5, "degC",relation_class="S",axes=("load_bus_subset",),time_point=source["timestamps"][0],time_support="initial_boundary",fields=["initial_effective_temperature_c"])
     effective = source["diag__load_effective_temperature_c"][:, loads]
     previous = np.concatenate((initial[None, loads], effective[:-1]), axis=0)
     decay = np.exp(-dt / cfg.load_thermal_memory_hours) if cfg.load_thermal_memory_hours > 0 else np.zeros_like(dt)
-    checks.equal("source_load_thermal_memory_recursion", effective - decay * previous - (1 - decay) * temperature[:, loads], 1e-5, "degC", "T end states plus explicit pre-window boundary")
+    checks.equal("source_load_thermal_memory_recursion", effective - decay * previous - (1 - decay) * temperature[:, loads], 1e-5, "degC", "T end states plus explicit pre-window boundary",relation_class="E",axes=("time","load_bus_subset"),timestamps=source["timestamps"]+1,time_support="interval_end_thermal_state",fields=["diag__load_effective_temperature_c","initial_effective_temperature_c","hourly.temperature"])
     # Design peak is an asset descriptor, not permission to remove requested load.
     utilization = np.divide(source["p_load_mw"][:, loads], nameplate[None, loads], out=np.zeros((shape[0], int(loads.sum()))), where=nameplate[None, loads] > 0)
     return {**energies, "max_requested_load_design_utilization": float(np.max(utilization, initial=0)),

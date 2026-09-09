@@ -688,6 +688,16 @@ class PlanningConfig:
 
 
 @dataclass(frozen=True)
+class ValidationConfig:
+    """Diagnostic presentation only; physical tolerances remain with each mechanism."""
+    max_failure_locations: int = 5
+
+    def __post_init__(self) -> None:
+        if isinstance(self.max_failure_locations,bool) or not isinstance(self.max_failure_locations,int) or not 0 <= self.max_failure_locations <= 1000:
+            raise ValueError("validation.max_failure_locations must be an integer in [0,1000]")
+
+
+@dataclass(frozen=True)
 class WorldConfig:
     seed: int = 42
     world: WorldGridConfig = field(default_factory=WorldGridConfig)
@@ -706,6 +716,7 @@ class WorldConfig:
     contracts: ContractConfig = field(default_factory=ContractConfig)
     hydrology_dynamic: HydrologyDynamicConfig = field(default_factory=HydrologyDynamicConfig)
     planning: PlanningConfig = field(default_factory=PlanningConfig)
+    validation: ValidationConfig = field(default_factory=ValidationConfig)
 
     def __post_init__(self) -> None:
         # P: capacities cannot be negative; do not silently clip bad scenarios.
@@ -744,6 +755,7 @@ def load_world_config(path: str | Path) -> WorldConfig:
         output=OutputConfig(**data.get("output", {})),
         contracts=ContractConfig(**data.get("contracts", {})),
         planning=PlanningConfig(**data.get("planning", {})),
+        validation=ValidationConfig(**data.get("validation", {})),
         hydrology_dynamic=HydrologyDynamicConfig(**data.get("hydrology_dynamic", {})),
     )
 

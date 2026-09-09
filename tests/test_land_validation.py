@@ -100,7 +100,10 @@ def test_zero_energy_projects_preserve_unused_area_instead_of_losing_land():
     candidates["energy_project_land_ledger"] = np.empty((0, 9))
     candidates["energy_project_area_by_cell_km2"] = np.empty((0, 2, 2))
     rows, summary = _run((static, candidates, metadata, config))
-    assert all(row["passed"] for row in rows.values())
+    assert all(row["status"] != "FAIL" for row in rows.values())
+    assert rows["energy_cell_area_budget"]["status"] == "PASS"
+    assert rows["wind_project_config_density"]["status"] == "NOT_RUN"
+    assert rows["pv_project_config_density"]["status"] == "NOT_RUN"
     assert summary["unallocated_energy_area_km2"] == 2
 
 

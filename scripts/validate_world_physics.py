@@ -24,6 +24,7 @@ from world_generator.weather.physics import diagnose_moist_air, saturation_vapor
 from scripts.hydrology_validation import check_dynamic_hydrology
 from scripts.source_load_validation import check_source_load_contracts
 from scripts.operation_validation import check_operation_contracts, check_frozen_asset_contracts
+from scripts.validation_checks import Checks, input_error_report, validation_context
 
 
 def _npz(path: Path) -> dict[str, np.ndarray]:
@@ -39,31 +40,7 @@ def _positive_max(values: np.ndarray) -> float:
     return float(np.max(values, initial=0.0))
 
 
-class Checks:
-    def __init__(self) -> None:
-        self.rows: list[dict[str, object]] = []
-
-    def equal(self, name: str, residual: np.ndarray, tolerance: float, unit: str = "", note: str = "",
-              *, relative_tolerance: float = 0.0, scale: np.ndarray | float = 0.0) -> None:
-        values = np.asarray(residual, dtype=np.float64)
-        allowed = tolerance + relative_tolerance * np.abs(np.asarray(scale, dtype=np.float64))
-        if tolerance < 0 or relative_tolerance < 0 or not np.isfinite(allowed).all():
-            raise ValueError("Check tolerances and scales must be finite and nonnegative")
-        error = _max_abs(values)
-        self.rows.append({"name": name, "passed": bool(np.isfinite(values).all() and np.all(np.abs(values) <= allowed)),
-                          "max_error": error, "tolerance": tolerance, "relative_tolerance": relative_tolerance,
-                          "unit": unit, "note": note})
-
-    def upper(self, name: str, values: np.ndarray, upper: np.ndarray | float, tolerance: float, unit: str = "", note: str = "") -> None:
-        residual = np.asarray(values, dtype=np.float64) - upper
-        error = _positive_max(residual)
-        self.rows.append({"name": name, "passed": bool(np.isfinite(residual).all() and error <= tolerance),
-                          "max_error": error, "tolerance": tolerance, "unit": unit, "note": note})
-
-    def condition(self, name: str, passed: bool, note: str = "") -> None:
-        self.rows.append({"name": name, "passed": bool(passed), "note": note})
-
-
+@validation_context(stage="B_weather",fields=["daily_weather.dynamic","hourly_weather.dynamic","hourly_daily_summary.dynamic"],engineering_simplification="Synthetic local-solar weather; hydrostatic and no-twilight identities, not empirical calibration")
 def check_weather_contracts(checks: Checks, daily: dict[str, np.ndarray], hourly: dict[str, np.ndarray],
                             config: object, daily_summary: dict[str, np.ndarray] | None = None) -> None:
     """B: independently aggregate outputs and enforce only declared anchor constraints.
@@ -159,6 +136,7 @@ def check_weather_contracts(checks: Checks, daily: dict[str, np.ndarray], hourly
         checks.condition("positive_moist_air_density", bool(np.all(hourly["diagnostic__air_density_kg_m3"] > 0)))
 
 
+@validation_context(stage="C_land_city_energy",fields=["land_use_fraction_*","population_density","energy_project_land_ledger"],time_support="static_or_spatial_aggregate",engineering_simplification="Exclusive project envelopes and configured land allocation; area and population accounting")
 def check_land_accounting(checks: Checks, static: dict[str, np.ndarray],
                           candidates: dict[str, np.ndarray], metadata: dict[str, object],
                           config: object) -> dict[str, float]:
@@ -283,6 +261,7 @@ def check_land_accounting(checks: Checks, static: dict[str, np.ndarray],
             "target_population_persons": target_population}
 
 
+@validation_context(stage="C_stage09_thermal_land",fields=["thermal_land_ledger","thermal_project_area_by_cell_km2"],time_support="static_or_spatial_aggregate",engineering_simplification="Configured thermal land density and exclusive envelopes")
 def check_thermal_land(checks: Checks, static: dict[str, np.ndarray], nodes: dict[str, np.ndarray],
                        metadata: dict[str, object], config: object) -> dict[str, float]:
     """C: Stage 09 thermal footprints consume only the Stage 08 remaining area."""
@@ -339,6 +318,20 @@ def check_thermal_land(checks: Checks, static: dict[str, np.ndarray], nodes: dic
 
 def validate_world(world_dir: Path) -> dict[str, object]:
     world_dir = world_dir.resolve()
+    failure_marker = world_dir / "generation_failure.json"
+    if failure_marker.exists():
+        try:
+            failure = json.loads(failure_marker.read_text(encoding="utf-8"))
+        except (OSError,ValueError) as exc:
+            return input_error_report(world_dir.name,ValueError(f"Unreadable generation_failure.json; old artifacts cannot be validated: {exc}"))
+        if not isinstance(failure,dict):
+            return input_error_report(world_dir.name,ValueError("Invalid generation_failure.json; old artifacts cannot be validated"))
+        report = input_error_report(world_dir.name,ValueError("Latest generation failed; stale artifacts were not validated: " + str(failure.get("message","failure marker present"))))
+        report["generation_failure"] = failure
+        report["error_category"] = failure.get("category","INPUT_OR_GENERATION_ERROR")
+        report["checks"][0].update(name="latest_generation_failed",stage=failure.get("stage","generation"),fields=["generation_failure.json"],error_category=report["error_category"])
+        report["limitations"] = "Generation failure marker is authoritative until a successful rerun clears it. Existing data were not validated."
+        return report
     layout = WorldDataLayout(world_dir / "data")
     config = load_world_config(layout.config_snapshot)
     metadata = json.loads(layout.metadata.read_text(encoding="utf-8"))
@@ -353,10 +346,11 @@ def validate_world(world_dir: Path) -> dict[str, object]:
         "electrical": layout.existing(layout.storage_dispatch, "storage_dispatch_electrical.npz", layout.root / "storage_dispatch_electrical.npz"),
     }
     data = {name: _npz(path) for name, path in paths.items()}
-    checks = Checks()
+    checks = Checks(max_failure_locations=config.validation.max_failure_locations)
+    checks.set_context(stage="input_alignment",fields=["exported_artifacts"],relation_class="S",engineering_simplification="Input schema/finite-value checks; no physical feasibility claim")
     for artifact, arrays in data.items():
         invalid = [name for name, values in arrays.items() if values.dtype.kind in "fc" and not np.isfinite(values).all()]
-        checks.condition(f"finite_{artifact}", not invalid, ", ".join(invalid))
+        checks.condition(f"finite_{artifact}", not invalid, ", ".join(invalid),fields=[f"{artifact}.{name}" for name in (invalid or arrays.keys())])
     static, daily, hourly = data["static"], data["daily"], data["hourly"]
     source, storage, dispatch, flow, electrical = (data[key] for key in ("source", "storage", "dispatch", "flow", "electrical"))
     stamps = hourly["timestamps"].astype(np.int64)
@@ -365,10 +359,11 @@ def validate_world(world_dir: Path) -> dict[str, object]:
     for name in ("source", "storage", "dispatch", "flow"):
         checks.condition(f"timestamps_match_{name}", np.array_equal(data[name]["timestamps"], stamps))
 
+    checks.set_context(stage="C_static_population",fields=["population_density","cities.population"],relation_class="P",time_support="static_or_domain_aggregate",engineering_simplification="Area integral of whole-cell population density")
     population = float(np.sum(static["population_density"], dtype=np.float64) * config.world.cell_size_km**2)
     city_population = float(sum(city["population"] for city in metadata["cities"]))
     checks.equal("population_mass", np.asarray(population - city_population), max(0.1, city_population * 2e-6), "persons")
-    checks.upper("population_nonnegative", -static["population_density"], 0.0, 1e-7, "persons/km2")
+    checks.upper("population_nonnegative", -static["population_density"], 0.0, 1e-7, "persons/km2",axes=("row","col"))
     if "catchment_area_km2" in static:
         checks.equal("static_catchment_physical_area", static["catchment_area_km2"] - static["flow_accumulation"] * config.world.cell_size_km**2,
                      1e-6, "km2", "legacy upstream cell count converted to physical area; never interpreted as current discharge")
@@ -377,6 +372,8 @@ def validate_world(world_dir: Path) -> dict[str, object]:
     if metadata.get("land_accounting_version") == "land_use_v1":
         land_summary = check_land_accounting(checks, static, _npz(layout.energy / "source_load_candidates.npz"), metadata, config)
         land_summary.update(check_thermal_land(checks, static, _npz(layout.buses / "grid_nodes.npz"), metadata, config))
+    else:
+        checks.status("independent_land_area_accounting","NOT_RUN","Legacy world has no complete C land accounting declaration",stage="C_land_city_energy",fields=["land_accounting_version"])
 
     daily_summary_path = layout.weather / "hourly_daily_summary.npz"
     daily_summary = _npz(daily_summary_path) if daily_summary_path.exists() else None
@@ -387,10 +384,14 @@ def validate_world(world_dir: Path) -> dict[str, object]:
         from world_generator.operation.stage_cache import load_dynamic_hydrology_checkpoint
         hydro = load_dynamic_hydrology_checkpoint(world_dir, expected_timestamps=hourly["timestamps"],
                                                    expected_grid_shape=(config.world.height, config.world.width))
-        checks.condition("hydrology_mode_matches_configuration", (hydro is not None) == config.hydrology_dynamic.enabled)
+        checks.condition("hydrology_mode_matches_configuration", (hydro is not None) == config.hydrology_dynamic.enabled,stage="D_dynamic_hydrology",fields=["dynamic_hydrology","hydrology_dynamic.enabled"],relation_class="S")
         hydrology_summary = {"mode": "static_only", "dynamic_water_balance": "NOT_RUN"}
         if hydro is not None:
             hydrology_summary = check_dynamic_hydrology(checks, hydro.as_arrays(), hourly, static, config)
+        else:
+            checks.status("dynamic_water_balance","NOT_RUN","Dynamic hydrology is disabled; static drainage geometry is not simulated flow",stage="D_dynamic_hydrology",fields=["hydrology_dynamic.enabled"])
+    else:
+        checks.status("dynamic_water_balance","NOT_RUN","Legacy output has no dynamic hydrology process",stage="D_dynamic_hydrology",fields=["dynamic_hydrology"])
 
     source_ids = source["bus_ids"].astype(int)
     source_kinds = np.asarray(source["bus_kinds"])
@@ -400,7 +401,8 @@ def validate_world(world_dir: Path) -> dict[str, object]:
         from world_generator.core.datatypes import SourceLoadForecastStore
         SourceLoadForecastStore.from_arrays(source)
         source_load_summary = check_source_load_contracts(checks, source, hourly, config, metadata)
-    checks.upper("exogenous_load_nonnegative", -source["p_load_mw"], 0.0, 1e-6, "MW")
+    checks.set_context(stage="E_source_load",fields=["source.p_load_mw","source.p_gen_available_mw"],relation_class="P",time_support="hour_interval_mean",engineering_simplification="Synthetic exogenous request and equipment availability; not delivered power")
+    checks.upper("exogenous_load_nonnegative", -source["p_load_mw"], 0.0, 1e-6, "MW",axes=("time","bus"),timestamps=stamps)
     checks.upper("exogenous_availability_nonnegative", -source["p_gen_available_mw"], 0.0, 1e-6, "MW")
     capacity_factors: dict[str, float | None] = {}
     for kind in ("wind_bus", "pv_bus"):
@@ -410,6 +412,7 @@ def validate_world(world_dir: Path) -> dict[str, object]:
         checks.upper(f"{kind}_ac_capacity", availability, capacities[None, :], 1e-4, "MW")
         capacity_factors[kind] = float(availability.sum() / (hours * capacities.sum())) if capacities.sum() > 0 else None
 
+    checks.set_context(stage="F_lossless_DC",fields=["flow.line_flow_mw","flow.bus_p_injection_mw","dispatch.p_load_mw"],time_support="hour_interval_mean",engineering_simplification="Lossless DC network; no AC voltage, reactive power or frequency dynamics")
     bus_ids, branch_ids = flow["bus_ids"].astype(int), flow["branch_ids"].astype(int)
     bus_index = {int(bus_id): index for index, bus_id in enumerate(bus_ids)}
     checks.condition("unique_final_bus_ids", len(bus_index) == len(bus_ids))
@@ -436,8 +439,8 @@ def validate_world(world_dir: Path) -> dict[str, object]:
         row = branches[int(branch_id)]
         incidence[bus_index[int(row[1])], edge_position] = 1.0
         incidence[bus_index[int(row[2])], edge_position] = -1.0
-    checks.equal("kcl_incidence", flow["line_flow_mw"].astype(np.float64) @ incidence.T - flow["bus_p_injection_mw"], 2e-3, "MW")
-    checks.equal("kcl_global_balance", flow["bus_p_injection_mw"].sum(axis=1, dtype=np.float64), 2e-3, "MW")
+    checks.equal("kcl_incidence", flow["line_flow_mw"].astype(np.float64) @ incidence.T - flow["bus_p_injection_mw"], 2e-3, "MW",axes=("time","bus"),timestamps=stamps)
+    checks.equal("kcl_global_balance", flow["bus_p_injection_mw"].sum(axis=1, dtype=np.float64), 2e-3, "MW",axes=("time",),timestamps=stamps)
     checks.equal("injection_matches_served_dispatch", flow["bus_p_injection_mw"] - (flow["dispatched_generation_mw"] - flow["served_load_mw"]), 2e-3, "MW")
     checks.equal("requested_load_equals_served_plus_unserved", dispatch["p_load_mw"] - flow["served_load_mw"] - flow["unserved_load_mw"], 2e-3, "MW", "includes requested storage charging; shortfall remains at its optimized bus")
     checks.upper("served_load_nonnegative", -flow["served_load_mw"], 0.0, 1e-6, "MW")
@@ -446,8 +449,9 @@ def validate_world(world_dir: Path) -> dict[str, object]:
     if not config.storage.allow_load_shedding:
         checks.equal("strict_zero_unserved_load", flow["unserved_load_mw"], 2e-3, "MW")
     rates = np.asarray([branches[int(branch_id)][8] for branch_id in branch_ids])
-    checks.upper("line_operating_limit", np.abs(flow["line_flow_mw"]), config.storage.line_operating_limit_ratio * rates[None, :], 2e-3, "MW")
+    checks.upper("line_operating_limit", np.abs(flow["line_flow_mw"]), config.storage.line_operating_limit_ratio * rates[None, :], 2e-3, "MW",axes=("time","branch"),timestamps=stamps)
 
+    checks.set_context(stage="F_storage",fields=["storage.charge_mw","storage.discharge_mw","storage.soc_mwh"],time_support="explicit_interval_or_boundary_by_check",engineering_simplification="Lumped battery efficiencies and configured inverter/C-rate/ramp limits")
     charge = storage["charge_mw"].astype(np.float64)
     discharge = storage["discharge_mw"].astype(np.float64)
     emergency = storage["emergency_discharge_mw"].astype(np.float64)
@@ -456,9 +460,9 @@ def validate_world(world_dir: Path) -> dict[str, object]:
     power_capacity = storage["site_power_capacity_mw"].astype(np.float64)
     checks.condition("soc_terminal_boundary", soc.shape == (hours + 1, charge.shape[1]))
     # Exported discharge already includes emergency; never count it twice.
-    checks.equal("soc_energy_conservation", np.diff(soc, axis=0) - config.storage.charge_efficiency * charge + discharge / config.storage.discharge_efficiency, 2e-3, "MWh")
-    checks.upper("soc_lower_bound", config.storage.minimum_soc_fraction * energy_capacity[None, :] - soc, 0.0, 2e-3, "MWh")
-    checks.upper("soc_upper_bound", soc, config.storage.maximum_soc_fraction * energy_capacity[None, :], 2e-3, "MWh")
+    checks.equal("soc_energy_conservation", np.diff(soc, axis=0) - config.storage.charge_efficiency * charge + discharge / config.storage.discharge_efficiency, 2e-3, "MWh",axes=("time","storage_site"),timestamps=stamps,time_support="hour_interval_energy_balance")
+    checks.upper("soc_lower_bound", config.storage.minimum_soc_fraction * energy_capacity[None, :] - soc, 0.0, 2e-3, "MWh",axes=("state_time","storage_site"),timestamps=np.r_[stamps,stamps[-1]+1],time_support="T_plus_1_boundary_state")
+    checks.upper("soc_upper_bound", soc, config.storage.maximum_soc_fraction * energy_capacity[None, :], 2e-3, "MWh",axes=("state_time","storage_site"),timestamps=np.r_[stamps,stamps[-1]+1],time_support="T_plus_1_boundary_state")
     if config.storage.cyclic_state_of_charge:
         checks.equal("soc_cycle_closure", soc[-1] - soc[0], 2e-3, "MWh")
     elif "op__initial_soc_mwh" in storage:
@@ -476,6 +480,7 @@ def validate_world(world_dir: Path) -> dict[str, object]:
     storage_ramps = net_storage - np.roll(net_storage, 1, axis=0) if config.storage.cyclic_state_of_charge else np.diff(net_storage, axis=0)
     checks.upper("storage_ramp_including_emergency", np.abs(storage_ramps), config.storage.storage_power_ramp_fraction_per_hour * power_capacity[None, :], 2e-3, "MW/hour")
 
+    checks.set_context(stage="F_thermal_operation",fields=["flow.dispatched_generation_mw","storage.thermal_bus_ids","electrical.electrical_buses"],time_support="hour_interval_or_ramp",engineering_simplification="Configured nameplate and ramp constraints; no unit commitment or combustion dynamics")
     thermal_ids = storage["thermal_bus_ids"].astype(int)
     thermal_positions = [bus_index[int(bus_id)] for bus_id in thermal_ids]
     thermal_capacity = np.asarray([buses_electrical[int(bus_id)][2] for bus_id in thermal_ids])
@@ -494,10 +499,18 @@ def validate_world(world_dir: Path) -> dict[str, object]:
             _npz(layout.buses / "grid_nodes.npz").get("thermal_land_ledger"))
         operation_summary["asset_boundary"] = check_frozen_asset_contracts(checks, world_dir, storage, flow, electrical, config)
 
+    for name,note in (
+        ("AC_voltage_reactive_power","DC equations do not solve voltage magnitudes or reactive power"),
+        ("frequency_stability","No inertia, governor or transient frequency process is simulated"),
+        ("reserve_activation_network_deliverability","Island aggregate held reserve does not certify post-activation network flows"),
+        ("empirical_regional_calibration","No observed regional data were fitted; scenario validity is not empirical calibration"),
+    ):
+        checks.status(name,"UNSUPPORTED",note,stage="validation_scope",fields=[name],relation_class="S",time_support="not_applicable_unsupported",engineering_simplification=note)
+    validation_scope = checks.summary()
     return {
         "world": world_dir.name, "generator_version": metadata.get("generator_version", "unspecified"),
         "scenario_semantics": metadata.get("scenario_semantics", "unspecified"),
-        "passed": all(row["passed"] for row in checks.rows), "checks": checks.rows,
+        "passed": validation_scope["passed"], "status":validation_scope["status"],"validation_scope":validation_scope,"checks": checks.rows,
         "summary": {"hours": hours, "population_persons": population, "city_population_persons": city_population,
                     "capacity_factors_descriptive_only": capacity_factors,
                     "peak_exogenous_load_mw": float(source["p_load_mw"].sum(axis=1).max(initial=0.0)),
@@ -521,19 +534,23 @@ def _safe_json(value: object) -> object:
 
 
 def _markdown(report: dict[str, object]) -> str:
-    rows = [f"# Physics validation: {report['world']}", "", f"Result: **{'PASS' if report['passed'] else 'FAIL'}**", ""]
+    rows = [f"# Physics validation: {report['world']}", "", f"Result: **{report.get('status','PASS' if report['passed'] else 'FAIL')}**", "",
+            "Result covers evaluated supported constraints only; UNSUPPORTED and NOT_RUN are not physical certification.",""]
+    if report.get("error_category"):
+        rows.extend([f"Error category: **{report['error_category']}**",""])
     summary = report.get("summary", {})
     if summary:
         rows.extend([
             f"Unserved energy: **{summary['total_unserved_mwh']:.6g} MWh**; curtailed generation: **{summary['total_curtailed_mwh']:.6g} MWh**.",
             "A physical-constraint PASS does not imply zero supply shortfall.", "",
         ])
-    rows.extend(["| Check | Result | Maximum error / violation | Tolerance |", "|---|---|---:|---:|"])
+    rows.extend(["| Check | Result | Raw max / excess violation | Location / time | Stage |", "|---|---|---:|---|---|"])
     for check in report["checks"]:
-        error = check.get("max_error")
-        error_text = f"{error:.6g} {check.get('unit', '')}" if isinstance(error, (int, float)) else "—"
-        tolerance = check.get("tolerance", "—")
-        rows.append(f"| {check['name']} | {'PASS' if check['passed'] else 'FAIL'} | {error_text} | {tolerance} |")
+        error,violation = check.get("max_residual"),check.get("max_violation")
+        number = lambda value:f"{value:.6g}" if isinstance(value,(int,float)) else "—"
+        error_text = f"{number(error)} / {number(violation)} {check.get('unit','')}"
+        location = json.dumps({"raw":check.get("raw_max_location"),"violation":check.get("max_violation_location"),"time":check.get("time")},ensure_ascii=False)
+        rows.append(f"| {check['name']} | {check.get('status','PASS' if check['passed'] else 'FAIL')} | {error_text} | {location} | {check.get('stage','unspecified')} |")
     rows.extend(["", str(report.get("limitations", "")), ""])
     return "\n".join(rows)
 
@@ -551,12 +568,12 @@ def main() -> int:
             continue
         try:
             report = validate_world(world_dir)
-        except (KeyError, ValueError, FileNotFoundError, IndexError) as exc:
-            report = {"world": world_dir.name, "passed": False, "checks": [{"name": "read_and_align_inputs", "passed": False, "note": str(exc)}], "limitations": str(exc)}
+        except (KeyError, ValueError, OSError, IndexError, TypeError) as exc:
+            report = input_error_report(world_dir.name,exc)
         report = _safe_json(report)
         (world_dir / "physics_validation.json").write_text(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
         (world_dir / "physics_validation.md").write_text(_markdown(report), encoding="utf-8")
-        print(f"{world_dir.name}: {'PASS' if report['passed'] else 'FAIL'} ({len(report['checks'])} checks)")
+        print(f"{world_dir.name}: {report.get('status','PASS' if report['passed'] else 'FAIL')} ({len(report['checks'])} checks; {report.get('validation_scope',{}).get('counts',{})})")
         passed &= bool(report["passed"])
     return 0 if passed else 1
 

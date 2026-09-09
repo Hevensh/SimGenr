@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import json
 import numpy as np
+from scripts.validation_checks import validation_context
 
 
+@validation_context(stage="F_operation",fields=["storage.op__*","flow.*","source_load.*","electrical.*"],time_support="explicit_check_axis_or_aggregate",engineering_simplification="Lossless DC and island-aggregate reserve with configured service/ramp rules; no AC/frequency or reserve activation proof")
 def check_operation_contracts(checks, storage, flow, electrical, source, config, thermal_ledger=None):
     from world_generator.core.datatypes import StorageDispatchStore, PowerFlowStore
     StorageDispatchStore.from_arrays(storage)
@@ -26,15 +28,15 @@ def check_operation_contracts(checks, storage, flow, electrical, source, config,
     meta = json.loads(str(storage["operation_metadata_json"]))
     tol = 2e-3  # float32 legacy powers / MWh, not a relaxation of solver limits
 
-    def eq(name, value, unit="MW", tolerance=tol):
-        checks.equal("operation_" + name, value, tolerance, unit)
+    def eq(name, value, unit="MW", tolerance=tol, **annotations):
+        checks.equal("operation_" + name, value, tolerance, unit, **annotations)
 
-    def upper(name, value, limit, unit="MW", tolerance=tol):
-        checks.upper("operation_" + name, value, limit, tolerance, unit)
+    def upper(name, value, limit, unit="MW", tolerance=tol, **annotations):
+        checks.upper("operation_" + name, value, limit, tolerance, unit, **annotations)
 
     checks.condition("operation_bus_axis", np.array_equal(ids, flow["bus_ids"]))
     checks.condition("operation_branch_axis", np.array_equal(storage["branch_ids"], flow["branch_ids"]))
-    eq("served_plus_unserved", op["served_load_mw"] + op["unserved_load_mw"] - op["requested_load_mw"])
+    eq("served_plus_unserved", op["served_load_mw"] + op["unserved_load_mw"] - op["requested_load_mw"],axes=("time","bus"),timestamps=storage["timestamps"],fields=["op__served_load_mw","op__unserved_load_mw","op__requested_load_mw"],time_support="hour_interval_mean")
     unserved_total = op["unserved_load_mw"].sum(axis=1)
     checks.equal("operation_unserved_not_hidden_in_summary", storage["dispatched_unserved_mw"] - unserved_total,
                  1e-7, "MW", relative_tolerance=5e-7, scale=unserved_total)
@@ -108,7 +110,7 @@ def check_operation_contracts(checks, storage, flow, electrical, source, config,
     eq("inactive_branch_zero_flow", np.where(enabled, 0, flow["line_flow_mw"]))
     expected_island = np.zeros((hours, len(ids)), dtype=int)
     expected_requirement = np.zeros((hours, len(ids)))
-    balance, reserve_balance = [], []
+    balance, reserve_balance, island_times = [], [], []
     for t in range(hours):
         parent = list(range(len(ids)))
 
@@ -134,19 +136,20 @@ def check_operation_contracts(checks, storage, flow, electrical, source, config,
             anchor = members[np.argmin(ids[members])]
             expected_requirement[t, anchor] = need
             balance.append(flow["bus_p_injection_mw"][t, members].sum())
+            island_times.append(storage["timestamps"][t])
             provided = sr[t, np.isin(sites, members)].sum() + tr[t, np.isin(thermal, members)].sum()
             reserve_balance.append(need - provided - op["reserve_shortfall_mw"][t, members].sum())
     eq("island_labels_connectivity", op["island_id"] - expected_island, "id", 0)
     eq("island_labels_flow_agreement", flow["op__island_id"] - expected_island, "id", 0)
-    eq("each_active_island_balance", np.asarray(balance))
-    eq("reserve_requirement_configuration", op["reserve_requirement_mw"] - expected_requirement)
-    upper("each_island_reserve_adequacy_or_shortfall", np.asarray(reserve_balance), 0)
+    eq("each_active_island_balance", np.asarray(balance),axes=("time",),timestamps=np.asarray(island_times),fields=["op__island_id","bus_p_injection_mw"],time_support="explicit_island_hour_observations_repeated_hour_values")
+    eq("reserve_requirement_configuration", op["reserve_requirement_mw"] - expected_requirement,relation_class="S",axes=("time","bus"),timestamps=storage["timestamps"],fields=["op__reserve_requirement_mw","op__requested_load_mw","op__island_id"],time_support="hour_interval_reserve_rule")
+    upper("each_island_reserve_adequacy_or_shortfall", np.asarray(reserve_balance), 0,axes=("time",),timestamps=np.asarray(island_times),fields=["op__storage_reserve_mw","op__thermal_reserve_mw","op__reserve_shortfall_mw","op__reserve_requirement_mw"],time_support="explicit_island_hour_observations_repeated_hour_values")
     upper("reserve_shortfall_within_requirement", op["reserve_shortfall_mw"], expected_requirement)
     angle_flow = np.zeros_like(flow["line_flow_mw"], dtype=float)
     for e, row in enumerate(ordered):
         a, b = index[int(row[1])], index[int(row[2])]
         angle_flow[:, e] = enabled[:, e] * row[3] ** 2 / row[6] * (flow["bus_angle_rad"][:, a] - flow["bus_angle_rad"][:, b])
-    eq("dc_angle_flow_relation", flow["line_flow_mw"] - angle_flow)
+    eq("dc_angle_flow_relation", flow["line_flow_mw"] - angle_flow,axes=("time","branch"),timestamps=storage["timestamps"],fields=["line_flow_mw","bus_angle_rad","op__branch_in_service","electrical_branches"],time_support="hour_interval_DC_state")
     if getattr(config, "planning", None) and config.planning.mode != "full_window_planning":
         for name in ("storage_power_expansion_mw", "storage_energy_expansion_mwh", "thermal_capacity_expansion_mw", "line_capacity_expansion_mva"):
             eq("fixed_assets_zero_" + name, storage[name], "MWh" if "mwh" in name else "MW", 1e-6)
@@ -159,6 +162,7 @@ def check_operation_contracts(checks, storage, flow, electrical, source, config,
             "inactive_branch_hours": int((~enabled).sum()), "metadata": meta}
 
 
+@validation_context(stage="F_asset_planning_boundary",fields=["initial_assets.*","frozen_assets.*","asset_boundary.json"],time_support="fixed_asset_and_information_boundary",relation_class="S",engineering_simplification="Configured fixed/preplanned/oracle information policy; content hashes and fixed identity checks")
 def check_frozen_asset_contracts(checks, world_dir, storage, flow, electrical, config):
     from world_generator.operation.stage_cache import load_asset_boundary_checkpoint
     boundary = load_asset_boundary_checkpoint(world_dir, expected_timestamps=storage["timestamps"],

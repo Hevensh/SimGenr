@@ -124,10 +124,12 @@ def build_dataset(
     partitions: dict[int, str] | None = None,
     show_progress: bool = True,
 ) -> dict[str, object]:
+    world_paths = [Path(world_dir) for world_dir in world_dirs]
+    for world_dir in world_paths:
+        _reject_failed_generation(world_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     sample_root = output_dir / "samples"
     sample_root.mkdir(parents=True, exist_ok=True)
-    world_paths = [Path(world_dir) for world_dir in world_dirs]
     iterator = tqdm(
         world_paths,
         desc="Packaging dataset",
@@ -156,12 +158,18 @@ def build_dataset(
     return manifest
 
 
+def _reject_failed_generation(world_dir: Path) -> None:
+    if (world_dir / "generation_failure.json").exists():
+        raise ValueError(f"Cannot package failed generation {world_dir}: generation_failure.json is present; rerun generation successfully before using remaining artifacts")
+
+
 def package_world(
     world_dir: Path,
     sample_root: Path,
     *,
     partitions: dict[int, str] | None = None,
 ) -> dict[str, object]:
+    _reject_failed_generation(world_dir)
     data_dir = world_dir / "data"
     layout = WorldDataLayout(data_dir)
     world_metadata = json.loads(layout.metadata.read_text(encoding="utf-8")) if layout.metadata.exists() else {}

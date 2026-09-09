@@ -53,7 +53,11 @@ def _run(args):
 
 def test_analytic_closed_bucket_conserves_local_rain_volume():
     rows, summary = _run(_example())
-    assert all(row["passed"] for row in rows.values()), [r for r in rows.values() if not r["passed"]]
+    assert all(row["status"] != "FAIL" for row in rows.values()), [r for r in rows.values() if r["status"] == "FAIL"]
+    assert rows["hydrology_cell_water_balance"]["status"] == "PASS"
+    assert rows["hydrology_domain_interval_balance"]["status"] == "PASS"
+    assert rows["hydrology_lake_bed_static_anchor"]["status"] == "NOT_RUN"
+    assert rows["hydrology_lake_spill_level"]["status"] == "NOT_RUN"
     assert summary["precipitation_m3"] == 4000
     assert summary["final_storage_m3"] == 4000
     assert summary["boundary_outflow_m3"] == 0

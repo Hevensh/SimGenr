@@ -6,6 +6,7 @@ import numpy as np
 
 from world_generator.core.config import StorageConfig
 from world_generator.core.contracts import entity_ids, interval_bounds_hours
+from world_generator.core.errors import PhysicalInfeasibilityError, SolverError
 from world_generator.core.datatypes import (
     GridElectricalState,
     PowerFlowStore,
@@ -41,7 +42,7 @@ def dispatch_storage_week(
         from scipy.optimize import linprog
         from scipy.sparse import coo_matrix
     except ImportError as exc:  # pragma: no cover - environment dependency
-        raise RuntimeError("Stage 14 physical planning requires scipy.optimize.linprog") from exc
+        raise SolverError("Stage 14 physical planning requires scipy.optimize.linprog", stage="stage_14_dispatch") from exc
 
     bus_ids = entity_ids(np.asarray([bus.bus_id for bus in topology.refined_buses]), "operating bus_ids").astype(np.int32)
     hours, bus_count = len(baseline_power_flow.timestamps), len(bus_ids)
@@ -434,7 +435,8 @@ def dispatch_storage_week(
         )
     if not result.success:
         reason = "infeasible under the configured capacity bounds" if result.status == 2 else "solver failed"
-        raise RuntimeError(f"Stage 14 DC-OPF {reason}: {result.message}")
+        failure = PhysicalInfeasibilityError if result.status == 2 else SolverError
+        raise failure(f"Stage 14 DC-OPF {reason}: {result.message}", stage="stage_14_dispatch")
 
     if site_count:
         lp_charge = result.x[layout.charge]
@@ -872,7 +874,8 @@ def _solve_exclusive_storage_modes(
         options={"mip_rel_gap": 1e-7},
     )
     if not result.success:
-        raise RuntimeError(f"Storage dispatch with exclusive charge/discharge modes failed: {result.message}")
+        failure = PhysicalInfeasibilityError if result.status == 2 else SolverError
+        raise failure(f"Storage dispatch with exclusive charge/discharge modes failed: {result.message}", stage="stage_14_dispatch")
     return result
 
 
@@ -881,6 +884,6 @@ def _clean(values: np.ndarray, tolerance: float = 1e-7) -> np.ndarray:
     # Retain arbitrarily small positive ENS/power; only remove solver-negative
     # roundoff on variables whose declared lower bound is zero.
     if np.any(result < -tolerance):
-        raise RuntimeError("Solver returned a materially negative nonnegative variable")
+        raise SolverError("Solver returned a materially negative nonnegative variable", stage="stage_14_dispatch")
     result[(result < 0) & (result >= -tolerance)] = 0.0
     return result

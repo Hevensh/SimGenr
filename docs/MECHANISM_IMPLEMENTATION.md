@@ -79,3 +79,12 @@
 - 默认oracle两例均零缺供/弃风光；真实fixed与preplanned各24h加5%备用和2h退出分别缺供2737.678448/863.187421MWh，备用不足1410.010546/23.195645MW·h。后者最大2岛；显式记录短缺，不把守恒通过解释成充裕或可靠性认证。
 - Oracle Stage14恢复335项通过；独立preplanned Stage13恢复334项通过，规划输入和冻结资产哈希不变。修复仅限被证明的缓存float32舍入，真实土地超界仍拒绝；窗口前净功率不重复计入已包含在总放电中的应急部分。
 - G 下一步为四态检查、定位信息和成对干预报告；AC电压/频率、备用激活可送达、完整N-1、储能土地和电池老化仍不支持。
+
+### G：四态、定位、成对实验与失败边界（通过）
+
+- 完整交付见 [WORK_PACKAGE_G.md](WORK_PACKAGE_G.md)，最终全局说明见 [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)，实际数值证据见 [validation_results.json](validation_results.json)。
+- Checks保留旧API，新增PASS/FAIL/UNSUPPORTED/NOT_RUN；空对象不假通过，原始最大残差与最大违规分别定位，显式时间轴不按尺寸猜测。每个默认world的所有检查都有阶段和涉及字段。仅新配置validation.max_failure_locations控制额外失败详情，不改变约束。
+- 最终完整生成器521项通过（47.43s）；模型测试仍因缺torch_geometric未运行。两默认seed分别334/309PASS、0FAIL、4UNSUPPORTED、0/2NOT_RUN；2km网格328PASS，静态水文236PASS/22NOT_RUN。另两个实际资产模式故障场景保留可定位缺供。
+- 同资产、小时轴、已有模块RNG的18项干预全部通过，3项过程明确UNSUPPORTED；错误输出、执行异常、失败标记均有反例。LP/MILP status2与求解错误分类；生成失败非零退出且旧产物不能误被验证或打包。
+- G对F每世界25份NPZ/445数组精确相同。最终数据集0.10.0两世界48窗口校验和、SOC、前序净功率及外生MWh全部通过。批量脚本含空格默认config路径修复经Bash语法与6次替身参数检查，未更改生成公式。
+- A–G已完成。后续需要按研究问题单独实施滚动预测控制、AC/动态安全、备用激活、储能土地/老化及更细水量过程，不把本次守恒通过写成真实区域复现。

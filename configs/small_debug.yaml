@@ -1,4 +1,6 @@
 seed: 42
+validation:
+  max_failure_locations: 5
 
 planning:
   # S: oracle asset planning with full operation-window truth, explicit default.

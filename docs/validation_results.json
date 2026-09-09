@@ -1,0 +1,516 @@
+{
+  "generator_version": "physics_v4",
+  "baseline_commit": "3d6d53209434308e464caea82fcd58facd090474",
+  "scope": "Mechanism consistency for declared synthetic scenarios; no regional calibration or engineering safety certification",
+  "tests": {
+    "passed": 521,
+    "seconds": 47.43,
+    "command": "/d/anaconda/python.exe -B -m pytest tests --ignore=tests/test_forecasting_model.py -q -p no:cacheprovider",
+    "not_run": "tests/test_forecasting_model.py: torch_geometric is not installed"
+  },
+  "worlds": [
+    {
+      "world": "small_debug_seed42",
+      "seed": 42,
+      "grid_shape": [
+        64,
+        64
+      ],
+      "cell_size_km": 1.0,
+      "physical_extent_km": [
+        64.0,
+        64.0
+      ],
+      "area_km2": 4096.0,
+      "hours": 168,
+      "planning_mode": "full_window_planning",
+      "hydrology_enabled": true,
+      "passed_supported_checks": true,
+      "status_counts": {
+        "PASS": 334,
+        "FAIL": 0,
+        "UNSUPPORTED": 4,
+        "NOT_RUN": 0
+      },
+      "elevation_quantiles_m": [
+        543.554931640625,
+        1044.1867065429688,
+        2066.0706176757812
+      ],
+      "population_persons": 2635759.437221852,
+      "requested_load_mwh": 412740.8248977661,
+      "peak_exogenous_load_mw": 3216.89599609375,
+      "unserved_mwh": 0.0,
+      "capacity_factors": {
+        "wind_bus": 0.3851779382552294,
+        "pv_bus": 0.2207654538868549
+      },
+      "failure_names": []
+    },
+    {
+      "world": "small_debug_seed123",
+      "seed": 123,
+      "grid_shape": [
+        64,
+        64
+      ],
+      "cell_size_km": 1.0,
+      "physical_extent_km": [
+        64.0,
+        64.0
+      ],
+      "area_km2": 4096.0,
+      "hours": 168,
+      "planning_mode": "full_window_planning",
+      "hydrology_enabled": true,
+      "passed_supported_checks": true,
+      "status_counts": {
+        "PASS": 309,
+        "FAIL": 0,
+        "UNSUPPORTED": 4,
+        "NOT_RUN": 2
+      },
+      "elevation_quantiles_m": [
+        1458.9154663085938,
+        3177.935546875,
+        3666.65380859375
+      ],
+      "population_persons": 2730994.8295989684,
+      "requested_load_mwh": 448438.53753089905,
+      "peak_exogenous_load_mw": 3486.619384765625,
+      "unserved_mwh": 0.0,
+      "capacity_factors": {
+        "wind_bus": 0.3553509543784715,
+        "pv_bus": 0.26574690006457713
+      },
+      "failure_names": []
+    },
+    {
+      "world": "resolution_2km_seed42",
+      "seed": 42,
+      "grid_shape": [
+        32,
+        32
+      ],
+      "cell_size_km": 2.0,
+      "physical_extent_km": [
+        64.0,
+        64.0
+      ],
+      "area_km2": 4096.0,
+      "hours": 168,
+      "planning_mode": "full_window_planning",
+      "hydrology_enabled": true,
+      "passed_supported_checks": true,
+      "status_counts": {
+        "PASS": 328,
+        "FAIL": 0,
+        "UNSUPPORTED": 4,
+        "NOT_RUN": 0
+      },
+      "elevation_quantiles_m": [
+        537.7436096191407,
+        1044.7157592773438,
+        2064.708666992186
+      ],
+      "population_persons": 2528071.0224733353,
+      "requested_load_mwh": 404273.5797557831,
+      "peak_exogenous_load_mw": 3102.849609375,
+      "unserved_mwh": 0.0,
+      "capacity_factors": {
+        "wind_bus": 0.3272683018757327,
+        "pv_bus": 0.17553619624875533
+      },
+      "failure_names": []
+    },
+    {
+      "world": "static_hydrology_seed42",
+      "seed": 42,
+      "grid_shape": [
+        32,
+        32
+      ],
+      "cell_size_km": 2.0,
+      "physical_extent_km": [
+        64.0,
+        64.0
+      ],
+      "area_km2": 4096.0,
+      "hours": 24,
+      "planning_mode": "fixed_assets",
+      "hydrology_enabled": false,
+      "passed_supported_checks": true,
+      "status_counts": {
+        "PASS": 236,
+        "FAIL": 0,
+        "UNSUPPORTED": 4,
+        "NOT_RUN": 22
+      },
+      "elevation_quantiles_m": [
+        537.7436096191407,
+        1044.7157592773438,
+        2064.708666992186
+      ],
+      "population_persons": 2528071.0224733353,
+      "requested_load_mwh": 58618.509645462036,
+      "peak_exogenous_load_mw": 3055.008056640625,
+      "unserved_mwh": 917.2634753507975,
+      "capacity_factors": {
+        "wind_bus": 0.266506494779205,
+        "pv_bus": 0.17296561430886517
+      },
+      "failure_names": []
+    },
+    {
+      "world": "f_fixed_seed42",
+      "seed": 42,
+      "grid_shape": [
+        64,
+        64
+      ],
+      "cell_size_km": 1.0,
+      "physical_extent_km": [
+        64.0,
+        64.0
+      ],
+      "area_km2": 4096.0,
+      "hours": 24,
+      "planning_mode": "fixed_assets",
+      "hydrology_enabled": true,
+      "passed_supported_checks": true,
+      "status_counts": {
+        "PASS": 335,
+        "FAIL": 0,
+        "UNSUPPORTED": 4,
+        "NOT_RUN": 0
+      },
+      "elevation_quantiles_m": [
+        543.554931640625,
+        1044.1867065429688,
+        2066.0706176757812
+      ],
+      "population_persons": 2635759.437221852,
+      "requested_load_mwh": 60462.18920707703,
+      "peak_exogenous_load_mw": 3178.6494140625,
+      "unserved_mwh": 2737.678447859289,
+      "capacity_factors": {
+        "wind_bus": 0.4206383569609376,
+        "pv_bus": 0.23109694925610225
+      },
+      "failure_names": []
+    },
+    {
+      "world": "f_preplanned_seed42",
+      "seed": 42,
+      "grid_shape": [
+        64,
+        64
+      ],
+      "cell_size_km": 1.0,
+      "physical_extent_km": [
+        64.0,
+        64.0
+      ],
+      "area_km2": 4096.0,
+      "hours": 24,
+      "planning_mode": "preplanned",
+      "hydrology_enabled": true,
+      "passed_supported_checks": true,
+      "status_counts": {
+        "PASS": 334,
+        "FAIL": 0,
+        "UNSUPPORTED": 4,
+        "NOT_RUN": 0
+      },
+      "elevation_quantiles_m": [
+        543.554931640625,
+        1044.1867065429688,
+        2066.0706176757812
+      ],
+      "population_persons": 2635759.437221852,
+      "requested_load_mwh": 60462.18920707703,
+      "peak_exogenous_load_mw": 3178.6494140625,
+      "unserved_mwh": 863.1874206989783,
+      "capacity_factors": {
+        "wind_bus": 0.4206383569609376,
+        "pv_bus": 0.23109694925610225
+      },
+      "failure_names": []
+    }
+  ],
+  "dataset": {
+    "schema_version": "0.10.0",
+    "worlds": 2,
+    "windows": 48,
+    "checksum_verified": true,
+    "all_window_soc_previous_power_and_source_energy_verified": true
+  },
+  "numerical_regression": {
+    "42": {
+      "files": 25,
+      "arrays": 445,
+      "all_arrays_exactly_equal": true,
+      "per_artifact": {
+        "dynamic_hydrology\\hourly_hydrology.npz": 49,
+        "planning\\frozen_assets.npz": 14,
+        "planning\\initial_assets.npz": 14,
+        "stage_05_weather\\daily_weather.npz": 12,
+        "stage_05_weather\\hourly_daily_summary.npz": 13,
+        "stage_05_weather\\hourly_weather_week.npz": 13,
+        "stage_08_energy_sites\\source_load_candidates.npz": 6,
+        "stage_09_grid_buses\\grid_nodes.npz": 5,
+        "stage_10_grid_topology\\grid_electrical.npz": 2,
+        "stage_10_grid_topology\\grid_topology.npz": 1,
+        "stage_10_grid_topology\\refined_grid_topology.npz": 2,
+        "stage_10_grid_topology\\static_maps.npz": 97,
+        "stage_11_operation\\grid_upgrade_plan.npz": 10,
+        "stage_11_operation\\power_flow_hourly.npz": 23,
+        "stage_11_operation\\source_load_forecast.npz": 33,
+        "stage_12_grid_update\\grid_electrical.npz": 2,
+        "stage_12_grid_update\\grid_upgrade_plan.npz": 10,
+        "stage_12_grid_update\\power_flow_hourly.npz": 23,
+        "stage_12_grid_update\\refined_grid_topology.npz": 2,
+        "stage_13_storage_planning\\storage_need.npz": 16,
+        "stage_13_storage_planning\\storage_plan.npz": 5,
+        "stage_14_storage_dispatch\\storage_dispatch.npz": 58,
+        "stage_14_storage_dispatch\\storage_dispatch_electrical.npz": 2,
+        "stage_14_storage_dispatch\\storage_dispatch_forecast.npz": 10,
+        "stage_14_storage_dispatch\\storage_dispatch_power_flow.npz": 23
+      }
+    },
+    "123": {
+      "files": 25,
+      "arrays": 445,
+      "all_arrays_exactly_equal": true,
+      "per_artifact": {
+        "dynamic_hydrology\\hourly_hydrology.npz": 49,
+        "planning\\frozen_assets.npz": 14,
+        "planning\\initial_assets.npz": 14,
+        "stage_05_weather\\daily_weather.npz": 12,
+        "stage_05_weather\\hourly_daily_summary.npz": 13,
+        "stage_05_weather\\hourly_weather_week.npz": 13,
+        "stage_08_energy_sites\\source_load_candidates.npz": 6,
+        "stage_09_grid_buses\\grid_nodes.npz": 5,
+        "stage_10_grid_topology\\grid_electrical.npz": 2,
+        "stage_10_grid_topology\\grid_topology.npz": 1,
+        "stage_10_grid_topology\\refined_grid_topology.npz": 2,
+        "stage_10_grid_topology\\static_maps.npz": 97,
+        "stage_11_operation\\grid_upgrade_plan.npz": 10,
+        "stage_11_operation\\power_flow_hourly.npz": 23,
+        "stage_11_operation\\source_load_forecast.npz": 33,
+        "stage_12_grid_update\\grid_electrical.npz": 2,
+        "stage_12_grid_update\\grid_upgrade_plan.npz": 10,
+        "stage_12_grid_update\\power_flow_hourly.npz": 23,
+        "stage_12_grid_update\\refined_grid_topology.npz": 2,
+        "stage_13_storage_planning\\storage_need.npz": 16,
+        "stage_13_storage_planning\\storage_plan.npz": 5,
+        "stage_14_storage_dispatch\\storage_dispatch.npz": 58,
+        "stage_14_storage_dispatch\\storage_dispatch_electrical.npz": 2,
+        "stage_14_storage_dispatch\\storage_dispatch_forecast.npz": 10,
+        "stage_14_storage_dispatch\\storage_dispatch_power_flow.npz": 23
+      }
+    }
+  },
+  "interventions": {
+    "counts": {
+      "PASS": 18,
+      "FAIL": 0,
+      "UNSUPPORTED": 3,
+      "NOT_RUN": 0
+    },
+    "seeds": [
+      42,
+      123
+    ]
+  },
+  "conservation": {
+    "42": {
+      "water_summary": {
+        "mode": "bucket_routing_v1",
+        "initial_storage_m3": 364892741.61139256,
+        "final_storage_m3": 389191019.5926882,
+        "precipitation_m3": 144767831.42824584,
+        "actual_et_m3": 75340458.71150887,
+        "boundary_inflow_m3": 0.0,
+        "boundary_outflow_m3": 45129094.73544106,
+        "max_cell_residual_m3": 1.2964016526950672e-09,
+        "whole_window_residual_m3": 2.384185791015625e-07
+      },
+      "key_checks": [
+        {
+          "name": "population_mass",
+          "status": "PASS",
+          "max_residual": 0.0043267435394227505,
+          "max_violation": 0.0,
+          "unit": "persons",
+          "location": {
+            "array_index": [],
+            "axes": null
+          },
+          "time": {
+            "status": "not_applicable",
+            "support": "static_or_domain_aggregate",
+            "value": null
+          },
+          "fields": [
+            "population_density",
+            "cities.population"
+          ],
+          "stage": "C_static_population"
+        },
+        {
+          "name": "kcl_incidence",
+          "status": "PASS",
+          "max_residual": 1.057287590811029e-11,
+          "max_violation": 0.0,
+          "unit": "MW",
+          "location": {
+            "array_index": [
+              85,
+              53
+            ],
+            "axes": [
+              "time",
+              "bus"
+            ]
+          },
+          "time": {
+            "status": "explicit",
+            "support": "hour_interval_mean",
+            "value": 2269,
+            "index": 85
+          },
+          "fields": [
+            "flow.line_flow_mw",
+            "flow.bus_p_injection_mw",
+            "dispatch.p_load_mw"
+          ],
+          "stage": "F_lossless_DC"
+        },
+        {
+          "name": "soc_energy_conservation",
+          "status": "PASS",
+          "max_residual": 7.815970093361102e-14,
+          "max_violation": 0.0,
+          "unit": "MWh",
+          "location": {
+            "array_index": [
+              161,
+              1
+            ],
+            "axes": [
+              "time",
+              "storage_site"
+            ]
+          },
+          "time": {
+            "status": "explicit",
+            "support": "hour_interval_energy_balance",
+            "value": 2345,
+            "index": 161
+          },
+          "fields": [
+            "storage.charge_mw",
+            "storage.discharge_mw",
+            "storage.soc_mwh"
+          ],
+          "stage": "F_storage"
+        }
+      ]
+    },
+    "123": {
+      "water_summary": {
+        "mode": "bucket_routing_v1",
+        "initial_storage_m3": 375363642.54699105,
+        "final_storage_m3": 255332524.0941602,
+        "precipitation_m3": 68759752.47441188,
+        "actual_et_m3": 93655488.49302623,
+        "boundary_inflow_m3": 0.0,
+        "boundary_outflow_m3": 95135382.43421641,
+        "max_cell_residual_m3": 1.1641532182693481e-10,
+        "whole_window_residual_m3": 1.1920928955078125e-07
+      },
+      "key_checks": [
+        {
+          "name": "population_mass",
+          "status": "PASS",
+          "max_residual": 0.00032226089388132095,
+          "max_violation": 0.0,
+          "unit": "persons",
+          "location": {
+            "array_index": [],
+            "axes": null
+          },
+          "time": {
+            "status": "not_applicable",
+            "support": "static_or_domain_aggregate",
+            "value": null
+          },
+          "fields": [
+            "population_density",
+            "cities.population"
+          ],
+          "stage": "C_static_population"
+        },
+        {
+          "name": "kcl_incidence",
+          "status": "PASS",
+          "max_residual": 9.890754881780595e-12,
+          "max_violation": 0.0,
+          "unit": "MW",
+          "location": {
+            "array_index": [
+              107,
+              66
+            ],
+            "axes": [
+              "time",
+              "bus"
+            ]
+          },
+          "time": {
+            "status": "explicit",
+            "support": "hour_interval_mean",
+            "value": 2579,
+            "index": 107
+          },
+          "fields": [
+            "flow.line_flow_mw",
+            "flow.bus_p_injection_mw",
+            "dispatch.p_load_mw"
+          ],
+          "stage": "F_lossless_DC"
+        },
+        {
+          "name": "soc_energy_conservation",
+          "status": "PASS",
+          "max_residual": 4.547473508864641e-13,
+          "max_violation": 0.0,
+          "unit": "MWh",
+          "location": {
+            "array_index": [
+              114,
+              0
+            ],
+            "axes": [
+              "time",
+              "storage_site"
+            ]
+          },
+          "time": {
+            "status": "explicit",
+            "support": "hour_interval_energy_balance",
+            "value": 2586,
+            "index": 114
+          },
+          "fields": [
+            "storage.charge_mw",
+            "storage.discharge_mw",
+            "storage.soc_mwh"
+          ],
+          "stage": "F_storage"
+        }
+      ]
+    }
+  }
+}
