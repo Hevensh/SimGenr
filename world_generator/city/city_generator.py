@@ -15,13 +15,15 @@ def generate_initial_cities(
     config: CityConfig,
     rng: np.random.Generator,
 ) -> CityState:
+    if config.city_count < 0 or config.total_population < 0.0 or grid.cell_size_km <= 0.0:
+        raise ValueError("City count/population must be non-negative and cell size positive")
     water = hydrology.river | hydrology.lake
     protected = land.protected.astype(bool)
     flood = np.clip(hydrology.flood_risk, 0.0, 1.0)
     buildability = np.clip(land.buildability, 0.0, 1.0)
     terrain_cost = np.clip(land.terrain_cost, 0.0, 1.0)
-    slope_n = _normalize01(terrain.slope)
-    roughness_n = _normalize01(terrain.roughness)
+    slope_n = np.clip(terrain.slope / 0.22, 0.0, 1.0)
+    roughness_n = np.clip(terrain.roughness / 0.22, 0.0, 1.0)
 
     waterfront_amenity = _waterfront_amenity(hydrology.distance_to_water, water, protected, flood, config)
     water_access = _gaussian_preference(
@@ -55,7 +57,7 @@ def generate_initial_cities(
         config.edge_buffer_km,
         config.edge_buffer_min_factor,
     )
-    urban_core_suitability[water | protected] = 0.0
+    urban_core_suitability[water | protected | (buildability <= 0.0)] = 0.0
     urban_core_suitability = _normalize01(urban_core_suitability)
 
     city_count, total_population = _resolve_city_targets(land, hydrology, grid, config, rng)
@@ -103,7 +105,7 @@ def _climate_comfort(climate: ClimateBaseline) -> np.ndarray:
     temp = _gaussian_preference(climate.mean_temperature, 18.0, 8.0)
     humidity = _gaussian_preference(climate.mean_humidity, 0.62, 0.24)
     rain = _gaussian_preference(climate.mean_precipitation, 850.0, 520.0)
-    return _normalize01(0.52 * temp + 0.30 * humidity + 0.18 * rain)
+    return np.clip(0.52 * temp + 0.30 * humidity + 0.18 * rain, 0.0, 1.0).astype(np.float32)
 
 
 def _select_city_centers(
@@ -113,6 +115,8 @@ def _select_city_centers(
     rng: np.random.Generator,
     city_count: int,
 ) -> list[tuple[int, int]]:
+    if city_count <= 0:
+        return []
     min_distance_cells = max(config.min_city_distance_km / max(grid.cell_size_km, 1e-6), 1.0)
     row_col = np.argwhere(suitability > np.quantile(suitability, 0.72))
     if row_col.size == 0:
@@ -133,7 +137,7 @@ def _select_city_centers(
             row, col = np.unravel_index(int(flat_index), suitability.shape)
             if suitability[row, col] <= 0.0:
                 break
-            if all(np.hypot(row - r0, col - c0) >= min_distance_cells * 0.72 for r0, c0 in centers):
+            if all(np.hypot(row - r0, col - c0) >= min_distance_cells for r0, c0 in centers):
                 centers.append((int(row), int(col)))
                 if len(centers) >= city_count:
                     break
@@ -203,16 +207,17 @@ def _build_city_nodes(
     rng: np.random.Generator,
     total_population: float,
 ) -> list[CityNode]:
-    if not centers:
+    if not centers or total_population <= 0.0:
         return []
     center_scores = np.asarray([suitability[row, col] for row, col in centers], dtype=np.float32)
     ranks = np.argsort(np.argsort(-center_scores))
-    size_weights = (len(centers) - ranks).astype(np.float32) ** config.city_size_alpha
+    # Rank-size distribution (Zipf/Pareto); the old reversed polynomial was
+    # not a rank-size law and varied its shape with the number of cities.
+    size_weights = (ranks.astype(np.float64) + 1.0) ** (-config.city_size_alpha)
     size_weights *= rng.uniform(0.85, 1.18, size=size_weights.shape).astype(np.float32)
     populations = total_population * size_weights / max(float(size_weights.sum()), 1e-6)
-    score_n = _normalize01(center_scores)
     cities = []
-    for city_id, ((row, col), population, score) in enumerate(zip(centers, populations, score_n)):
+    for city_id, ((row, col), population) in enumerate(zip(centers, populations)):
         radius = config.urban_radius_min_km + (config.urban_radius_max_km - config.urban_radius_min_km) * np.sqrt(population / populations.max())
         cities.append(
             CityNode(
@@ -239,7 +244,7 @@ def _spread_city_fields(
     grid: WorldGridConfig,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     rows, cols = np.indices(buildability.shape)
-    population = np.zeros(buildability.shape, dtype=np.float32)
+    population = np.zeros(buildability.shape, dtype=np.float64)
     economy = np.zeros(buildability.shape, dtype=np.float32)
     density = np.zeros(buildability.shape, dtype=np.float32)
     city_id_map = np.full(buildability.shape, -1, dtype=np.int16)
@@ -253,20 +258,23 @@ def _spread_city_fields(
         core = np.exp(-(distance**2) / (2.0 * (0.38 * radius_cells) ** 2))
         halo = 0.42 * np.exp(-(distance**2) / (2.0 * radius_cells**2))
         influence = (core + halo) * developable
-        population += city.population * influence
+        influence_total = float(influence.sum())
+        if influence_total <= 0.0:
+            if city.population > 0.0:
+                raise ValueError("Cannot allocate city population without developable land")
+            continue
+        # Conserve each city's population before superposition; units persons/km2.
+        population += city.population * influence / (influence_total * grid.cell_size_km**2)
         economy += (0.55 + 0.45 * waterfront_amenity) * np.sqrt(max(city.population, 1.0)) * influence
         density = np.maximum(density, influence)
         update = influence > best_influence
         city_id_map[update] = city.city_id
         best_influence[update] = influence[update]
 
-    if population.sum() > 0.0:
-        population *= sum(city.population for city in cities) / float(population.sum())
-    population = _normalize01(population)
     economy = _normalize01(economy)
     density = _normalize01(density)
     city_id_map[density <= 0.03] = -1
-    return population, economy, density, city_id_map
+    return population.astype(np.float32), economy, density, city_id_map
 
 
 def _gaussian_preference(values: np.ndarray, center: float, sigma: float) -> np.ndarray:
@@ -277,5 +285,5 @@ def _normalize01(values: np.ndarray) -> np.ndarray:
     vmin = float(np.nanmin(values))
     vmax = float(np.nanmax(values))
     if vmax - vmin < 1e-12:
-        return np.zeros_like(values, dtype=np.float32)
+        return np.full_like(values, np.clip(vmax, 0.0, 1.0), dtype=np.float32)
     return ((values - vmin) / (vmax - vmin)).astype(np.float32)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from world_generator.core.config import LandConfig, WorldGridConfig
-from world_generator.core.datatypes import HydrologyState, StaticLandState, TerrainFeatures
+from world_generator.core.datatypes import ClimateBaseline, HydrologyState, StaticLandState, TerrainFeatures
 
 
 LAND_COVER = {
@@ -22,22 +22,30 @@ def generate_static_land(
     grid: WorldGridConfig,
     config: LandConfig,
     rng: np.random.Generator,
+    climate: ClimateBaseline | None = None,
 ) -> StaticLandState:
     water = hydrology.river | hydrology.lake
     water_buffer = hydrology.distance_to_water <= config.water_buffer_km
-    elevation_n = _normalize01(terrain.elevation)
-    slope_n = _normalize01(terrain.slope)
-    roughness_n = _normalize01(terrain.roughness)
+    elevation_n = np.clip(terrain.elevation / 4000.0, 0.0, 1.0)
+    slope_n = np.clip(terrain.slope / max(config.steep_slope_threshold, 1e-6), 0.0, 1.0)
+    roughness_n = np.clip(terrain.roughness / max(config.steep_slope_threshold, 1e-6), 0.0, 1.0)
     flood = np.clip(hydrology.flood_risk, 0.0, 1.0)
 
     vegetation_noise = _smooth_noise(terrain.elevation.shape, rng, steps=3)
-    vegetation = (
-        0.34 * (1.0 - slope_n)
-        + 0.24 * (1.0 - elevation_n)
-        + 0.17 * np.exp(-hydrology.distance_to_water / 6.0)
-        + config.vegetation_noise_weight * vegetation_noise
-    )
-    vegetation = _normalize01(vegetation)
+    # Miami climatic potential NPP, Lieth (1973), normalized by its 3000
+    # g dry matter/m2/year upper scale. This is potential vegetation, not NDVI.
+    if climate is None:
+        # Backwards-compatible call sites receive a documented reference climate.
+        temperature = np.full(terrain.elevation.shape, 15.0)
+        precipitation = np.full(terrain.elevation.shape, 850.0)
+    else:
+        temperature = climate.mean_temperature
+        precipitation = climate.mean_precipitation
+    temperature_limit = 1.0 / (1.0 + np.exp(np.clip(1.315 - 0.119 * temperature, -60.0, 60.0)))
+    water_limit = -np.expm1(-0.000664 * np.maximum(precipitation, 0.0))
+    vegetation = np.minimum(temperature_limit, water_limit)
+    vegetation *= (1.0 - 0.25 * slope_n) * (1.0 + config.vegetation_noise_weight * (vegetation_noise - 0.5))
+    vegetation = np.clip(vegetation, 0.0, 1.0)
     vegetation[water] = 0.0
 
     protected_score = (
@@ -48,8 +56,13 @@ def generate_static_land(
         + 0.08 * _protected_patch_field(terrain.elevation.shape, rng, config.random_patch_count)
     )
     protected_score[water] = 0.0
-    protected_threshold = np.quantile(protected_score, 1.0 - np.clip(config.protected_fraction, 0.0, 0.8))
-    protected = (protected_score >= protected_threshold) & ~water
+    # The fraction applies to eligible land only; zero must protect zero cells.
+    protected = np.zeros_like(water)
+    eligible = np.flatnonzero(~water)
+    protected_count = int(round(eligible.size * np.clip(config.protected_fraction, 0.0, 1.0)))
+    if protected_count:
+        selected = eligible[np.argsort(protected_score.ravel()[eligible], kind="stable")[-protected_count:]]
+        protected.ravel()[selected] = True
 
     terrain_cost = (
         0.36 * slope_n
@@ -58,7 +71,7 @@ def generate_static_land(
         + 0.12 * water_buffer.astype(np.float32)
         + 0.12 * protected.astype(np.float32)
     )
-    terrain_cost = _normalize01(terrain_cost)
+    terrain_cost = np.clip(terrain_cost, 0.0, 1.0)
     terrain_cost[water] = 1.0
 
     buildability = 1.0 - terrain_cost

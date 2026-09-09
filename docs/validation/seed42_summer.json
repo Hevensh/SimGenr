@@ -1,0 +1,513 @@
+{
+  "world": "small_debug_seed42",
+  "generator_version": "physics_v3",
+  "scenario_semantics": "synthetic_realization_with_perfect_foresight_planning",
+  "passed": true,
+  "checks": [
+    {
+      "name": "finite_static",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "finite_daily",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "finite_hourly",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "finite_source",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "finite_storage",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "finite_dispatch",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "finite_flow",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "finite_electrical",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "nonempty_consecutive_hourly_timestamps",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "timestamps_match_source",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "timestamps_match_storage",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "timestamps_match_dispatch",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "timestamps_match_flow",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "population_mass",
+      "passed": true,
+      "max_error": 0.0013653230853378773,
+      "tolerance": 4.672755103592814,
+      "unit": "persons",
+      "note": ""
+    },
+    {
+      "name": "population_nonnegative",
+      "passed": true,
+      "max_error": -0.0,
+      "tolerance": 1e-07,
+      "unit": "persons/km2",
+      "note": ""
+    },
+    {
+      "name": "complete_daily_alignment_271",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "complete_daily_alignment_272",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "complete_daily_alignment_273",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "complete_daily_alignment_274",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "complete_daily_alignment_275",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "complete_daily_alignment_276",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "complete_daily_alignment_277",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "daily_hourly_wind_u",
+      "passed": true,
+      "max_error": 1.5894571880892272e-07,
+      "tolerance": 0.0002,
+      "unit": "channel native unit",
+      "note": "rain sums; all other channels average over the same solar day"
+    },
+    {
+      "name": "daily_hourly_wind_v",
+      "passed": true,
+      "max_error": 7.947285940446136e-08,
+      "tolerance": 0.0002,
+      "unit": "channel native unit",
+      "note": "rain sums; all other channels average over the same solar day"
+    },
+    {
+      "name": "daily_hourly_wind_speed",
+      "passed": true,
+      "max_error": 1.2715657558004523e-06,
+      "tolerance": 0.0002,
+      "unit": "channel native unit",
+      "note": "rain sums; all other channels average over the same solar day"
+    },
+    {
+      "name": "daily_hourly_temperature",
+      "passed": true,
+      "max_error": 3.9736429968684206e-07,
+      "tolerance": 0.0002,
+      "unit": "channel native unit",
+      "note": "rain sums; all other channels average over the same solar day"
+    },
+    {
+      "name": "daily_hourly_humidity",
+      "passed": true,
+      "max_error": 1.2417634365213814e-08,
+      "tolerance": 0.0002,
+      "unit": "channel native unit",
+      "note": "rain sums; all other channels average over the same solar day"
+    },
+    {
+      "name": "daily_hourly_pressure",
+      "passed": true,
+      "max_error": 1.52587890625e-05,
+      "tolerance": 0.0002,
+      "unit": "channel native unit",
+      "note": "rain sums; all other channels average over the same solar day"
+    },
+    {
+      "name": "daily_hourly_cloud",
+      "passed": true,
+      "max_error": 1.2417634365213814e-08,
+      "tolerance": 0.0002,
+      "unit": "channel native unit",
+      "note": "rain sums; all other channels average over the same solar day"
+    },
+    {
+      "name": "daily_hourly_precipitation",
+      "passed": true,
+      "max_error": 8.642673492431641e-07,
+      "tolerance": 0.0002,
+      "unit": "mm/day",
+      "note": "rain sums; all other channels average over the same solar day"
+    },
+    {
+      "name": "daily_hourly_irradiance",
+      "passed": true,
+      "max_error": 5.7220458984375e-06,
+      "tolerance": 0.0002,
+      "unit": "channel native unit",
+      "note": "rain sums; all other channels average over the same solar day"
+    },
+    {
+      "name": "nighttime_ghi_zero",
+      "passed": true,
+      "max_error": 0.0,
+      "tolerance": 1e-06,
+      "unit": "W/m2",
+      "note": ""
+    },
+    {
+      "name": "irradiance_below_toa",
+      "passed": true,
+      "max_error": 0.0,
+      "tolerance": 0.0002,
+      "unit": "W/m2",
+      "note": ""
+    },
+    {
+      "name": "hourly_precipitation_nonnegative",
+      "passed": true,
+      "max_error": -0.0,
+      "tolerance": 1e-06,
+      "unit": "",
+      "note": ""
+    },
+    {
+      "name": "hourly_irradiance_nonnegative",
+      "passed": true,
+      "max_error": -0.0,
+      "tolerance": 1e-06,
+      "unit": "",
+      "note": ""
+    },
+    {
+      "name": "hourly_wind_speed_nonnegative",
+      "passed": true,
+      "max_error": 0.0,
+      "tolerance": 1e-06,
+      "unit": "",
+      "note": ""
+    },
+    {
+      "name": "hourly_humidity_lower_bound",
+      "passed": true,
+      "max_error": 0.0,
+      "tolerance": 1e-06,
+      "unit": "",
+      "note": ""
+    },
+    {
+      "name": "hourly_humidity_upper_bound",
+      "passed": true,
+      "max_error": 0.0,
+      "tolerance": 1e-06,
+      "unit": "",
+      "note": ""
+    },
+    {
+      "name": "hourly_cloud_lower_bound",
+      "passed": true,
+      "max_error": -0.0,
+      "tolerance": 1e-06,
+      "unit": "",
+      "note": ""
+    },
+    {
+      "name": "hourly_cloud_upper_bound",
+      "passed": true,
+      "max_error": 0.0,
+      "tolerance": 1e-06,
+      "unit": "",
+      "note": ""
+    },
+    {
+      "name": "wind_vector_magnitude",
+      "passed": true,
+      "max_error": 9.5367431640625e-07,
+      "tolerance": 1e-05,
+      "unit": "m/s",
+      "note": ""
+    },
+    {
+      "name": "exogenous_load_nonnegative",
+      "passed": true,
+      "max_error": -0.0,
+      "tolerance": 1e-06,
+      "unit": "MW",
+      "note": ""
+    },
+    {
+      "name": "exogenous_availability_nonnegative",
+      "passed": true,
+      "max_error": -0.0,
+      "tolerance": 1e-06,
+      "unit": "MW",
+      "note": ""
+    },
+    {
+      "name": "wind_bus_ac_capacity",
+      "passed": true,
+      "max_error": 0.0,
+      "tolerance": 0.0001,
+      "unit": "MW",
+      "note": ""
+    },
+    {
+      "name": "pv_bus_ac_capacity",
+      "passed": true,
+      "max_error": 0.0,
+      "tolerance": 0.0001,
+      "unit": "MW",
+      "note": ""
+    },
+    {
+      "name": "unique_final_bus_ids",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "dispatch_flow_bus_order",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "kcl_incidence",
+      "passed": true,
+      "max_error": 6.866455078125e-05,
+      "tolerance": 0.002,
+      "unit": "MW",
+      "note": ""
+    },
+    {
+      "name": "kcl_global_balance",
+      "passed": true,
+      "max_error": 6.389617919921875e-05,
+      "tolerance": 0.002,
+      "unit": "MW",
+      "note": ""
+    },
+    {
+      "name": "injection_matches_served_dispatch",
+      "passed": true,
+      "max_error": 3.0517578125e-05,
+      "tolerance": 0.002,
+      "unit": "MW",
+      "note": ""
+    },
+    {
+      "name": "requested_load_equals_served_plus_unserved",
+      "passed": true,
+      "max_error": 9.351354492537212e-06,
+      "tolerance": 0.002,
+      "unit": "MW",
+      "note": "includes requested storage charging; shortfall remains at its optimized bus"
+    },
+    {
+      "name": "served_load_nonnegative",
+      "passed": true,
+      "max_error": -0.0,
+      "tolerance": 1e-06,
+      "unit": "MW",
+      "note": ""
+    },
+    {
+      "name": "unserved_load_nonnegative",
+      "passed": true,
+      "max_error": -0.0,
+      "tolerance": 1e-06,
+      "unit": "MW",
+      "note": ""
+    },
+    {
+      "name": "unserved_load_below_requested",
+      "passed": true,
+      "max_error": 0.0,
+      "tolerance": 0.002,
+      "unit": "MW",
+      "note": ""
+    },
+    {
+      "name": "line_operating_limit",
+      "passed": true,
+      "max_error": 3.0517578125e-05,
+      "tolerance": 0.002,
+      "unit": "MW",
+      "note": ""
+    },
+    {
+      "name": "soc_terminal_boundary",
+      "passed": true,
+      "note": ""
+    },
+    {
+      "name": "soc_energy_conservation",
+      "passed": true,
+      "max_error": 6.625526829395767e-06,
+      "tolerance": 0.002,
+      "unit": "MWh",
+      "note": ""
+    },
+    {
+      "name": "soc_lower_bound",
+      "passed": true,
+      "max_error": 0.0,
+      "tolerance": 0.002,
+      "unit": "MWh",
+      "note": ""
+    },
+    {
+      "name": "soc_upper_bound",
+      "passed": true,
+      "max_error": 1.5258789005656581e-06,
+      "tolerance": 0.002,
+      "unit": "MWh",
+      "note": ""
+    },
+    {
+      "name": "soc_cycle_closure",
+      "passed": true,
+      "max_error": 0.0,
+      "tolerance": 0.002,
+      "unit": "MWh",
+      "note": ""
+    },
+    {
+      "name": "storage_charge_nonnegative",
+      "passed": true,
+      "max_error": -0.0,
+      "tolerance": 1e-06,
+      "unit": "MW",
+      "note": ""
+    },
+    {
+      "name": "storage_discharge_nonnegative",
+      "passed": true,
+      "max_error": -0.0,
+      "tolerance": 1e-06,
+      "unit": "MW",
+      "note": ""
+    },
+    {
+      "name": "emergency_part_of_total_discharge",
+      "passed": true,
+      "max_error": 0.0,
+      "tolerance": 1e-05,
+      "unit": "MW",
+      "note": ""
+    },
+    {
+      "name": "storage_no_simultaneous_charge_discharge",
+      "passed": true,
+      "max_error": 0.0,
+      "tolerance": 0.0001,
+      "unit": "MW",
+      "note": ""
+    },
+    {
+      "name": "storage_shared_inverter_capacity",
+      "passed": true,
+      "max_error": 0.0,
+      "tolerance": 0.002,
+      "unit": "MW",
+      "note": ""
+    },
+    {
+      "name": "storage_normal_charge_c_rate",
+      "passed": true,
+      "max_error": 0.0,
+      "tolerance": 0.002,
+      "unit": "MW",
+      "note": ""
+    },
+    {
+      "name": "storage_normal_discharge_c_rate",
+      "passed": true,
+      "max_error": 3.725290298461914e-07,
+      "tolerance": 0.002,
+      "unit": "MW",
+      "note": ""
+    },
+    {
+      "name": "storage_ramp_including_emergency",
+      "passed": true,
+      "max_error": 9.5367431640625e-07,
+      "tolerance": 0.002,
+      "unit": "MW/hour",
+      "note": ""
+    },
+    {
+      "name": "thermal_operating_limit",
+      "passed": true,
+      "max_error": 0.0,
+      "tolerance": 0.002,
+      "unit": "MW",
+      "note": "storage discharge at a thermal bus is subtracted before checking"
+    },
+    {
+      "name": "thermal_ramp",
+      "passed": true,
+      "max_error": 2.288818359375e-05,
+      "tolerance": 0.002,
+      "unit": "MW/hour",
+      "note": ""
+    }
+  ],
+  "summary": {
+    "hours": 168,
+    "population_persons": 2336377.550431084,
+    "city_population_persons": 2336377.551796407,
+    "capacity_factors_descriptive_only": {
+      "wind_bus": 0.36658058341941685,
+      "pv_bus": 0.17398626881685644
+    },
+    "peak_exogenous_load_mw": 2893.47265625,
+    "total_unserved_mwh": 0.003551602130755782,
+    "total_curtailed_mwh": 0.00012600421905517578,
+    "storage_site_count": 5
+  },
+  "limitations": "Checks validate exported physical identities and constraints, not empirical realism or forecast accuracy. A PASS can include explicitly reported unserved energy when load shedding is allowed; it does not imply supply adequacy. Capacity factors are descriptive only. Final graph and dispatch use perfect foresight."
+}

@@ -21,7 +21,7 @@ class TerrainFeatures:
     slope: FloatMap
     aspect_sin: FloatMap
     aspect_cos: FloatMap
-    roughness: FloatMap
+    roughness: FloatMap  # dimensionless 3x3 relief / (2 * grid spacing); not aerodynamic z0
     curvature: FloatMap
 
     def as_maps(self) -> dict[str, np.ndarray]:
@@ -137,6 +137,7 @@ class SourceLoadForecastStore:
     p_gen_scheduled_mw: np.ndarray
     q_load_mvar: np.ndarray
     source_channels: tuple[str, ...]
+    data_semantics: str = "synthetic_realization"
 
     def as_arrays(self) -> dict[str, np.ndarray]:
         return {
@@ -148,13 +149,15 @@ class SourceLoadForecastStore:
             "p_gen_scheduled_mw": self.p_gen_scheduled_mw,
             "q_load_mvar": self.q_load_mvar,
             "source_channels": np.asarray(self.source_channels),
+            "data_semantics": np.asarray(self.data_semantics),
         }
 
-    def summary_dict(self) -> dict[str, float | int | list[str]]:
+    def summary_dict(self) -> dict[str, float | int | str | list[str]]:
         total_load = self.p_load_mw.sum(axis=1)
         total_available = self.p_gen_available_mw.sum(axis=1)
         total_scheduled = self.p_gen_scheduled_mw.sum(axis=1)
         return {
+            "data_semantics": self.data_semantics,
             "hours": int(self.p_load_mw.shape[0]),
             "bus_count": int(self.p_load_mw.shape[1]),
             "bus_kinds": sorted(set(self.bus_kinds)),
@@ -590,7 +593,7 @@ class CityState:
     city_suitability: FloatMap
     urban_core_suitability: FloatMap
     waterfront_amenity: FloatMap
-    population_density: FloatMap
+    population_density: FloatMap  # persons / km^2; sum * cell area equals total population
     economic_activity: FloatMap
     urban_density: FloatMap
     urban_mask: BoolMap

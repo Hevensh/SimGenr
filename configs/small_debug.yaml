@@ -6,6 +6,7 @@ world:
   cell_size_km: 1.0
   origin_x_km: 0.0
   origin_y_km: 0.0
+  latitude_center_degrees: 35.0
 
 terrain:
   algorithm: multiscale_v2
@@ -38,16 +39,18 @@ hydrology:
   lake_min_cells: 6
   lake_extra_dilation_cells: 1
   lake_expansion_slope_multiplier: 1.15
-  flow_smoothing_steps: 1
-  river_depth_min_m: 4.0
-  river_depth_max_m: 28.0
+  flow_smoothing_steps: 0
+  river_depth_min_m: 0.5
+  river_depth_max_m: 12.0
   lake_depth_m: 18.0
   flood_water_decay_km: 4.0
   river_min_catchment_km2: 64.0
   river_width_reference_catchment_km2: 320.0
+  river_width_reference_m: 30.0
   river_width_exponent: 0.35
   lake_min_depth_m: 12.0
   lake_max_area_km2: 80.0
+  lake_min_area_km2: 2.0
   depression_fill_epsilon_m: 0.02
 
 land:
@@ -79,6 +82,9 @@ climate:
   climate_noise_weight: 0.12
 
 weather:
+  wet_day_probability: 0.30
+  wet_day_persistence: 0.55
+  precipitation_gamma_shape: 1.5
   days: 365
   start_day_of_year: 0
   hourly_week_days: 7
@@ -146,6 +152,9 @@ land_use:
   load_industrial_weight: 0.18
 
 energy:
+  wind_capacity_density_mw_km2: 3.0
+  pv_capacity_density_mw_km2: 35.0
+  per_capita_peak_load_kw: 1.5
   wind_candidate_count: 8
   pv_candidate_count: 8
   load_node_count: 18
@@ -178,6 +187,9 @@ energy:
   load_capacity_max_mw: 120.0
 
 power_grid:
+  nominal_voltage_kv: 220.0
+  thermal_scale_with_load: true
+  thermal_planning_reserve_margin: 1.15
   thermal_candidate_count: 4
   thermal_load_optimal_km: 5.0
   thermal_load_sigma_km: 4.0
@@ -227,6 +239,9 @@ power_grid:
   downgrade_max_network_loading: 0.96
 
 storage:
+  cyclic_state_of_charge: true
+  allow_load_shedding: true
+  load_shedding_cost: 10000.0
   congestion_trigger_ratio: 0.90
   congestion_decay_hops: 2.0
   minimum_duration_hours: 2.0
@@ -268,3 +283,35 @@ storage:
 output:
   root: outputs
   world_name: small_debug
+
+# Scenario priors; these values require regional data calibration.
+source_load:
+  calendar_start_date: "2025-01-01"
+  wind_reference_height_m: 10.0
+  wind_hub_height_m: 90.0
+  wind_shear_exponent: 0.14
+  wind_cut_in_mps: 3.0
+  wind_rated_mps: 11.4
+  wind_cut_out_mps: 25.0
+  wind_system_loss_fraction: 0.08
+  pv_dc_ac_ratio: 1.2
+  pv_tilt_degrees: 30.0
+  pv_azimuth_degrees: 180.0
+  pv_ground_albedo: 0.2
+  pv_inverter_efficiency: 0.96
+  pv_system_loss_fraction: 0.10
+  pv_temperature_coefficient_per_c: -0.004
+  pv_heat_loss_constant: 25.0
+  pv_heat_loss_wind: 6.84
+  load_heating_balance_c: 16.0
+  load_cooling_balance_c: 22.0
+  load_heating_sensitivity_per_c: 0.016
+  load_cooling_sensitivity_per_c: 0.025
+  load_thermal_memory_hours: 8.0
+  load_residual_std_fraction: 0.035
+  load_residual_ar1: 0.85
+  load_common_variance_fraction: 0.55
+  load_spatial_correlation_km: 20.0
+  load_residential_fraction: 0.55
+  load_commercial_fraction: 0.30
+  load_industrial_fraction: 0.15

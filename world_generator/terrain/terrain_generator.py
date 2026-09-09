@@ -12,6 +12,8 @@ def generate_terrain_base(
     terrain: TerrainConfig,
     rng: np.random.Generator,
 ) -> TerrainBase:
+    if grid.height < 1 or grid.width < 1 or grid.cell_size_km <= 0.0:
+        raise ValueError("Terrain requires a nonempty grid and positive cell size")
     if terrain.algorithm == "multiscale_v2":
         return _generate_multiscale_terrain(grid, terrain, rng)
     if terrain.algorithm != "legacy":
@@ -130,7 +132,7 @@ def _world_fbm(
     total_amplitude = 0.0
     wavelength = float(base_wavelength_km)
     for octave in range(max(octaves, 1)):
-        if wavelength < cell_size_km * 1.75:
+        if wavelength < cell_size_km * 2.0:
             break
         result += amplitude * _value_noise_world(xx, yy, wavelength, seed + octave * 977)
         total_amplitude += amplitude

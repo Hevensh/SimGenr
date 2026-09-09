@@ -32,13 +32,14 @@ def generate_land_use_zones(
     developable = np.clip(land.buildability, 0.0, 1.0)
     developable[water | protected] = 0.0
     flood_safe = 1.0 - np.clip(hydrology.flood_risk, 0.0, 1.0)
-    flat = 1.0 - _normalize01(terrain.slope)
+    flat = 1.0 - np.clip(terrain.slope / max(config.agriculture_slope_hard_limit, 1e-6), 0.0, 1.0)
     agriculture_slope_suitability = _slope_suitability(
         terrain.slope,
         config.agriculture_slope_soft_limit,
         config.agriculture_slope_hard_limit,
     )
-    urban_edge = np.clip(city.urban_density - city.population_density, 0.0, 1.0)
+    population_index = _normalize01(city.population_density)
+    urban_edge = np.clip(city.urban_density - population_index, 0.0, 1.0)
     non_urban = np.clip(1.0 - city.urban_density, 0.0, 1.0)
 
     residential_base = _normalize01(city.population_density * (0.65 + 0.35 * developable) * flood_safe)
@@ -146,7 +147,7 @@ def _normalize01(values: np.ndarray) -> np.ndarray:
     vmin = float(np.nanmin(values))
     vmax = float(np.nanmax(values))
     if vmax - vmin < 1e-12:
-        return np.zeros_like(values, dtype=np.float32)
+        return np.full_like(values, np.clip(vmax, 0.0, 1.0), dtype=np.float32)
     return ((values - vmin) / (vmax - vmin)).astype(np.float32)
 
 

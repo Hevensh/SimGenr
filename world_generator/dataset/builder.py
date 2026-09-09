@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 from pathlib import Path
 from typing import Iterable
 
@@ -13,7 +12,7 @@ from world_generator.core.output_layout import WorldDataLayout
 from world_generator.operation.stage_cache import load_stage12_checkpoint
 
 
-SCHEMA_VERSION = "0.5.0"
+SCHEMA_VERSION = "0.6.0"
 
 STATIC_CONTINUOUS_CHANNELS = (
     "elevation",
@@ -80,7 +79,10 @@ NODE_TYPE_TO_ID = {
 STATIC_UNITS = {
     "elevation": "m",
     "slope": "rise_over_run",
-    "water_depth": "relative_depth",
+    "water_depth": "m",
+    "hydrology_elevation": "m",
+    "population_density": "persons/km2",
+    "flow_accumulation": "upstream_cell_count",
     "distance_to_water": "km",
     "mean_temperature": "degC",
     "annual_temperature_amplitude": "degC",
@@ -93,6 +95,9 @@ STATIC_UNITS = {
 OPERATION_UNITS = {
     "p_load_mw": "MW",
     "p_gen_available_mw": "MW",
+    "exogenous_p_load_mw": "MW",
+    "exogenous_p_gen_available_mw": "MW",
+    "exogenous_p_renewable_available_mw": "MW",
     "p_gen_scheduled_mw": "MW",
     "q_load_mvar": "Mvar",
     "bus_angle_rad": "rad",
@@ -136,7 +141,7 @@ def build_dataset(
     }
     manifest = {
         "schema_version": SCHEMA_VERSION,
-        "sample_unit": "one generated world with one 168-hour operation week",
+        "sample_unit": "one generated world with one configured hourly operation period",
         "split_policy": "split by world seed; never split hours from one world across partitions",
         "sample_count": len(samples),
         "split_counts": split_counts,
@@ -157,6 +162,7 @@ def package_world(
 ) -> dict[str, object]:
     data_dir = world_dir / "data"
     layout = WorldDataLayout(data_dir)
+    world_metadata = json.loads(layout.metadata.read_text(encoding="utf-8")) if layout.metadata.exists() else {}
     static_path = layout.existing(layout.topology, "static_maps.npz", data_dir / "static_maps.npz")
     weather_path = layout.existing(layout.weather, "hourly_weather_week.npz", data_dir / "hourly_weather_week.npz")
     forecast_path = layout.existing(
@@ -179,6 +185,7 @@ def package_world(
         "storage_dispatch_electrical.npz",
         data_dir / "storage_dispatch_electrical.npz",
     )
+    exogenous_path = layout.existing(layout.operation, "source_load_forecast.npz", data_dir / "source_load_forecast.npz")
     required = [
         static_path,
         weather_path,
@@ -189,6 +196,8 @@ def package_world(
         layout.config_snapshot,
     ]
     missing = [str(path) for path in required if not path.exists()]
+    if world_metadata.get("generator_version") == "physics_v3" and not exogenous_path.exists():
+        missing.append(str(exogenous_path))
     if missing:
         raise FileNotFoundError("World output is incomplete: " + ", ".join(missing))
 
@@ -198,6 +207,7 @@ def package_world(
     power_flow = _load_npz(power_flow_path)
     storage = _load_npz(storage_path)
     electrical = _load_npz(electrical_path)
+    exogenous = _load_npz(exogenous_path) if exogenous_path.exists() else None
     _, topology, _, _ = load_stage12_checkpoint(world_dir)
 
     static_continuous = _stack_channels(static_source, STATIC_CONTINUOUS_CHANNELS, np.float32)
@@ -218,7 +228,7 @@ def package_world(
     }
 
     graph_payload, graph_metadata = _graph_payload(topology, electrical)
-    operation_payload = _operation_payload(forecast, power_flow, storage)
+    operation_payload = _operation_payload(forecast, power_flow, storage, exogenous=exogenous)
 
     validation = _validate_modalities(
         static_continuous,
@@ -230,15 +240,23 @@ def package_world(
         graph_payload,
     )
     config_path = layout.config_snapshot
+    provenance = _world_provenance(world_metadata)
+    static_units = dict(STATIC_UNITS)
+    if provenance["generator_version"] != "physics_v3":
+        # Repackaging old outputs cannot magically convert their normalized
+        # density index to persons/km2. Keep the original data and its meaning.
+        static_units["population_density"] = "legacy_normalized_index"
     metadata = {
         "schema_version": SCHEMA_VERSION,
         "sample_id": world_dir.name,
-        "seed": _seed_from_world_id(world_dir.name),
+        "seed": world_metadata.get("seed", _seed_from_world_id(world_dir.name)),
+        **provenance,
         "source_world": str(world_dir.as_posix()),
         "config_sha256": _sha256(config_path),
         "grid_shape": list(static_continuous.shape[1:]),
         "hours": int(weather["dynamic"].shape[0]),
         "static": {
+            "units": static_units,
             "continuous_channels": list(STATIC_CONTINUOUS_CHANNELS),
             "categorical_channels": list(STATIC_CATEGORICAL_CHANNELS),
             "continuous_statistics": _channel_statistics(static_continuous, STATIC_CONTINUOUS_CHANNELS),
@@ -252,11 +270,15 @@ def package_world(
         },
         "graph": graph_metadata,
         "operation": {
+            "units": OPERATION_UNITS,
+            "exogenous_available": exogenous is not None,
+            "exogenous_source": "stage_11_operation/source_load_forecast.npz" if exogenous is not None else None,
+            "node_dynamic_semantics": "Stage 14 dispatch: load includes charging; availability includes storage power",
             "bus_count": int(forecast["bus_ids"].size),
             "branch_count": int(power_flow["branch_ids"].size),
             "storage_site_count": int(storage["site_ids"].size),
             "peak_load_mw": float(np.max(storage["total_load_mw"])),
-            "peak_line_loading_ratio": float(np.max(power_flow["line_loading_ratio"])),
+            "peak_line_loading_ratio": float(np.max(power_flow["line_loading_ratio"], initial=0.0)),
             "total_unserved_mwh": float(np.sum(power_flow["unserved_load_mw"])),
         },
         "validation": validation,
@@ -264,9 +286,6 @@ def package_world(
     seed = metadata["seed"]
     sample_name = f"seed{seed}.npz" if seed is not None else f"{world_dir.name}.npz"
     sample_path = sample_root / sample_name
-    legacy_sample_dir = sample_root / world_dir.name
-    if legacy_sample_dir.is_dir():
-        shutil.rmtree(legacy_sample_dir)
     payload = {
         **_prefix_payload("static", static_payload),
         **_prefix_payload("dynamic", dynamic_payload),
@@ -293,6 +312,9 @@ def package_world(
         "peak_line_loading_ratio": metadata["operation"]["peak_line_loading_ratio"],
         "file": file_info,
         "validation_passed": bool(validation["passed"]),
+        "generator_version": provenance["generator_version"],
+        "scenario_semantics": provenance["scenario_semantics"],
+        "exogenous_available": exogenous is not None,
     }
 
 
@@ -328,6 +350,11 @@ def dataset_schema() -> dict[str, object]:
             },
             "operation": {
                 "node_dynamic": "float32 [T,C_node,N]",
+                "node_dynamic_semantics": "Stage 14 dispatch quantities; includes storage charging and inverter capacity",
+                "exogenous_p_load_mw": "optional float32 [T,N]: Stage 11 requested demand, without storage charging",
+                "exogenous_p_gen_available_mw": "optional float32 [T,N]: Stage 11 generator availability, without storage capacity or later expansion",
+                "exogenous_p_renewable_available_mw": "optional float32 [T,N]: Stage 11 wind/PV availability, zero at other bus kinds",
+                "exogenous_bus_present": "optional bool [N]: final bus existed in Stage 11",
                 "line_dynamic": "float32 [T,C_line,E]",
                 "storage time series": "float32 [T,S], except soc_mwh [T+1,S]",
             },
@@ -339,6 +366,8 @@ def dataset_schema() -> dict[str, object]:
         "node_type_mapping": NODE_TYPE_TO_ID,
         "static_units": STATIC_UNITS,
         "operation_units": OPERATION_UNITS,
+        "dispatch_semantics": "perfect_foresight_dispatch",
+        "forecast_evaluation": "Future weather is realized weather, not a forecast available at issue time. Final topology and dispatch were planned using the operation period.",
     }
 
 
@@ -368,11 +397,11 @@ def _graph_payload(topology: object, electrical: dict[str, np.ndarray]) -> tuple
     node_electrical = np.asarray([bus_electrical[int(bus.bus_id)][1:7] for bus in buses], dtype=np.float32)
     edge_id = np.asarray([edge.edge_id for edge in edges], dtype=np.int32)
     node_position = {int(bus_id): index for index, bus_id in enumerate(node_id)}
-    edge_bus_ids = np.asarray([[edge.from_bus, edge.to_bus] for edge in edges], dtype=np.int32).T
+    edge_bus_ids = np.asarray([[edge.from_bus, edge.to_bus] for edge in edges], dtype=np.int32).reshape(-1, 2).T
     edge_index = np.asarray(
         [[node_position[int(edge.from_bus)], node_position[int(edge.to_bus)]] for edge in edges],
         dtype=np.int32,
-    ).T
+    ).reshape(-1, 2).T
     edge_features = np.asarray(
         [
             [
@@ -385,8 +414,8 @@ def _graph_payload(topology: object, electrical: dict[str, np.ndarray]) -> tuple
     )
     path_lengths = np.asarray([len(edge.path_rows) for edge in edges], dtype=np.int32)
     path_ptr = np.concatenate((np.asarray([0], dtype=np.int32), np.cumsum(path_lengths, dtype=np.int32)))
-    path_row = np.concatenate([np.asarray(edge.path_rows, dtype=np.int16) for edge in edges])
-    path_col = np.concatenate([np.asarray(edge.path_cols, dtype=np.int16) for edge in edges])
+    path_row = np.concatenate([np.asarray(edge.path_rows, dtype=np.int16) for edge in edges]) if edges else np.empty(0, dtype=np.int16)
+    path_col = np.concatenate([np.asarray(edge.path_cols, dtype=np.int16) for edge in edges]) if edges else np.empty(0, dtype=np.int16)
     payload = {
         "node_id": node_id,
         "node_type": node_type,
@@ -437,6 +466,7 @@ def _operation_payload(
     forecast: dict[str, np.ndarray],
     power_flow: dict[str, np.ndarray],
     storage: dict[str, np.ndarray],
+    *, exogenous: dict[str, np.ndarray] | None = None,
 ) -> dict[str, np.ndarray]:
     node_sources = forecast | power_flow
     line_sources = power_flow | storage
@@ -487,7 +517,61 @@ def _operation_payload(
         "thermal_capacity_expansion_mw",
     ):
         payload[key] = storage[key]
+    if exogenous is not None:
+        payload.update(_exogenous_payload(exogenous, forecast["bus_ids"], forecast["timestamps"]))
     return payload
+
+
+def _exogenous_payload(source: dict[str, np.ndarray], final_bus_ids: np.ndarray, timestamps: np.ndarray) -> dict[str, np.ndarray]:
+    """Map pre-dispatch realizations by business ID, without inventing targets.
+
+    New zero-injection transit buses receive zeros and a false presence mask.
+    Removing a bus with nonzero original injection is rejected: otherwise a
+    changed topology could silently destroy energy during dataset packaging.
+    """
+    if not np.array_equal(source["timestamps"], timestamps):
+        raise ValueError("Stage 11 and final-operation timestamps differ")
+    original_ids = np.asarray(source["bus_ids"])
+    target_ids = np.asarray(final_bus_ids)
+    if len(np.unique(original_ids)) != original_ids.size or len(np.unique(target_ids)) != target_ids.size:
+        raise ValueError("Exogenous bus mapping requires unique bus IDs")
+    source_index = {int(bus_id): i for i, bus_id in enumerate(original_ids)}
+    missing = ~np.isin(original_ids, target_ids)
+    payload: dict[str, np.ndarray] = {}
+    for name in ("p_load_mw", "p_gen_available_mw"):
+        values = np.asarray(source[name], dtype=np.float32)
+        if values.shape != (len(timestamps), len(original_ids)):
+            raise ValueError(f"Stage 11 {name} has inconsistent shape")
+        if not np.isfinite(values).all() or np.any(values < 0):
+            raise ValueError(f"Stage 11 {name} must be finite and nonnegative")
+        if np.any(values[:, missing] != 0):
+            raise ValueError("Final topology removed a bus with nonzero exogenous injection")
+        mapped = np.zeros((len(timestamps), len(target_ids)), dtype=np.float32)
+        for target_index, bus_id in enumerate(target_ids):
+            if int(bus_id) in source_index:
+                mapped[:, target_index] = values[:, source_index[int(bus_id)]]
+        payload[f"exogenous_{name}"] = mapped
+    kinds = np.asarray(source["bus_kinds"])
+    if kinds.shape != original_ids.shape:
+        raise ValueError("Stage 11 bus kinds must match bus IDs")
+    renewable_mask = np.asarray([
+        int(bus_id) in source_index and str(kinds[source_index[int(bus_id)]]) in {"wind_bus", "pv_bus"}
+        for bus_id in target_ids
+    ])
+    payload["exogenous_p_renewable_available_mw"] = payload["exogenous_p_gen_available_mw"] * renewable_mask[None, :]
+    payload["exogenous_bus_present"] = np.isin(target_ids, original_ids)
+    return payload
+
+
+def _world_provenance(world_metadata: dict[str, object]) -> dict[str, object]:
+    return {
+        "generator_version": world_metadata.get("generator_version", "legacy_unspecified"),
+        "scenario_semantics": world_metadata.get("scenario_semantics", "unspecified_legacy"),
+        "time_convention": world_metadata.get("time_convention", "unspecified_legacy"),
+        "execution_stage_order": world_metadata.get("execution_stage_order", []),
+        "dispatch_semantics": "perfect_foresight_dispatch",
+        "forecast_feature_availability": "Future weather is realized; final topology, capacities and dispatch use the full operation period.",
+    }
 
 
 def _validate_modalities(
@@ -532,7 +616,7 @@ def _validate_modalities(
             and np.isfinite(power_flow["line_loading_ratio"]).all()
             and np.isfinite(storage["soc_mwh"]).all()
         ),
-        "nonnegative_line_loading": bool(np.min(power_flow["line_loading_ratio"]) >= -1e-6),
+        "nonnegative_line_loading": bool(np.min(power_flow["line_loading_ratio"], initial=0.0) >= -1e-6),
     }
     unserved = power_flow["unserved_load_mw"]
     diagnostics = {
@@ -631,19 +715,26 @@ def _write_json(path: Path, payload: object) -> None:
 def _dataset_readme() -> str:
     return """# SimGenr dataset preview
 
-Each sample is one generated 64 x 64 world paired with one 168-hour operation week.
+Each sample is one generated world paired with its configured hourly operation period.
 
 - `samples/seed<seed>.npz`: one complete world sample.
 - `static__*`: continuous and categorical spatial channels.
 - `dynamic__*`: hourly weather fields in TCHW layout.
 - `graph__*`: final Stage 12 buses, branches, electrical attributes, and ragged A* paths.
-- `operation__*`: final Stage 14 source/load, power-flow, and storage time series.
+- `operation__node_dynamic`: final Stage 14 source/load, power-flow and storage operation; demand includes charging.
+- `operation__exogenous_*`: Stage 11 original demand and availability mapped to final bus IDs, when present.
 - `metadata_json` and `config_yaml`: embedded metadata and generation configuration.
 
 Rendered PNG/WebP figures are not packaged into training samples.
 
 Dataset partitions must be assigned by world seed. Hours from one world must never be split across train,
 validation, and test partitions.
+
+Schema 0.6.0 preserves generator_version and scenario_semantics. Dispatch and final graph
+are planned with perfect knowledge of the operation period. Future weather is realized
+weather, not an issue-time forecast. Exogenous targets remove storage contamination but
+do not by themselves make this dataset free of future-information leakage. Legacy files
+without Stage 11 arrays remain readable; exogenous arrays are never fabricated from dispatch.
 """
 
 
