@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from world_generator.core.contracts import entity_ids, interval_bounds_hours
 from world_generator.core.datatypes import GridElectricalState, PowerFlowStore, RefinedGridTopologyState, SourceLoadForecastStore
 
 
@@ -12,84 +13,124 @@ def solve_dc_power_flow(
     forecast: SourceLoadForecastStore,
     refined_topology: RefinedGridTopologyState,
     electrical: GridElectricalState,
+    *, branch_in_service: np.ndarray | None = None, rebalance: bool = True,
 ) -> PowerFlowStore:
     buses = refined_topology.refined_buses
     branches = electrical.branch_params
     hours = forecast.p_load_mw.shape[0]
-    bus_ids = np.asarray([bus.bus_id for bus in buses], dtype=np.int32)
-    branch_ids = np.asarray([branch.edge_id for branch in branches], dtype=np.int32)
+    bus_ids = entity_ids(np.asarray([bus.bus_id for bus in buses]), "DC bus_ids").astype(np.int32)
+    branch_ids = entity_ids(np.asarray([branch.edge_id for branch in branches]), "DC branch_ids").astype(np.int32)
+    interval_bounds_hours(forecast.timestamps, 1.0)
     bus_index = {int(bus_id): index for index, bus_id in enumerate(bus_ids)}
     if not buses or len(bus_index) != len(buses):
         raise ValueError("DC power flow requires nonempty, uniquely identified buses")
     if not np.array_equal(forecast.bus_ids, bus_ids):
         raise ValueError("Forecast bus order must match topology bus order")
-    for values in (forecast.p_load_mw, forecast.p_gen_scheduled_mw):
+    for values in (forecast.p_load_mw, forecast.p_gen_scheduled_mw, forecast.p_gen_available_mw):
         if values.shape != (hours, len(buses)) or not np.all(np.isfinite(values)) or np.any(values < 0.0):
             raise ValueError("Source/load power must be finite, nonnegative [time, bus] arrays")
+    if np.any(forecast.p_gen_scheduled_mw > forecast.p_gen_available_mw + 1e-6):
+        raise ValueError("Scheduled generation cannot exceed available generation")
     slack_index = _choose_slack_bus_index(refined_topology)
 
     susceptance = _branch_susceptance_mw_per_rad(branches)
-    b_matrix = _build_b_matrix(branches, bus_index, susceptance, len(buses))
-    components = _network_components(len(buses), branches, bus_index)
+    in_service = _branch_status(branch_in_service, hours, len(branches))
+    patterns = {}
+    for pattern in np.unique(in_service, axis=0):
+        active = tuple(branch for branch, enabled in zip(branches, pattern) if enabled)
+        patterns[pattern.tobytes()] = (
+            _build_b_matrix(active, bus_index, susceptance[pattern], len(buses)),
+            _network_components(len(buses), active, bus_index),
+        )
 
     bus_angle = np.zeros((hours, len(buses)), dtype=np.float64)
-    bus_injection = np.zeros((hours, len(buses)), dtype=np.float32)
-    served_load = np.zeros_like(forecast.p_load_mw, dtype=np.float32)
-    dispatched_generation = np.zeros_like(forecast.p_gen_scheduled_mw, dtype=np.float32)
-    unserved_load = np.zeros_like(forecast.p_load_mw, dtype=np.float32)
-    curtailed_generation = np.zeros_like(forecast.p_gen_scheduled_mw, dtype=np.float32)
-    line_flow = np.zeros((hours, len(branches)), dtype=np.float32)
+    bus_injection = np.zeros((hours, len(buses)), dtype=np.float64)
+    served_load = np.zeros_like(forecast.p_load_mw, dtype=np.float64)
+    dispatched_generation = np.zeros_like(forecast.p_gen_scheduled_mw, dtype=np.float64)
+    unserved_load = np.zeros_like(forecast.p_load_mw, dtype=np.float64)
+    curtailed_generation = np.zeros_like(forecast.p_gen_scheduled_mw, dtype=np.float64)
+    line_flow = np.zeros((hours, len(branches)), dtype=np.float64)
+    island_id = np.zeros((hours, len(buses)), dtype=np.int64)
 
     bus_kinds = np.asarray(forecast.bus_kinds)
     renewable_mask = np.isin(bus_kinds, ("wind_bus", "pv_bus"))
     generation_mask = forecast.p_gen_scheduled_mw.max(axis=0) > 0.0
 
     for hour in range(hours):
+        _, components = patterns[in_service[hour].tobytes()]
         load = forecast.p_load_mw[hour].astype(np.float64, copy=True)
         generation = forecast.p_gen_scheduled_mw[hour].astype(np.float64, copy=True)
         unserved = np.zeros_like(load)
         curtailed = np.zeros_like(generation)
         # An island cannot import a fictitious supply from the global slack bus.
         for component in components:
-            load[component], generation[component], unserved[component], curtailed[component] = _balance_dispatch(
-                load[component], generation[component], renewable_mask[component], generation_mask[component]
-            )
+            island_id[hour, component] = int(bus_ids[component].min())
+            if rebalance:
+                load[component], generation[component], unserved[component], curtailed[component] = _balance_dispatch(
+                    load[component], generation[component], renewable_mask[component], generation_mask[component]
+                )
+            elif abs(float((generation[component] - load[component]).sum())) > 1e-5 + 1e-10 * float(load[component].sum()):
+                raise ValueError("Declared dispatch does not balance an active island")
         p_injection = generation - load
-        bus_injection[hour] = p_injection.astype(np.float32)
-        served_load[hour] = load.astype(np.float32)
-        dispatched_generation[hour] = generation.astype(np.float32)
-        unserved_load[hour] = unserved.astype(np.float32)
-        curtailed_generation[hour] = curtailed.astype(np.float32)
+        bus_injection[hour] = p_injection
+        served_load[hour] = load
+        dispatched_generation[hour] = generation
+        unserved_load[hour] = unserved
+        curtailed_generation[hour] = curtailed
 
     # Factor/solve once per island for all hours, rather than once per snapshot.
-    for component in components:
-        reference = slack_index if slack_index in component else int(component[0])
-        non_slack = component[component != reference]
-        if non_slack.size:
-            angles = _solve_reduced_angles(
-                b_matrix[np.ix_(non_slack, non_slack)], bus_injection[:, non_slack].astype(np.float64).T
-            ).T
-            bus_angle[:, non_slack] = angles
+    for pattern_key, (b_matrix, components) in patterns.items():
+        selected_hours = np.flatnonzero([row.tobytes() == pattern_key for row in in_service])
+        for component in components:
+            reference = slack_index if slack_index in component else int(component[0])
+            non_slack = component[component != reference]
+            if non_slack.size:
+                angles = _solve_reduced_angles(
+                    b_matrix[np.ix_(non_slack, non_slack)], bus_injection[np.ix_(selected_hours, non_slack)].T
+                ).T
+                bus_angle[np.ix_(selected_hours, non_slack)] = angles
     for index, (branch, branch_b) in enumerate(zip(branches, susceptance)):
         i, j = bus_index[int(branch.from_bus)], bus_index[int(branch.to_bus)]
-        line_flow[:, index] = branch_b * (bus_angle[:, i].astype(np.float64) - bus_angle[:, j])
+        line_flow[:, index] = in_service[:, index] * branch_b * (bus_angle[:, i] - bus_angle[:, j])
 
-    rates = np.asarray([max(float(branch.rate_mva), 1e-6) for branch in branches], dtype=np.float32)
+    rates = np.asarray([float(branch.rate_mva) for branch in branches], dtype=float)
+    if not np.isfinite(rates).all() or np.any(rates <= 0):
+        raise ValueError("DC branch ratings must be finite and positive")
     line_loading = np.abs(line_flow) / rates[None, :] if len(branches) else np.zeros_like(line_flow)
     return PowerFlowStore(
         timestamps=forecast.timestamps.copy(),
         bus_ids=bus_ids,
         branch_ids=branch_ids,
-        bus_angle_rad=bus_angle.astype(np.float32),
+        bus_angle_rad=bus_angle,
         bus_p_injection_mw=bus_injection,
         served_load_mw=served_load,
         dispatched_generation_mw=dispatched_generation,
         unserved_load_mw=unserved_load,
         curtailed_generation_mw=curtailed_generation,
         line_flow_mw=line_flow,
-        line_loading_ratio=line_loading.astype(np.float32),
+        line_loading_ratio=line_loading,
         slack_bus_id=int(bus_ids[slack_index]),
+        operation_arrays={
+            "requested_load_mw": np.asarray(forecast.p_load_mw, dtype=float).copy(),
+            "generation_available_mw": np.asarray(forecast.p_gen_available_mw, dtype=float).copy(),
+            "renewable_curtailment_mw": (forecast.p_gen_available_mw - dispatched_generation) * renewable_mask,
+            "thermal_backdown_mw": curtailed_generation * (bus_kinds == "thermal_bus"),
+            "thermal_unused_available_mw": (forecast.p_gen_available_mw - dispatched_generation) * (bus_kinds == "thermal_bus"),
+            "island_id": island_id, "branch_in_service": in_service,
+        },
+        operation_metadata={"schema_version": "operation_v1", "store_kind": "power_flow",
+                            "network_model": "lossless_DC_fixed_voltage_magnitude; no_voltage_or_frequency_security",
+                            "balance_scope": "each_active_island", "power_basis": "input_forecast_including_storage_if_present"},
     )
+
+
+def _branch_status(values: np.ndarray | None, hours: int, count: int) -> np.ndarray:
+    if values is None:
+        return np.ones((hours, count), dtype=bool)
+    values = np.asarray(values)
+    if values.shape != (hours, count) or not np.isin(values, (0, 1)).all():
+        raise ValueError("branch_in_service must be boolean [T,E] in persistent electrical branch order")
+    return values.astype(bool)
 
 
 def _choose_slack_bus_index(refined_topology: RefinedGridTopologyState) -> int:
@@ -169,7 +210,7 @@ def _balance_dispatch(
     total_generation = float(generation.sum())
     imbalance = total_generation - total_load
 
-    if imbalance > 1e-6:
+    if imbalance > 0:
         remaining = imbalance
         # Economic screening: back down dispatchable units before spilling renewables.
         dispatchable_generation = dispatched * generation_mask * ~renewable_mask
@@ -177,12 +218,12 @@ def _balance_dispatch(
         dispatched -= backed_down
         curtailed += backed_down
         remaining -= float(backed_down.sum())
-        if remaining > 1e-6:
+        if remaining > 0:
             generator_generation = dispatched * generation_mask
             curtailed_generator = _proportional_reduction(generator_generation, remaining)
             dispatched -= curtailed_generator
             curtailed += curtailed_generator
-    elif imbalance < -1e-6 and total_load > 1e-6:
+    elif imbalance < 0 and total_load > 0:
         unserved = _proportional_reduction(served_load, -imbalance)
         served_load -= unserved
 
@@ -191,7 +232,7 @@ def _balance_dispatch(
 
 def _proportional_reduction(values: np.ndarray, target: float) -> np.ndarray:
     total = float(values.sum())
-    if total <= 1e-9 or target <= 1e-9:
+    if total <= 0 or target <= 0:
         return np.zeros_like(values)
     amount = min(float(target), total)
     return values * (amount / total)

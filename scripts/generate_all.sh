@@ -12,11 +12,22 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
   fi
 fi
 
-CONFIGS="${CONFIGS:-${PROJECT_ROOT}/configs/small_debug.yaml}"
-SEEDS="${SEEDS:-42 123}"
+if [[ -n "${CONFIGS:-}" ]]; then
+  # Preserve the existing whitespace-separated multi-config interface.
+  # read -d '' consumes the whole list, including newline-separated entries.
+  IFS=$' \t\n' read -r -d '' -a config_paths <<< "${CONFIGS}" || true
+else
+  # The default absolute path is one argument even when the checkout has spaces.
+  config_paths=("${PROJECT_ROOT}/configs/small_debug.yaml")
+fi
+IFS=$' \t\n' read -r -d '' -a seeds <<< "${SEEDS:-42 123}" || true
 
-for config in ${CONFIGS}; do
-  for seed in ${SEEDS}; do
+# Resolve configured relative paths and output roots against this repository,
+# independently of the directory from which the batch script was invoked.
+cd "${PROJECT_ROOT}"
+
+for config in "${config_paths[@]}"; do
+  for seed in "${seeds[@]}"; do
     echo "==> Generating config=${config} seed=${seed}"
     args=("${PROJECT_ROOT}/scripts/generate_static_world.py" "--config" "${config}" "--seed" "${seed}")
     if [[ -n "${OUTPUT_ROOT:-}" ]]; then

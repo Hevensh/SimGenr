@@ -74,6 +74,7 @@ def generate_hydrology(
     return HydrologyState(
         flow_direction=flow_direction.astype(np.int8),
         flow_accumulation=flow_accumulation.astype(np.float32),
+        catchment_area_km2=(flow_accumulation * float(grid.cell_size_km)**2).astype(np.float64),
         river_centerline=river_centerline,
         river=river,
         lake=lake,
@@ -143,6 +144,7 @@ def _generate_conditioned_hydrology(
     return HydrologyState(
         flow_direction=flow_direction.astype(np.int8),
         flow_accumulation=flow_accumulation.astype(np.float32),
+        catchment_area_km2=catchment_area_km2.astype(np.float64),
         river_centerline=river_centerline,
         river=river,
         lake=lake,

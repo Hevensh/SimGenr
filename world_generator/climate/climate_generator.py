@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import numpy as np
+from scipy.special import ndtr
 
 from world_generator.core.config import ClimateConfig, WorldGridConfig
 from world_generator.core.datatypes import ClimateBaseline, HydrologyState, TerrainFeatures
 from world_generator.weather.physics import clear_sky_transmissivity, extraterrestrial_hourly_irradiance, latitude_grid
+from world_generator.weather.random_fields import gaussian_field
 
 
 def generate_climate_baseline(
@@ -20,7 +22,10 @@ def generate_climate_baseline(
     elevation_n = np.clip(terrain.elevation / 4000.0, 0.0, 1.0)
     slope_n = np.clip(terrain.slope / 0.35, 0.0, 1.0)
     water_influence = np.exp(-hydrology.distance_to_water / max(config.water_moderation_km, 1e-6))
-    broad_noise = _smooth_noise((height, width), rng, steps=5)
+    broad_noise = _spatial_noise(
+        (height, width), rng, config, grid.cell_size_km,
+        config.climate_correlation_length_km, legacy_steps=5,
+    )
 
     # Base temperature is the equatorial sea-level reference; the gradient is
     # equator-to-pole, not an arbitrary full change across every small map.
@@ -48,6 +53,7 @@ def generate_climate_baseline(
         base_v,
         config,
         rng,
+        cell_size_km=grid.cell_size_km,
     )
     wind_exposure = _wind_exposure(terrain, wind_dir_u, wind_dir_v, grid.cell_size_km)
     wind_speed = config.prevailing_wind_speed_mps * (
@@ -107,6 +113,8 @@ def _terrain_steered_wind_direction(
     base_v: float,
     config: ClimateConfig,
     rng: np.random.Generator,
+    *,
+    cell_size_km: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     grad_y, grad_x = _elevation_gradient(terrain.elevation)
     grad_mag = np.hypot(grad_x, grad_y)
@@ -117,10 +125,10 @@ def _terrain_steered_wind_direction(
     channel_u = np.where(tangent_alignment >= 0.0, tangent_u, -tangent_u)
     channel_v = np.where(tangent_alignment >= 0.0, tangent_v, -tangent_v)
 
-    angle_noise = _smooth_noise(
-        terrain.elevation.shape,
-        rng,
-        steps=config.wind_direction_smoothing_steps,
+    angle_noise = _spatial_noise(
+        terrain.elevation.shape, rng, config, cell_size_km,
+        config.wind_direction_correlation_length_km,
+        legacy_steps=config.wind_direction_smoothing_steps,
     )
     angle = np.deg2rad(config.wind_direction_noise_degrees) * (2.0 * angle_noise - 1.0)
     noisy_u = base_u * np.cos(angle) - base_v * np.sin(angle)
@@ -156,7 +164,24 @@ def _elevation_gradient(elevation: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return gradient_row, gradient_col
 
 
+def _spatial_noise(
+    shape: tuple[int, int], rng: np.random.Generator, config: ClimateConfig,
+    cell_size_km: float, correlation_length_km: float, *, legacy_steps: int,
+) -> np.ndarray:
+    """S: bounded scenario perturbation, not a measured climate covariance.
+
+    In physical mode L is the latent Gaussian covariance e-folding distance;
+    sigma_cells=L/(2*dx). The fixed Gaussian CDF maps to [0,1] without domain
+    min/max rescaling. The bounded field's covariance is not exactly Gaussian.
+    Explicit legacy mode retains the old pixel stencil and normalization.
+    """
+    if config.spatial_scale_mode == "legacy":
+        return _smooth_noise(shape, rng, steps=legacy_steps)
+    return ndtr(gaussian_field(shape, rng, correlation_length_km, cell_size_km, config.spatial_boundary))
+
+
 def _smooth_noise(shape: tuple[int, int], rng: np.random.Generator, steps: int) -> np.ndarray:
+    """Compatibility-only pixel stencil; physical mode never calls this."""
     noise = rng.random(shape, dtype=np.float32)
     for _ in range(max(steps, 0)):
         padded = np.pad(noise, 1, mode="edge")

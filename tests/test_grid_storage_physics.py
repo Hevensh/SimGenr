@@ -108,7 +108,13 @@ def test_noncyclic_horizon_uses_configured_initial_energy():
     config = replace(StorageConfig(), cyclic_state_of_charge=False, minimum_soc_fraction=0.,
                      maximum_soc_fraction=1., max_storage_power_expansion_fraction=0.,
                      max_storage_energy_expansion_fraction=0.)
-    storage, _, flow, _ = dispatch_storage_week(topology, electrical, baseline, storage_plan(1, 5., 10.), config)
+    # This case isolates the initial energy boundary. The explicit preceding
+    # 3 MW discharge also makes the first ramp feasible; an unspecified prior
+    # power must no longer grant a free jump in the first operating interval.
+    storage, _, flow, _ = dispatch_storage_week(
+        topology, electrical, baseline, storage_plan(1, 5., 10.), config,
+        previous_storage_net_mw_by_site_id={0: 3.0},
+    )
     np.testing.assert_allclose(storage.soc_mwh[0], [5.], atol=1e-6)
     np.testing.assert_allclose(storage.soc_mwh[-1], [5. - 3. / .95], atol=1e-5)
     assert np.sum(flow.unserved_load_mw) < 1e-5

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import json
 
 import numpy as np
+
+from world_generator.core.contracts import interval_bounds_hours, validate_node_arrays, validate_weather_arrays
 
 
 FloatMap = np.ndarray
@@ -47,9 +50,10 @@ class HydrologyState:
     watershed_id: np.ndarray
     distance_to_water: FloatMap
     flood_risk: FloatMap
+    catchment_area_km2: FloatMap | None = None
 
     def as_maps(self) -> dict[str, np.ndarray]:
-        return {
+        maps = {
             "flow_direction": self.flow_direction,
             "flow_accumulation": self.flow_accumulation,
             "river_centerline": self.river_centerline,
@@ -61,6 +65,82 @@ class HydrologyState:
             "distance_to_water": self.distance_to_water,
             "flood_risk": self.flood_risk,
         }
+        if self.catchment_area_km2 is not None:
+            maps["catchment_area_km2"] = self.catchment_area_km2
+        return maps
+
+
+@dataclass(frozen=True)
+class HydrologyTimeSeriesStore:
+    """D: six explicit boundary states, interval fluxes and static water geometry."""
+
+    timestamps: np.ndarray
+    time_bounds_hours: np.ndarray
+    state_time_hours: np.ndarray
+    states: dict[str, np.ndarray]
+    fluxes: dict[str, np.ndarray]
+    static_maps: dict[str, np.ndarray]
+    budgets: dict[str, np.ndarray]
+    metadata: dict[str, object] = field(default_factory=dict)
+
+    def as_arrays(self) -> dict[str, np.ndarray]:
+        from world_generator.core.contracts import integer_labels
+        from world_generator.core.hydrology_contracts import HYDROLOGY_GROUP_UNITS, HYDROLOGY_MODE, HYDROLOGY_SCHEMA_VERSION, hydrology_field_schema
+
+        bounds = interval_bounds_hours(self.timestamps, 1.0)
+        if self.time_bounds_hours.shape != bounds.shape or not np.allclose(self.time_bounds_hours, bounds, rtol=0, atol=1e-9):
+            raise ValueError("Hydrology interval bounds must match consecutive hourly timestamps")
+        state_time = np.r_[bounds[:, 0], bounds[-1, 1]]
+        if self.state_time_hours.shape != state_time.shape or not np.allclose(self.state_time_hours, state_time, rtol=0, atol=1e-9):
+            raise ValueError("Hydrology state_time_hours must have the T+1 interval boundaries")
+        groups = {"state": self.states, "flux": self.fluxes, "static": self.static_maps, "budget": self.budgets}
+        for group, values in groups.items():
+            if set(values) != set(HYDROLOGY_GROUP_UNITS[group]):
+                raise ValueError(f"Hydrology {group} fields must exactly match hydrology_v1")
+        soil = np.asarray(self.states["soil_storage_mm"])
+        if soil.ndim != 3 or min(soil.shape[1:]) < 1:
+            raise ValueError("Hydrology states require T+1,H,W")
+        shape, hours = soil.shape[1:], bounds.shape[0]
+        expected = {"state": (hours + 1, *shape), "flux": (hours, *shape), "static": shape, "budget": (hours,)}
+        arrays = {"timestamps": np.asarray(self.timestamps), "time_bounds_hours": np.asarray(self.time_bounds_hours),
+                  "state_time_hours": np.asarray(self.state_time_hours), "schema_version": np.asarray(HYDROLOGY_SCHEMA_VERSION),
+                  "mode": np.asarray(HYDROLOGY_MODE), "field_schema_json": np.asarray(json.dumps(hydrology_field_schema(), sort_keys=True)),
+                  "hydrology_metadata_json": np.asarray(json.dumps(self.metadata, sort_keys=True, allow_nan=False))}
+        signed = {"lake_water_level_m", "lake_bed_elevation_m", "lake_spill_elevation_m", "routing_receiver_flat_index", "cell_budget_residual_m3", "residual_m3"}
+        for group, values in groups.items():
+            for name, array in values.items():
+                array = np.asarray(array)
+                if array.shape != expected[group] or not np.isfinite(array).all():
+                    raise ValueError(f"Hydrology {group} field {name} must be finite {expected[group]}")
+                if name not in signed and np.any(array < 0):
+                    raise ValueError(f"Hydrology {name} cannot be negative")
+                if name.endswith("_fraction") and np.any(array > 1):
+                    raise ValueError(f"Hydrology {name} cannot exceed one")
+                if name in {"lake_id", "routing_receiver_flat_index"}: integer_labels(array, f"hydrology {name}")
+                if name == "routing_receiver_flat_index" and np.any((array < -2) | (array >= np.prod(shape))):
+                    raise ValueError("Hydrology receiver must be a valid cell index or -1/-2")
+                if name == "closed_sink_mask" and not np.isin(array, [0, 1]).all():
+                    raise ValueError("closed_sink_mask must be boolean")
+                arrays[f"{group}__{name}"] = array
+        return arrays
+
+    @classmethod
+    def from_arrays(cls, arrays: dict[str, np.ndarray]) -> "HydrologyTimeSeriesStore":
+        from world_generator.core.hydrology_contracts import HYDROLOGY_GROUP_UNITS, HYDROLOGY_MODE, HYDROLOGY_SCHEMA_VERSION, hydrology_field_schema
+
+        if str(arrays.get("schema_version")) != HYDROLOGY_SCHEMA_VERSION or str(arrays.get("mode")) != HYDROLOGY_MODE:
+            raise ValueError("Unsupported or missing dynamic hydrology schema/mode")
+        if json.loads(str(arrays.get("field_schema_json", "null"))) != hydrology_field_schema():
+            raise ValueError("Hydrology field schema is missing or differs from hydrology_v1")
+        expected = {f"{group}__{name}" for group, names in HYDROLOGY_GROUP_UNITS.items() for name in names}
+        expected |= {"timestamps", "time_bounds_hours", "state_time_hours", "schema_version", "mode", "field_schema_json", "hydrology_metadata_json"}
+        if set(arrays) != expected:
+            raise ValueError("Hydrology checkpoint has missing or unrecognized fields")
+        groups = [{name: np.asarray(arrays[f"{group}__{name}"]) for name in names} for group, names in HYDROLOGY_GROUP_UNITS.items()]
+        store = cls(np.asarray(arrays["timestamps"]), np.asarray(arrays["time_bounds_hours"]), np.asarray(arrays["state_time_hours"]),
+                    *groups, json.loads(str(arrays["hydrology_metadata_json"])))
+        store.as_arrays()
+        return store
 
 
 @dataclass(frozen=True)
@@ -71,9 +151,22 @@ class StaticLandState:
     buildability: FloatMap
     terrain_cost: FloatMap
     water_buffer: BoolMap
+    landform: np.ndarray | None = None
+    land_cover_type: np.ndarray | None = None
+    allocatable_land_fraction: FloatMap | None = None
+
+    def __post_init__(self) -> None:
+        axes = (self.landform, self.land_cover_type, self.allocatable_land_fraction)
+        if any(values is not None for values in axes):
+            if not all(values is not None and values.shape == self.land_cover.shape for values in axes):
+                raise ValueError("New land axes must all be present as HxW maps")
+
+    @property
+    def protected_mask(self) -> np.ndarray:
+        return self.protected
 
     def as_maps(self) -> dict[str, np.ndarray]:
-        return {
+        maps = {
             "land_cover": self.land_cover,
             "vegetation": self.vegetation,
             "protected": self.protected,
@@ -81,6 +174,10 @@ class StaticLandState:
             "terrain_cost": self.terrain_cost,
             "water_buffer": self.water_buffer,
         }
+        if self.landform is not None:
+            maps.update(landform=self.landform, land_cover_type=self.land_cover_type,
+                        protected_mask=self.protected_mask, allocatable_land_fraction=self.allocatable_land_fraction)
+        return maps
 
 
 @dataclass(frozen=True)
@@ -115,16 +212,32 @@ class WeatherStore:
     channel_names: tuple[str, ...]
     time_unit: str = "day"
     start_day_of_year: int = 0
+    diagnostics: dict[str, np.ndarray] = field(default_factory=dict)
+    metadata: dict[str, object] = field(default_factory=dict)
+    static_elevation_m: np.ndarray | None = None
 
     def as_arrays(self) -> dict[str, np.ndarray]:
-        return {
+        validate_weather_arrays(self.dynamic, self.weather_class, self.timestamps, self.channel_names, self.time_unit)
+        arrays = {
             "dynamic": self.dynamic,
             "weather_class": self.weather_class,
             "timestamps": self.timestamps,
             "channel_names": np.asarray(self.channel_names),
             "time_unit": np.asarray(self.time_unit),
             "start_day_of_year": np.asarray(self.start_day_of_year, dtype=np.int32),
+            "time_bounds_hours": interval_bounds_hours(self.timestamps, 1.0 if self.time_unit == "hour" else 24.0, stamp_unit=self.time_unit),
         }
+        for name, values in self.diagnostics.items():
+            values = np.asarray(values)
+            if values.shape != self.weather_class.shape or not np.isfinite(values).all():
+                raise ValueError(f"Weather diagnostic {name!r} must be finite [T,H,W]")
+            arrays[f"diagnostic__{name}"] = values
+        if self.static_elevation_m is not None:
+            if self.static_elevation_m.shape != self.dynamic.shape[2:] or not np.isfinite(self.static_elevation_m).all():
+                raise ValueError("Weather elevation must be finite [H,W]")
+            arrays["static_elevation_m"] = self.static_elevation_m
+        arrays["weather_metadata_json"] = np.asarray(json.dumps(self.metadata, sort_keys=True, allow_nan=False))
+        return arrays
 
 
 @dataclass(frozen=True)
@@ -138,9 +251,20 @@ class SourceLoadForecastStore:
     q_load_mvar: np.ndarray
     source_channels: tuple[str, ...]
     data_semantics: str = "synthetic_realization"
+    nameplate_capacity_mw: np.ndarray | None = None
+    reference_load_mw: np.ndarray | None = None
+    initial_effective_temperature_c: np.ndarray | None = None
+    weather_sample_row: np.ndarray | None = None
+    weather_sample_col: np.ndarray | None = None
+    diagnostics: dict[str, np.ndarray] = field(default_factory=dict)
+    metadata: dict[str, object] = field(default_factory=dict)
 
     def as_arrays(self) -> dict[str, np.ndarray]:
-        return {
+        validate_node_arrays(self.timestamps, self.bus_ids, {
+            "p_load_mw": self.p_load_mw, "p_gen_available_mw": self.p_gen_available_mw,
+            "p_gen_scheduled_mw": self.p_gen_scheduled_mw, "q_load_mvar": self.q_load_mvar,
+        })
+        arrays = {
             "timestamps": self.timestamps,
             "bus_ids": self.bus_ids,
             "bus_kinds": np.asarray(self.bus_kinds),
@@ -150,7 +274,101 @@ class SourceLoadForecastStore:
             "q_load_mvar": self.q_load_mvar,
             "source_channels": np.asarray(self.source_channels),
             "data_semantics": np.asarray(self.data_semantics),
+            "time_bounds_hours": interval_bounds_hours(self.timestamps, 1.0),
         }
+        optional = (self.nameplate_capacity_mw, self.reference_load_mw, self.initial_effective_temperature_c, self.weather_sample_row, self.weather_sample_col)
+        if not any(value is not None for value in optional) and not self.diagnostics and not self.metadata:
+            return arrays
+        from world_generator.core.contracts import integer_labels, integrate_power_mwh
+        from world_generator.core.source_load_contracts import (
+            SOURCE_LOAD_SCHEMA_VERSION, SOURCE_LOAD_MODE, SOURCE_LOAD_DIAGNOSTIC_APPLICABILITY,
+            SOURCE_LOAD_ENERGY_POWER_FIELDS, SOURCE_LOAD_CF_POWER_FIELDS, source_load_field_schema,
+        )
+        if not all(value is not None for value in optional):
+            raise ValueError("Source/load appendix requires all five node attribute arrays")
+        count, hours = len(self.bus_ids), len(self.timestamps)
+        kinds = np.asarray(self.bus_kinds)
+        if kinds.shape != (count,):
+            raise ValueError("Source/load bus kinds must match bus IDs")
+        if self.metadata.get("schema_version") != SOURCE_LOAD_SCHEMA_VERSION or self.metadata.get("mode") != SOURCE_LOAD_MODE:
+            raise ValueError("Modern source/load metadata must declare source_load_v1 exogenous_realization")
+        if set(self.diagnostics) != set(SOURCE_LOAD_DIAGNOSTIC_APPLICABILITY):
+            raise ValueError("Modern source/load diagnostics must match the six-field source_load_v1 schema")
+        expected_applicability = {name: list(values) for name, values in SOURCE_LOAD_DIAGNOSTIC_APPLICABILITY.items()}
+        if self.metadata.get("diagnostic_applicability") != expected_applicability:
+            raise ValueError("Source/load diagnostic applicability must be explicit and match source_load_v1")
+        grid_shape = np.asarray(self.metadata.get("weather_grid_shape", []))
+        if grid_shape.shape != (2,) or np.any(integer_labels(grid_shape, "weather_grid_shape") <= 0):
+            raise ValueError("Source/load metadata must identify the weather grid shape")
+        for name in ("nameplate_capacity_mw", "reference_load_mw", "initial_effective_temperature_c", "weather_sample_row", "weather_sample_col"):
+            values = np.asarray(getattr(self, name))
+            if values.shape != (count,) or not np.isfinite(values).all():
+                raise ValueError(f"Source/load {name} must be finite [N]")
+            if name != "initial_effective_temperature_c" and np.any(values < 0):
+                raise ValueError(f"Source/load {name} must be nonnegative")
+            arrays[name] = values
+        for index, name in enumerate(("weather_sample_row", "weather_sample_col")):
+            positions = integer_labels(arrays[name], name)
+            if np.any(positions >= grid_shape[index]):
+                raise ValueError("Source/load weather sample coordinates exceed the weather grid")
+        load_mask = kinds == "load_bus"
+        if np.any(arrays["reference_load_mw"][~load_mask] != 0) or np.any(arrays["initial_effective_temperature_c"][~load_mask] != 0):
+            raise ValueError("Load reference and thermal initial state must be zero on non-load buses")
+        for name, applies in SOURCE_LOAD_DIAGNOSTIC_APPLICABILITY.items():
+            values = np.asarray(self.diagnostics[name])
+            if values.shape != (hours, count) or not np.isfinite(values).all():
+                raise ValueError(f"Source/load diagnostic {name} must be finite [T,N]")
+            if np.any(values[:, ~np.isin(kinds, applies)] != 0):
+                raise ValueError(f"Source/load diagnostic {name} is nonzero outside applicable bus kinds")
+            if name in {"hub_wind_speed_mps", "wind_air_density_kg_m3", "pv_poa_w_m2"} and np.any(values < 0):
+                raise ValueError(f"Source/load diagnostic {name} must be nonnegative")
+            arrays[f"diag__{name}"] = values
+        valid = np.isin(kinds, ("wind_bus", "pv_bus", "thermal_bus")) & (arrays["nameplate_capacity_mw"] > 0)
+        arrays["capacity_factor_valid"] = valid
+        duration = arrays["time_bounds_hours"][:, 1] - arrays["time_bounds_hours"][:, 0]
+        for name, power_name in SOURCE_LOAD_ENERGY_POWER_FIELDS.items():
+            power = np.asarray(arrays[power_name], dtype=np.float64)
+            arrays[name] = power * duration[:, None]
+            arrays[f"period_{name}"] = integrate_power_mwh(power, duration)
+        for name, power_name in SOURCE_LOAD_CF_POWER_FIELDS.items():
+            arrays[name] = np.divide(arrays[power_name], arrays["nameplate_capacity_mw"][None, :],
+                                     out=np.zeros((hours, count), dtype=float), where=valid[None, :])
+        arrays["source_load_schema_version"] = np.asarray(SOURCE_LOAD_SCHEMA_VERSION)
+        arrays["source_load_field_schema_json"] = np.asarray(json.dumps(source_load_field_schema(), sort_keys=True))
+        arrays["source_load_metadata_json"] = np.asarray(json.dumps(self.metadata, sort_keys=True, allow_nan=False))
+        return arrays
+
+    @classmethod
+    def from_arrays(cls, arrays: dict[str, np.ndarray]) -> "SourceLoadForecastStore":
+        from world_generator.core.source_load_contracts import SOURCE_LOAD_SCHEMA_VERSION, source_load_field_schema
+
+        base = ("timestamps", "bus_ids", "bus_kinds", "p_load_mw", "p_gen_available_mw", "p_gen_scheduled_mw", "q_load_mvar", "source_channels")
+        if not set(base).issubset(arrays):
+            raise ValueError("Source/load checkpoint is missing required power or identity fields")
+        bounds = interval_bounds_hours(arrays["timestamps"], 1.0)
+        if "time_bounds_hours" in arrays and (np.asarray(arrays["time_bounds_hours"]).shape != bounds.shape or not np.allclose(arrays["time_bounds_hours"], bounds, rtol=0, atol=1e-9)):
+            raise ValueError("Source/load checkpoint has inconsistent interval bounds")
+        kwargs = {}
+        schema = source_load_field_schema()
+        modern = any(name in arrays for name in ("source_load_schema_version", "source_load_metadata_json", "source_load_field_schema_json")) or any(name in arrays for name in schema) or any(name.startswith("diag__") for name in arrays)
+        if modern:
+            if str(arrays.get("source_load_schema_version")) != SOURCE_LOAD_SCHEMA_VERSION or json.loads(str(arrays.get("source_load_field_schema_json", "null"))) != schema:
+                raise ValueError("Source/load appendix schema is missing or inconsistent")
+            expected = set(base) | set(schema) | {"data_semantics", "time_bounds_hours", "source_load_schema_version", "source_load_field_schema_json", "source_load_metadata_json"}
+            if set(arrays) != expected:
+                raise ValueError("Source/load appendix is incomplete or has unknown fields")
+            kwargs = {name: np.asarray(arrays[name]) for name in ("nameplate_capacity_mw", "reference_load_mw", "initial_effective_temperature_c", "weather_sample_row", "weather_sample_col")}
+            kwargs["diagnostics"] = {name.removeprefix("diag__"): np.asarray(arrays[name]) for name in schema if name.startswith("diag__")}
+            kwargs["metadata"] = json.loads(str(arrays["source_load_metadata_json"]))
+        store = cls(np.asarray(arrays["timestamps"]), np.asarray(arrays["bus_ids"]), tuple(str(item) for item in arrays["bus_kinds"]),
+                    *(np.asarray(arrays[name]) for name in ("p_load_mw", "p_gen_available_mw", "p_gen_scheduled_mw", "q_load_mvar")),
+                    tuple(str(item) for item in arrays["source_channels"]), str(arrays.get("data_semantics", "synthetic_realization")), **kwargs)
+        checked = store.as_arrays()
+        if modern:
+            for name in schema:
+                if np.asarray(arrays[name]).shape != np.asarray(checked[name]).shape or not np.allclose(arrays[name], checked[name], rtol=1e-10, atol=1e-10):
+                    raise ValueError(f"Source/load serialized accounting field {name} disagrees with its power basis")
+        return store
 
     def summary_dict(self) -> dict[str, float | int | str | list[str]]:
         total_load = self.p_load_mw.sum(axis=1)
@@ -184,9 +402,11 @@ class PowerFlowStore:
     line_flow_mw: np.ndarray
     line_loading_ratio: np.ndarray
     slack_bus_id: int
+    operation_arrays: dict[str, np.ndarray] = field(default_factory=dict)
+    operation_metadata: dict[str, object] = field(default_factory=dict)
 
     def as_arrays(self) -> dict[str, np.ndarray]:
-        return {
+        result = {
             "timestamps": self.timestamps,
             "bus_ids": self.bus_ids,
             "branch_ids": self.branch_ids,
@@ -200,6 +420,25 @@ class PowerFlowStore:
             "line_loading_ratio": self.line_loading_ratio,
             "slack_bus_id": np.asarray(self.slack_bus_id, dtype=np.int32),
         }
+        from world_generator.core.operation_contracts import operation_appendix_arrays, validate_operation_serialized_shapes
+        result.update(operation_appendix_arrays("power_flow", self.operation_arrays, self.operation_metadata,
+                      timestamps=self.timestamps, bus_ids=self.bus_ids, branch_ids=self.branch_ids))
+        if self.operation_arrays:
+            validate_operation_serialized_shapes(result,"power_flow")
+        return result
+
+    @classmethod
+    def from_arrays(cls, payload: dict[str, np.ndarray]) -> "PowerFlowStore":
+        from dataclasses import fields
+        from world_generator.core.operation_contracts import decode_operation_appendix, validate_operation_time_bounds
+        arrays, metadata = decode_operation_appendix(payload, "power_flow")
+        names = {item.name for item in fields(cls)} - {"operation_arrays", "operation_metadata"}
+        if not names.issubset(payload):
+            raise ValueError("Incomplete power-flow base fields")
+        store = cls(**{name: payload[name] for name in names}, operation_arrays=arrays, operation_metadata=metadata)
+        checked = store.as_arrays()
+        validate_operation_time_bounds(payload, checked)
+        return store
 
     def summary_dict(self) -> dict[str, float | int]:
         peak_loading = self.line_loading_ratio.max(axis=0) if self.line_loading_ratio.size else np.asarray([], dtype=np.float32)
@@ -393,9 +632,11 @@ class StorageDispatchStore:
     thermal_capacity_expansion_mw: np.ndarray
     baseline_line_loading_ratio: np.ndarray
     dispatched_line_loading_ratio: np.ndarray
+    operation_arrays: dict[str, np.ndarray] = field(default_factory=dict)
+    operation_metadata: dict[str, object] = field(default_factory=dict)
 
     def as_arrays(self) -> dict[str, np.ndarray]:
-        return {
+        result = {
             "timestamps": self.timestamps,
             "site_ids": self.site_ids,
             "site_bus_ids": self.site_bus_ids,
@@ -428,6 +669,27 @@ class StorageDispatchStore:
             "baseline_line_loading_ratio": self.baseline_line_loading_ratio,
             "dispatched_line_loading_ratio": self.dispatched_line_loading_ratio,
         }
+        from world_generator.core.operation_contracts import operation_appendix_arrays, validate_storage_operation_states, validate_operation_serialized_shapes
+        result.update(operation_appendix_arrays("storage_dispatch", self.operation_arrays, self.operation_metadata,
+                      timestamps=self.timestamps, branch_ids=self.branch_ids, site_ids=self.site_ids,
+                      thermal_bus_ids=self.thermal_bus_ids))
+        if self.operation_arrays:
+            validate_storage_operation_states(result)
+            validate_operation_serialized_shapes(result,"storage_dispatch")
+        return result
+
+    @classmethod
+    def from_arrays(cls, payload: dict[str, np.ndarray]) -> "StorageDispatchStore":
+        from dataclasses import fields
+        from world_generator.core.operation_contracts import decode_operation_appendix, validate_operation_time_bounds
+        arrays, metadata = decode_operation_appendix(payload, "storage_dispatch")
+        names = {item.name for item in fields(cls)} - {"operation_arrays", "operation_metadata"}
+        if not names.issubset(payload):
+            raise ValueError("Incomplete storage-dispatch base fields")
+        store = cls(**{name: payload[name] for name in names}, operation_arrays=arrays, operation_metadata=metadata)
+        checked = store.as_arrays()
+        validate_operation_time_bounds(payload, checked)
+        return store
 
     def summary_dict(self) -> dict[str, float | int]:
         baseline_overload = int(np.sum(self.baseline_line_loading_ratio > 1.0))
@@ -598,6 +860,7 @@ class CityState:
     urban_density: FloatMap
     urban_mask: BoolMap
     city_id_map: np.ndarray
+    population_budget: dict[str, float | int] = field(default_factory=dict)
 
     def as_maps(self) -> dict[str, np.ndarray]:
         return {
@@ -636,9 +899,10 @@ class LandUseState:
     park_green: FloatMap
     load_density_base: FloatMap
     land_use_zone: np.ndarray
+    use_fractions: dict[str, np.ndarray] = field(default_factory=dict)
 
     def as_maps(self) -> dict[str, np.ndarray]:
-        return {
+        maps = {
             "residential": self.residential,
             "commercial": self.commercial,
             "industrial": self.industrial,
@@ -647,6 +911,8 @@ class LandUseState:
             "load_density_base": self.load_density_base,
             "land_use_zone": self.land_use_zone,
         }
+        maps.update({f"land_use_fraction_{name}": values for name, values in self.use_fractions.items()})
+        return maps
 
 
 @dataclass(frozen=True)
@@ -673,9 +939,16 @@ class EnergyCandidateState:
     wind_candidates: tuple[EnergyCandidate, ...]
     pv_candidates: tuple[EnergyCandidate, ...]
     load_candidates: tuple[EnergyCandidate, ...]
+    land_accounting_maps: dict[str, np.ndarray] = field(default_factory=dict)
+    project_land_ledger: np.ndarray | None = None
+    project_area_by_cell_km2: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        _validate_project_land_arrays(self.project_land_ledger, self.project_area_by_cell_km2,
+                                      self.wind_suitability.shape, "energy")
 
     def as_maps(self) -> dict[str, np.ndarray]:
-        return {
+        maps = {
             "wind_suitability": self.wind_suitability,
             "pv_suitability": self.pv_suitability,
             "load_node_density": self.load_node_density,
@@ -684,6 +957,7 @@ class EnergyCandidateState:
             "source_candidate_map": self.source_candidate_map,
             "load_candidate_map": self.load_candidate_map,
         }
+        return maps | self.land_accounting_maps
 
     def candidates_as_dicts(self) -> dict[str, list[dict[str, float | int | str]]]:
         return {
@@ -693,11 +967,34 @@ class EnergyCandidateState:
         }
 
     def candidates_as_arrays(self) -> dict[str, np.ndarray]:
-        return {
+        arrays = {
             "wind_candidates": _candidates_to_array(self.wind_candidates),
             "pv_candidates": _candidates_to_array(self.pv_candidates),
             "load_candidates": _candidates_to_array(self.load_candidates),
         }
+        if self.project_land_ledger is not None:
+            arrays.update(energy_project_land_ledger=self.project_land_ledger,
+                          energy_project_area_by_cell_km2=self.project_area_by_cell_km2,
+                          energy_project_land_columns=np.asarray(ENERGY_PROJECT_LAND_COLUMNS))
+        return arrays
+
+
+ENERGY_PROJECT_LAND_COLUMNS = (
+    "project_id", "technology_code", "candidate_id", "row", "col", "reserved_area_km2",
+    "capacity_mw", "capacity_density_mw_km2", "capacity_equivalent_area_km2",
+)
+
+
+def _validate_project_land_arrays(ledger: np.ndarray | None, cube: np.ndarray | None,
+                                  shape: tuple[int, ...], label: str) -> None:
+    if (ledger is None) != (cube is None):
+        raise ValueError(f"{label} project ledger and area cube must be supplied together")
+    if ledger is None:
+        return
+    if ledger.ndim != 2 or ledger.shape[1] != 9 or cube.shape != (ledger.shape[0], *shape):
+        raise ValueError(f"{label} project ledger must be Nx9 and area cube NxHxW")
+    if not np.isfinite(ledger).all() or not np.isfinite(cube).all() or np.any(cube < 0):
+        raise ValueError(f"{label} project ledger and area cube must be finite with nonnegative area")
 
 
 def _candidate_as_dict(candidate: EnergyCandidate) -> dict[str, float | int | str]:
@@ -726,7 +1023,7 @@ def _candidates_to_array(candidates: tuple[EnergyCandidate, ...]) -> np.ndarray:
         ]
         for item in candidates
     ]
-    return np.asarray(rows, dtype=np.float32)
+    return np.asarray(rows, dtype=np.float32).reshape(-1, 7)
 
 
 @dataclass(frozen=True)
@@ -753,9 +1050,19 @@ class GridNodeState:
     source_bus_map: np.ndarray
     thermal_bus_map: np.ndarray
     buses: tuple[GridBus, ...]
+    land_accounting_maps: dict[str, np.ndarray] = field(default_factory=dict)
+    thermal_project_land_ledger: np.ndarray | None = None
+    thermal_project_area_by_cell_km2: np.ndarray | None = None
+    thermal_land_accounting_mode: str = "legacy_no_land_guarantee"
+
+    def __post_init__(self) -> None:
+        _validate_project_land_arrays(self.thermal_project_land_ledger, self.thermal_project_area_by_cell_km2,
+                                      self.thermal_suitability.shape, "thermal")
+        if self.thermal_land_accounting_mode != "legacy_no_land_guarantee" and self.thermal_project_land_ledger is None:
+            raise ValueError("Modern thermal land accounting requires a project ledger and area cube")
 
     def as_maps(self) -> dict[str, np.ndarray]:
-        return {
+        maps = {
             "thermal_suitability": self.thermal_suitability,
             "thermal_externality": self.thermal_externality,
             "bus_site_map": self.bus_site_map,
@@ -763,12 +1070,18 @@ class GridNodeState:
             "source_bus_map": self.source_bus_map,
             "thermal_bus_map": self.thermal_bus_map,
         }
+        return maps | self.land_accounting_maps
 
     def buses_as_dicts(self) -> list[dict[str, float | int | str]]:
         return [_bus_as_dict(item) for item in self.buses]
 
     def buses_as_arrays(self) -> dict[str, np.ndarray]:
-        return {"grid_buses": _buses_to_array(self.buses)}
+        arrays = {"grid_buses": _buses_to_array(self.buses), "thermal_land_accounting_mode": np.asarray(self.thermal_land_accounting_mode)}
+        if self.thermal_project_land_ledger is not None:
+            arrays.update(thermal_land_ledger=self.thermal_project_land_ledger,
+                          thermal_project_area_by_cell_km2=self.thermal_project_area_by_cell_km2,
+                          thermal_land_columns=np.asarray(("bus_id", "row", "col", "reserved_area_km2", "capacity_mw", "capacity_density_mw_km2", "capacity_equivalent_area_km2", "land_capacity_upper_bound_mw", "requested_capacity_mw")))
+        return arrays
 
 
 def _bus_as_dict(bus: GridBus) -> dict[str, float | int | str]:

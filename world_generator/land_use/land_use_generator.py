@@ -4,6 +4,7 @@ import numpy as np
 
 from world_generator.core.config import LandUseConfig, WorldGridConfig
 from world_generator.core.datatypes import CityState, HydrologyState, LandUseState, StaticLandState, TerrainFeatures
+from world_generator.land.land_generator import SURFACE_COVER, hard_allocatable_land_fraction
 
 
 LAND_USE_ZONE = {
@@ -16,6 +17,11 @@ LAND_USE_ZONE = {
     "protected": 6,
     "water": 7,
 }
+
+LAND_USE_FRACTION_NAMES = (
+    "water", "wetland", "residential", "commercial", "industrial",
+    "agriculture", "park_green", "natural", "energy_reserve",
+)
 
 
 def generate_land_use_zones(
@@ -30,7 +36,8 @@ def generate_land_use_zones(
     water = hydrology.river | hydrology.lake
     protected = land.protected.astype(bool)
     developable = np.clip(land.buildability, 0.0, 1.0)
-    developable[water | protected] = 0.0
+    allocatable = hard_allocatable_land_fraction(land, hydrology)
+    developable[allocatable <= 0.0] = 0.0
     flood_safe = 1.0 - np.clip(hydrology.flood_risk, 0.0, 1.0)
     flat = 1.0 - np.clip(terrain.slope / max(config.agriculture_slope_hard_limit, 1e-6), 0.0, 1.0)
     agriculture_slope_suitability = _slope_suitability(
@@ -112,7 +119,55 @@ def generate_land_use_zones(
         park_green=park_green.astype(np.float32),
         load_density_base=load_density.astype(np.float32),
         land_use_zone=land_use_zone.astype(np.int16),
+        use_fractions=_allocate_use_fractions(
+            land, hydrology, terrain, city.population_density, allocatable,
+            residential, commercial, industrial, agriculture, park_green, config,
+        ),
     )
+
+
+def _allocate_use_fractions(
+    land: StaticLandState, hydrology: HydrologyState, terrain: TerrainFeatures,
+    population_density: np.ndarray, allocatable: np.ndarray,
+    residential: np.ndarray, commercial: np.ndarray, industrial: np.ndarray,
+    agriculture: np.ndarray, park_green: np.ndarray, config: LandUseConfig,
+) -> dict[str, np.ndarray]:
+    """S: sequential, non-overlapping land budgets; P: exact cell area closure.
+
+    Built area demand is driven by population / a configured built-land density,
+    with a maximum area share. Scores distribute a fixed built budget between
+    sectors; they never multiply the geometric eligible-land budget. Agricultural
+    and park quotas allocate explicit shares of remaining eligible area. The
+    energy reserve is withdrawn next; the residual is retained natural land.
+    """
+    water = (hydrology.river | hydrology.lake).astype(bool)
+    wetland = ((land.land_cover_type == SURFACE_COVER["wetland"]) if land.land_cover_type is not None else (land.land_cover == 5)) & ~water
+    fractions = {name: np.zeros(water.shape, dtype=np.float64) for name in LAND_USE_FRACTION_NAMES}
+    fractions["water"] = water.astype(float)
+    fractions["wetland"] = wetland.astype(float)
+    eligible = np.asarray(allocatable, dtype=np.float64).copy()
+    eligible[water | wetland | land.protected.astype(bool)] = 0.0
+    if not np.isfinite(population_density).all() or np.any(population_density < 0):
+        raise ValueError("Population density for land allocation must be finite and nonnegative")
+    built = np.minimum(population_density / config.built_population_density_persons_km2, config.maximum_built_fraction * eligible)
+    scores = np.maximum(np.stack([residential, commercial, industrial]).astype(np.float64), 0.0)
+    total_score = scores.sum(axis=0)
+    # With population but zero sector scores, allocate the built budget to
+    # residential use explicitly instead of producing NaN or losing area.
+    weights = np.divide(scores, total_score[None, ...], out=np.zeros_like(scores), where=total_score[None, ...] > 0)
+    weights[0, total_score <= 0] = 1.0
+    for name, weight in zip(("residential", "commercial", "industrial"), weights):
+        fractions[name] = built * weight
+    remaining = eligible - built
+    agricultural_eligible = (terrain.slope <= config.agriculture_slope_hard_limit) & (agriculture > 0.0)
+    fractions["agriculture"] = remaining * config.agriculture_fraction_of_remaining * agricultural_eligible
+    remaining -= fractions["agriculture"]
+    fractions["park_green"] = remaining * config.park_fraction_of_remaining * (park_green > 0.0)
+    remaining -= fractions["park_green"]
+    fractions["energy_reserve"] = remaining * config.energy_reserve_fraction_of_remaining
+    # Protected and otherwise nonallocatable nonwater land remains natural.
+    fractions["natural"] = 1.0 - sum(fractions.values())
+    return {name: values.astype(np.float32) for name, values in fractions.items()}
 
 
 def _classify_land_use(

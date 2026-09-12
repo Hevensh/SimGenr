@@ -4,6 +4,7 @@ import numpy as np
 
 from world_generator.core.config import CityConfig, WorldGridConfig
 from world_generator.core.datatypes import CityNode, CityState, ClimateBaseline, HydrologyState, StaticLandState, TerrainFeatures
+from world_generator.land.land_generator import hard_allocatable_land_fraction
 
 
 def generate_initial_cities(
@@ -17,10 +18,14 @@ def generate_initial_cities(
 ) -> CityState:
     if config.city_count < 0 or config.total_population < 0.0 or grid.cell_size_km <= 0.0:
         raise ValueError("City count/population must be non-negative and cell size positive")
+    if config.city_count == 0 and config.total_population > 0.0:
+        raise ValueError("A positive target population requires at least one city")
     water = hydrology.river | hydrology.lake
     protected = land.protected.astype(bool)
     flood = np.clip(hydrology.flood_risk, 0.0, 1.0)
     buildability = np.clip(land.buildability, 0.0, 1.0)
+    allocatable = hard_allocatable_land_fraction(land, hydrology)
+    buildability[allocatable <= 0.0] = 0.0
     terrain_cost = np.clip(land.terrain_cost, 0.0, 1.0)
     slope_n = np.clip(terrain.slope / 0.22, 0.0, 1.0)
     roughness_n = np.clip(terrain.roughness / 0.22, 0.0, 1.0)
@@ -62,6 +67,8 @@ def generate_initial_cities(
 
     city_count, total_population = _resolve_city_targets(land, hydrology, grid, config, rng)
     centers = _select_city_centers(urban_core_suitability, grid, config, rng, city_count)
+    if total_population > 0.0 and not centers:
+        raise ValueError("Cannot place a positive target population without an eligible city center")
     cities = _build_city_nodes(centers, urban_core_suitability, grid, config, rng, total_population)
     population_density, economic_activity, urban_density, city_id_map = _spread_city_fields(
         cities,
@@ -84,6 +91,14 @@ def generate_initial_cities(
         urban_density=urban_density.astype(np.float32),
         urban_mask=urban_mask,
         city_id_map=city_id_map.astype(np.int16),
+        population_budget={
+            "configured_population_persons": float(config.total_population),
+            "target_population_persons": float(total_population),
+            "allocated_population_persons": float(np.sum(population_density, dtype=np.float64) * grid.cell_size_km**2),
+            "allocatable_land_area_km2": float(allocatable.sum() * grid.cell_size_km**2),
+            "requested_city_count": int(config.city_count), "target_city_count": int(city_count),
+            "placed_city_count": len(cities),
+        },
     )
 
 
@@ -158,6 +173,8 @@ def _resolve_city_targets(
         raise ValueError(f"Unsupported city scaling mode: {config.scaling_mode}")
 
     effective_area_km2 = _effective_developable_area_km2(land, hydrology, grid)
+    if effective_area_km2 <= 0.0:
+        return 0, 0.0
     area_ratio = max(effective_area_km2 / max(config.reference_effective_area_km2, 1e-6), 1e-6)
 
     expected_count = max(
@@ -176,11 +193,7 @@ def _effective_developable_area_km2(
     hydrology: HydrologyState,
     grid: WorldGridConfig,
 ) -> float:
-    developable = np.clip(land.buildability, 0.0, 1.0) * (
-        1.0 - 0.75 * np.clip(hydrology.flood_risk, 0.0, 1.0)
-    )
-    blocked = hydrology.river | hydrology.lake | land.protected.astype(bool)
-    developable[blocked] = 0.0
+    developable = hard_allocatable_land_fraction(land, hydrology)
     cell_area_km2 = max(float(grid.cell_size_km), 1e-6) ** 2
     return float(developable.sum()) * cell_area_km2
 

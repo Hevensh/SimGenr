@@ -15,6 +15,10 @@ LAND_COVER = {
     "protected": 6,
 }
 
+# The historical LAND_COVER above remains a mixed display label only.
+LANDFORM = {"plain": 1, "hill": 2, "mountain": 3}
+SURFACE_COVER = {"water": 1, "wetland": 2, "herbaceous": 3, "woodland": 4, "bare": 5}
+
 
 def generate_static_land(
     terrain: TerrainFeatures,
@@ -89,6 +93,18 @@ def generate_static_land(
         flood=flood,
         config=config,
     )
+    landform = np.full(water.shape, LANDFORM["plain"], dtype=np.int16)
+    landform[(terrain.elevation >= config.hill_elevation_m) | (terrain.slope >= config.hill_slope_threshold)] = LANDFORM["hill"]
+    landform[(terrain.elevation >= config.mountain_elevation_m) | (terrain.slope >= config.mountain_slope_threshold)] = LANDFORM["mountain"]
+    # S: synthetic physical cover inferred from potential vegetation and wetness;
+    # protection identity never overwrites the cover axis.
+    surface_cover = np.full(water.shape, SURFACE_COVER["herbaceous"], dtype=np.int16)
+    surface_cover[vegetation <= config.bare_vegetation_threshold] = SURFACE_COVER["bare"]
+    surface_cover[vegetation >= config.woodland_vegetation_threshold] = SURFACE_COVER["woodland"]
+    wetland = water_buffer & (flood > config.wetland_flood_threshold) & ~water
+    surface_cover[wetland] = SURFACE_COVER["wetland"]
+    surface_cover[water] = SURFACE_COVER["water"]
+    allocatable = (~(water | wetland | protected) & (terrain.slope <= config.allocatable_max_slope)).astype(np.float32)
 
     return StaticLandState(
         land_cover=land_cover.astype(np.int16),
@@ -97,7 +113,30 @@ def generate_static_land(
         buildability=buildability,
         terrain_cost=terrain_cost.astype(np.float32),
         water_buffer=water_buffer,
+        landform=landform,
+        land_cover_type=surface_cover,
+        allocatable_land_fraction=allocatable,
     )
+
+
+def hard_allocatable_land_fraction(land: StaticLandState, hydrology: HydrologyState) -> np.ndarray:
+    """P: a geometric budget; suitability never scales square kilometres.
+
+    Legacy hand-built states lack the new hard terrain/cover axis and retain
+    only their explicit water/protection exclusions. New worlds always provide
+    the complete axis. Water/wetland/protection are reapplied to external states.
+    """
+    blocked = hydrology.river | hydrology.lake | land.protected.astype(bool)
+    if land.land_cover_type is not None:
+        blocked |= np.isin(land.land_cover_type, [SURFACE_COVER["water"], SURFACE_COVER["wetland"]])
+    if land.allocatable_land_fraction is None:
+        result = (~blocked).astype(np.float64)
+    else:
+        result = np.asarray(land.allocatable_land_fraction, dtype=np.float64).copy()
+        if result.shape != blocked.shape or not np.isfinite(result).all() or np.any((result < 0) | (result > 1)):
+            raise ValueError("allocatable_land_fraction must be finite HxW values in [0, 1]")
+        result[blocked] = 0.0
+    return result
 
 
 def _classify_land_cover(

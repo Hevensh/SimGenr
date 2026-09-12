@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +14,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from world_generator.core.config import dump_config_snapshot, load_world_config
+from world_generator.core.contracts import GENERATOR_VERSION, field_contract_document
+from world_generator.core.errors import generation_failure_category
 from world_generator.core.output_layout import WorldDataLayout
 from world_generator.core.random_state import build_rng_registry
 from world_generator.climate.climate_generator import generate_climate_baseline
@@ -27,11 +29,18 @@ from world_generator.hydrology.hydrology_generator import generate_hydrology
 from world_generator.land.land_generator import generate_static_land
 from world_generator.land_use.land_use_generator import generate_land_use_zones
 from world_generator.operation.grid_upgrade import build_grid_upgrade_plan
-from world_generator.operation.grid_update_loop import run_grid_update_loop
+from world_generator.operation.asset_planning import (
+    run_asset_planning, thermal_land_limits_from_ledger, align_source_to_assets,
+    operation_branch_mask, asset_snapshot, asset_snapshot_sha256, installed_assets, storage_initial_boundary,
+    restore_cached_thermal_land_boundary,
+)
 from world_generator.operation.power_flow import solve_dc_power_flow
 from world_generator.operation.source_load_forecast import generate_source_load_forecast
 from world_generator.operation.stage_cache import (
     load_hourly_weather_checkpoint,
+    load_dynamic_hydrology_checkpoint,
+    load_source_load_checkpoint,
+    load_asset_boundary_checkpoint,
     load_stage12_checkpoint,
     load_stage13_checkpoint,
     save_stage12_checkpoint,
@@ -42,10 +51,68 @@ from world_generator.terrain.derivatives import derive_terrain_features
 from world_generator.terrain.terrain_generator import generate_terrain_base
 from world_generator.visualization.map_plot import save_static_map_figures
 from world_generator.visualization.storage_figures import save_storage_dispatch_figures, save_storage_need_figures
-from world_generator.weather.weather_generator import generate_daily_weather, generate_hourly_weather_week
+from world_generator.weather.weather_generator import aggregate_daily_weather, generate_daily_weather, generate_hourly_weather_week
+
+
+@dataclass
+class GenerationContext:
+    output_dir: Path | None = None
+    config_path: str | None = None
+    seed: int | None = None
+    stage: str | None = None
+    resolved_config: dict[str, object] | None = None
+
+
+def _failure_marker(context: GenerationContext) -> Path | None:
+    if context.output_dir is None:
+        return None
+    directory = context.output_dir.resolve()
+    if not directory.is_relative_to(PROJECT_ROOT.resolve()) or directory == PROJECT_ROOT.resolve():
+        return None
+    return directory / "generation_failure.json"
+
+
+def _record_generation_failure(context: GenerationContext, error: BaseException) -> None:
+    marker = _failure_marker(context)
+    if marker is None:
+        return
+    stage = getattr(error, "stage", None) or context.stage
+    payload = {
+        "schema_version": "generation_failure_v1", "status": "FAIL",
+        "category": generation_failure_category(error, stage=stage),
+        "stage": stage, "error_type": type(error).__name__, "message": str(error),
+        "config": context.config_path, "seed": context.seed,
+        "resolved_config": context.resolved_config,
+        "world_directory": str(marker.parent),
+    }
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError as reporting_error:
+        # Reporting must not replace the original solver/input failure.
+        print(f"Could not write generation failure record: {reporting_error}", file=sys.stderr)
 
 
 def main() -> None:
+    context = GenerationContext()
+    try:
+        _generate(context)
+    except (Exception, SystemExit) as error:
+        if not isinstance(error, SystemExit) or error.code not in (None, 0):
+            _record_generation_failure(context, error)
+        raise
+    else:
+        marker = _failure_marker(context)
+        if marker is not None and marker.exists():
+            marker.unlink()
+
+
+def _set_stage(context: GenerationContext, progress: object, description: str) -> None:
+    context.stage = description
+    progress.set_description(description)
+
+
+def _generate(context: GenerationContext) -> None:
     parser = argparse.ArgumentParser(description="Generate a reproducible static terrain world.")
     parser.add_argument("--config", default="configs/small_debug.yaml")
     parser.add_argument("--output", default=None)
@@ -78,6 +145,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    context.config_path = str(Path(args.config).resolve())
+    context.seed = args.seed
+    context.stage = "configuration"
     config = load_world_config(args.config)
     if args.seed is not None:
         config = replace(config, seed=args.seed)
@@ -86,9 +156,15 @@ def main() -> None:
             parser.error("--start-day must be in 0..364")
         config = replace(config, weather=replace(config.weather, start_day_of_year=args.start_day))
     rngs = build_rng_registry(config.seed)
+    context.resolved_config = config.to_dict()
     output_root = Path(args.output or config.output.root)
     world_id = f"{config.output.world_name}_seed{config.seed}"
+    if Path(world_id).name != world_id or "/" in world_id or "\\" in world_id:
+        raise ValueError("Output world_name must be a single directory name")
     output_dir = output_root / world_id
+    context.output_dir = output_dir.resolve()
+    context.seed = config.seed
+    context.stage = "cached_input_validation" if args.from_stage in (13, 14) else "output_setup"
     data_dir = output_dir / "data"
     data_layout = WorldDataLayout(data_dir)
     figure_dir = output_dir / "figures"
@@ -96,6 +172,7 @@ def main() -> None:
         _validate_cached_physics(output_dir, config, args.from_stage)
     data_layout.create()
     if args.from_stage == 13:
+        context.stage = "cached_stages_13_14"
         _run_stage13_from_cache(
             config,
             output_dir,
@@ -106,6 +183,7 @@ def main() -> None:
         )
         return
     if args.from_stage == 14:
+        context.stage = "cached_stage_14"
         _run_stage14_from_cache(
             config,
             output_dir,
@@ -118,15 +196,15 @@ def main() -> None:
     if args.from_stage != 1:
         parser.error("--from-stage currently supports only 1, 13, or 14")
 
-    progress = tqdm(total=15, unit="stage", dynamic_ncols=True)
-    progress.set_description("Stage 01 terrain")
+    progress = tqdm(total=15 + int(config.hydrology_dynamic.enabled), unit="stage", dynamic_ncols=True)
+    _set_stage(context, progress, "Stage 01 terrain")
     terrain_base = generate_terrain_base(config.world, config.terrain, rngs.generator("terrain"))
     terrain_features = derive_terrain_features(terrain_base, config.world)
     progress.update()
-    progress.set_description("Stage 02 hydrology")
+    _set_stage(context, progress, "Stage 02 hydrology")
     hydrology = generate_hydrology(terrain_features, config.world, config.hydrology)
     progress.update()
-    progress.set_description("Stage 04 climate")
+    _set_stage(context, progress, "Stage 04 climate")
     climate = generate_climate_baseline(
         terrain_features,
         hydrology,
@@ -135,7 +213,7 @@ def main() -> None:
         rngs.generator("climate"),
     )
     progress.update()
-    progress.set_description("Stage 03 static land (climate conditioned)")
+    _set_stage(context, progress, "Stage 03 static land (climate conditioned)")
     land = generate_static_land(
         terrain_features,
         hydrology,
@@ -145,7 +223,7 @@ def main() -> None:
         climate=climate,
     )
     progress.update()
-    progress.set_description("Stage 05 weather")
+    _set_stage(context, progress, "Stage 05 weather")
     weather = generate_daily_weather(
         terrain_features,
         hydrology,
@@ -161,7 +239,7 @@ def main() -> None:
         grid=config.world,
     )
     progress.update()
-    progress.set_description("Stage 06 cities")
+    _set_stage(context, progress, "Stage 06 cities")
     city = generate_initial_cities(
         terrain_features,
         hydrology,
@@ -172,7 +250,7 @@ def main() -> None:
         rngs.generator("evolution"),
     )
     progress.update()
-    progress.set_description("Stage 07 land use")
+    _set_stage(context, progress, "Stage 07 land use")
     land_use = generate_land_use_zones(
         terrain_features,
         hydrology,
@@ -182,7 +260,16 @@ def main() -> None:
         config.land_use,
     )
     progress.update()
-    progress.set_description("Stage 08 energy sites")
+    dynamic_hydrology = None
+    if config.hydrology_dynamic.enabled:
+        _set_stage(context, progress, "Stage 07b dynamic hydrology")
+        from world_generator.hydrology.dynamic_hydrology import generate_dynamic_hydrology
+
+        dynamic_hydrology = generate_dynamic_hydrology(
+            terrain_features, hydrology, land_use, hourly_weather, config.world, config.hydrology_dynamic,
+        )
+        progress.update()
+    _set_stage(context, progress, "Stage 08 energy sites")
     climate_maps = climate.as_maps()
     energy = generate_energy_candidates(
         terrain_features,
@@ -195,7 +282,7 @@ def main() -> None:
         config.energy,
     )
     progress.update()
-    progress.set_description("Stage 09 grid buses")
+    _set_stage(context, progress, "Stage 09 grid buses")
     grid_nodes = build_grid_nodes(
         terrain_features,
         hydrology,
@@ -206,7 +293,7 @@ def main() -> None:
         config.power_grid,
     )
     progress.update()
-    progress.set_description("Stage 10 topology")
+    _set_stage(context, progress, "Stage 10 topology")
     grid_topology = build_grid_topology(
         terrain_features,
         hydrology,
@@ -226,7 +313,7 @@ def main() -> None:
     )
     grid_electrical = build_grid_electrical(refined_topology, config.power_grid.nominal_voltage_kv)
     progress.update()
-    progress.set_description("Stage 11 operation")
+    _set_stage(context, progress, "Stage 11 operation")
     source_load_forecast = generate_source_load_forecast(
         hourly_weather,
         refined_topology,
@@ -247,56 +334,20 @@ def main() -> None:
         power_grid=config.power_grid,
     )
     progress.update()
-    progress.set_description("Stage 12 grid update")
-    update_loop = run_grid_update_loop(
-        source_load_forecast,
-        refined_topology,
-        grid_topology,
-        grid_electrical,
-        terrain_features,
-        hydrology,
-        land,
-        config.world,
-        config.power_grid,
+    _set_stage(context, progress, f"Stages 12-14 asset planning: {config.planning.mode}")
+    asset_result = run_asset_planning(
+        config=config, terrain=terrain_features, hydrology=hydrology, climate=climate,
+        land=land, land_use=land_use, topology=refined_topology, base_topology=grid_topology,
+        electrical=grid_electrical, operation_source=source_load_forecast,
+        thermal_land_limits_mw=thermal_land_limits_from_ledger(grid_nodes.thermal_project_land_ledger, refined_topology),
+        output_dir=data_dir / "planning",
     )
-    progress.update()
-    progress.set_description("Stage 13 storage need")
-    if update_loop.iterations:
-        final_iteration = update_loop.iterations[-1]
-        storage_need = analyze_storage_need(
-            final_iteration.refined_topology,
-            final_iteration.electrical,
-            final_iteration.power_flow,
-            config.world,
-            config.storage,
-        )
-    else:
-        storage_need = analyze_storage_need(
-            refined_topology,
-            grid_electrical,
-            power_flow,
-            config.world,
-            config.storage,
-        )
-    storage_plan = plan_storage_sites(
-        final_iteration.refined_topology if update_loop.iterations else refined_topology,
-        storage_need,
-        config.storage,
-    )
-    progress.update()
-    progress.set_description("Stage 14 storage dispatch")
-    final_topology = final_iteration.refined_topology if update_loop.iterations else refined_topology
-    final_electrical = final_iteration.electrical if update_loop.iterations else grid_electrical
-    final_power_flow = final_iteration.power_flow if update_loop.iterations else power_flow
-    storage_dispatch, storage_dispatch_forecast, storage_dispatch_power_flow, storage_dispatch_electrical = dispatch_storage_week(
-        final_topology,
-        final_electrical,
-        final_power_flow,
-        storage_plan,
-        config.storage,
-    )
-    progress.update()
-    progress.set_description("Writing outputs")
+    update_loop, storage_need, storage_plan = asset_result.update_loop, asset_result.storage_need, asset_result.storage_plan
+    final_topology, final_electrical, final_power_flow = asset_result.final_topology, asset_result.final_electrical, asset_result.final_power_flow
+    storage_dispatch, storage_dispatch_forecast = asset_result.storage_dispatch, asset_result.dispatched_forecast
+    storage_dispatch_power_flow, storage_dispatch_electrical = asset_result.dispatched_power_flow, asset_result.dispatched_electrical
+    progress.update(3)
+    _set_stage(context, progress, "Writing outputs")
     static_maps = (
         terrain_features.as_maps()
         | hydrology.as_maps()
@@ -317,6 +368,14 @@ def main() -> None:
     np.savez_compressed(data_layout.topology / "static_maps.npz", **static_maps)
     np.savez_compressed(data_layout.weather / "daily_weather.npz", **weather.as_arrays())
     np.savez_compressed(data_layout.weather / "hourly_weather_week.npz", **hourly_weather.as_arrays())
+    np.savez_compressed(data_layout.weather / "hourly_daily_summary.npz", **aggregate_daily_weather(hourly_weather).as_arrays())
+    hydrology_artifact = data_layout.dynamic_hydrology / "hourly_hydrology.npz"
+    if dynamic_hydrology is not None:
+        data_layout.dynamic_hydrology.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(hydrology_artifact, **dynamic_hydrology.as_arrays())
+    elif hydrology_artifact.exists():
+        # Do not leave a stale enabled artifact after a static-only re-generation.
+        hydrology_artifact.unlink()
     np.savez_compressed(data_layout.operation / "source_load_forecast.npz", **source_load_forecast.as_arrays())
     np.savez_compressed(data_layout.operation / "power_flow_hourly.npz", **power_flow.as_arrays())
     np.savez_compressed(data_layout.operation / "grid_upgrade_plan.npz", **upgrade_plan.as_arrays())
@@ -340,13 +399,32 @@ def main() -> None:
     if update_loop.iterations:
         save_stage12_checkpoint(update_loop.iterations[-1], data_layout.grid_update)
     dump_config_snapshot(config, data_layout.config_snapshot)
+    if config.contracts.export_field_contracts:
+        (data_dir / "field_contracts.json").write_text(
+            json.dumps(field_contract_document(config.contracts.time_step_hours), indent=2), encoding="utf-8"
+        )
     data_layout.metadata.write_text(
         json.dumps(
             {
                 "world_id": world_id,
-                "generator_version": "physics_v3",
-                "execution_stage_order": [1, 2, 4, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
-                "scenario_semantics": "synthetic_realization_with_perfect_foresight_planning",
+                "generator_version": GENERATOR_VERSION,
+                "land_accounting_version": "land_use_v1",
+                "land_cover_compatibility": "land_cover is the legacy mixed display label; landform, land_cover_type and protected_mask are independent axes",
+                "energy_land_semantics": "exclusive_project_envelopes_within_energy_reserve_not_impervious_area",
+                "city_population_budget": city.population_budget,
+                "dynamic_hydrology": {
+                    "mode": "bucket_routing_v1" if dynamic_hydrology is not None else "static_only",
+                    "schema_version": "hydrology_v1",
+                    "artifact": "dynamic_hydrology/hourly_hydrology.npz" if dynamic_hydrology is not None else None,
+                    "after_stage": 7,
+                    "feedback_to_static_planning": False,
+                    "boundary_forcing": "zero_external_inflow" if dynamic_hydrology is not None else "not_simulated",
+                },
+                "field_contracts": "field_contracts.json" if config.contracts.export_field_contracts else None,
+                "time_step_hours": config.contracts.time_step_hours,
+                "execution_stage_order": [1, 2, 4, 3, 5, 6, 7] + (["dynamic_hydrology"] if dynamic_hydrology is not None else []) + [8, 9, 10, 11, 12, 13, 14],
+                "scenario_semantics": f"synthetic_realization_{config.planning.mode}_with_perfect_foresight_dispatch",
+                "asset_planning": asset_result.metadata,
                 "grid_model": "single_voltage_lossless_DC_transmission_equivalent",
                 "stage14_line_expansion": "thermal_rerating_fixed_impedance",
                 "parameter_status": "uncalibrated_scenario_priors_except_documented_physical_constants_and_line_templates",
@@ -355,6 +433,8 @@ def main() -> None:
                 "module_seeds": rngs.module_seeds,
                 "static_maps": {name: list(value.shape) for name, value in static_maps.items()},
                 "daily_weather": {
+                    "statistic_role": "daily_driver_anchors",
+                    "diagnostic_support": "anchor_state_not_hourly_aggregated_truth",
                     "dynamic": list(weather.dynamic.shape),
                     "weather_class": list(weather.weather_class.shape),
                     "channels": list(weather.channel_names),
@@ -367,6 +447,8 @@ def main() -> None:
                 "refined_grid_edges": refined_topology.edges_as_dicts(),
                 "grid_electrical": grid_electrical.as_dicts(),
                 "hourly_weather_week": {
+                    **hourly_weather.metadata,
+                    "daily_summary_file": "hourly_daily_summary.npz",
                     "dynamic": list(hourly_weather.dynamic.shape),
                     "weather_class": list(hourly_weather.weather_class.shape),
                     "channels": list(hourly_weather.channel_names),
@@ -374,6 +456,10 @@ def main() -> None:
                     "start_day_of_year": hourly_weather.start_day_of_year,
                 },
                 "source_load_forecast": source_load_forecast.summary_dict(),
+                "source_load_appendix": {
+                    "schema_version": "source_load_v1", "mode": "exogenous_realization",
+                    "artifact": "stage_11_operation/source_load_forecast.npz",
+                } if source_load_forecast.nameplate_capacity_mw is not None else None,
                 "power_flow": power_flow.summary_dict(),
                 "grid_upgrade_plan": upgrade_plan.summary_dict(),
                 "grid_update_loop": update_loop.summary_dict(),
@@ -506,9 +592,14 @@ def _run_stage13_from_cache(
     data_layout = WorldDataLayout(data_dir)
     data_layout.create()
     progress = tqdm(total=2, unit="stage", dynamic_ncols=True, desc="Stage 13 storage need")
-    static_maps, topology, electrical, power_flow = load_stage12_checkpoint(output_dir)
-    storage_need = analyze_storage_need(topology, electrical, power_flow, config.world, config.storage)
-    storage_plan = plan_storage_sites(topology, storage_need, config.storage)
+    if config.planning.mode == "full_window_planning":
+        static_maps, topology, electrical, power_flow = load_stage12_checkpoint(output_dir)
+        storage_need = analyze_storage_need(topology, electrical, power_flow, config.world, config.storage)
+        storage_plan = plan_storage_sites(topology, storage_need, config.storage)
+    else:
+        # The cached operation week must not become a fresh design input.
+        static_maps, topology, electrical, power_flow, storage_plan = load_stage13_checkpoint(output_dir)
+        storage_need = analyze_storage_need(topology, electrical, power_flow, config.world, config.storage)
     np.savez_compressed(data_layout.storage_planning / "storage_need.npz", **storage_need.as_arrays())
     np.savez_compressed(data_layout.storage_planning / "storage_plan.npz", **storage_plan.as_arrays())
     (data_layout.storage_planning / "storage_need.json").write_text(
@@ -600,13 +691,35 @@ def _save_stage14_outputs(
 ) -> None:
     data_layout = WorldDataLayout(data_dir)
     data_layout.create()
+    source = load_source_load_checkpoint(data_dir.parent, expected_timestamps=power_flow.timestamps)
+    boundary = load_asset_boundary_checkpoint(data_dir.parent, expected_timestamps=source.timestamps)
+    topology, electrical = restore_cached_thermal_land_boundary(topology, electrical, static_maps.get("thermal_land_ledger"))
+    land_limits = thermal_land_limits_from_ledger(static_maps.get("thermal_land_ledger"), topology)
+    runtime_source = align_source_to_assets(source, topology, electrical)
+    service = operation_branch_mask(electrical, source.timestamps, config.planning.line_faults)
     storage_dispatch, dispatched_forecast, dispatched_power_flow, planned_electrical = dispatch_storage_week(
         topology,
         electrical,
         power_flow,
         storage_plan,
         config.storage,
+        source_forecast=runtime_source,
+        fixed_capacity=config.planning.mode != "full_window_planning",
+        branch_in_service=service,
+        thermal_land_limits_mw=land_limits,
+        initial_soc_mwh_by_site_id=storage_initial_boundary(storage_plan, config),
     )
+    installed_topology, installed_plan = installed_assets(topology, planned_electrical, storage_plan, storage_dispatch, config)
+    frozen = asset_snapshot(installed_topology, planned_electrical, installed_plan, land_limits)
+    frozen_hash = asset_snapshot_sha256(frozen)
+    boundary_metadata = dict(boundary["metadata"])
+    if config.planning.mode != "full_window_planning" and frozen_hash != boundary_metadata["frozen_assets_sha256"]:
+        raise ValueError("Cached operation changed frozen assets; regenerate with --from-stage 1")
+    boundary_metadata["frozen_assets_sha256"] = frozen_hash
+    boundary_metadata["initial_state_policy"] = "optimized_periodic_runtime" if config.storage.cyclic_state_of_charge else "fixed_prior_boundary"
+    planning_dir = data_dir / "planning"
+    np.savez_compressed(planning_dir / "frozen_assets.npz", **frozen)
+    (planning_dir / "asset_boundary.json").write_text(json.dumps(boundary_metadata, indent=2), encoding="utf-8")
     np.savez_compressed(data_layout.storage_dispatch / "storage_dispatch.npz", **storage_dispatch.as_arrays())
     np.savez_compressed(
         data_layout.storage_dispatch / "storage_dispatch_forecast.npz", **dispatched_forecast.as_arrays()
@@ -628,6 +741,7 @@ def _save_stage14_outputs(
         encoding="utf-8",
     )
     metadata = json.loads(data_layout.metadata.read_text(encoding="utf-8"))
+    metadata["asset_planning"] = boundary_metadata
     metadata["storage_dispatch"] = storage_dispatch.summary_dict()
     metadata["storage_plan"] = storage_plan.summary_dict()
     need_path = data_layout.storage_planning / "storage_need.json"
@@ -659,18 +773,37 @@ def _validate_cached_physics(output_dir: Path, config: object, from_stage: int) 
     """Prevent silent mixtures of old equations, new parameters and stale worlds."""
     layout = WorldDataLayout(output_dir / "data")
     if not layout.metadata.exists() or not layout.config_snapshot.exists():
-        raise ValueError("No complete physics_v3 checkpoint; run --from-stage 1 first")
+        raise ValueError(f"No complete {GENERATOR_VERSION} checkpoint; run --from-stage 1 first")
     metadata = json.loads(layout.metadata.read_text(encoding="utf-8"))
-    if metadata.get("generator_version") != "physics_v3":
-        raise ValueError("Checkpoint predates physics_v3; regenerate with --from-stage 1")
+    if metadata.get("generator_version") != GENERATOR_VERSION:
+        raise ValueError(f"Checkpoint uses different physical semantics; regenerate {GENERATOR_VERSION} with --from-stage 1")
+    if metadata.get("land_accounting_version") != "land_use_v1":
+        raise ValueError("Checkpoint predates independent land-area accounting; regenerate with --from-stage 1")
+    appendix = metadata.get("source_load_appendix")
+    if not isinstance(appendix, dict) or appendix.get("schema_version") != "source_load_v1":
+        raise ValueError("Checkpoint predates source_load_v1 source/load physics; regenerate with --from-stage 1")
     cached = load_world_config(layout.config_snapshot).to_dict()
     current = config.to_dict()
-    upstream = set(current) - {"output", "storage"}
+    upstream = set(current) - {"output", "storage", "validation"}
     changed = sorted(name for name in upstream if cached[name] != current[name])
     if changed:
         raise ValueError(f"Upstream configuration changed ({', '.join(changed)}); run --from-stage 1")
     if from_stage == 14 and cached["storage"] != current["storage"]:
         raise ValueError("Storage parameters changed; rerun storage sizing with --from-stage 13")
+    if config.planning.mode != "full_window_planning" and cached["storage"] != current["storage"]:
+        raise ValueError("Frozen planning/dispatch configuration changed; regenerate with --from-stage 1")
+    if config.hydrology_dynamic.enabled or metadata.get("dynamic_hydrology") is not None:
+        weather = load_hourly_weather_checkpoint(output_dir)
+        dynamic = load_dynamic_hydrology_checkpoint(output_dir, expected_timestamps=weather.timestamps,
+                                                    expected_grid_shape=(config.world.height, config.world.width))
+        if config.hydrology_dynamic.enabled != (dynamic is not None):
+            raise ValueError("Dynamic hydrology mode differs from the requested checkpoint configuration")
+    weather = load_hourly_weather_checkpoint(output_dir)
+    load_source_load_checkpoint(output_dir, expected_timestamps=weather.timestamps,
+                                expected_grid_shape=(config.world.height, config.world.width))
+    boundary = load_asset_boundary_checkpoint(output_dir, expected_timestamps=weather.timestamps)
+    if boundary["metadata"]["mode"] != config.planning.mode or metadata.get("asset_planning") != boundary["metadata"]:
+        raise ValueError("Asset boundary mode/metadata differs from its checkpoint; regenerate with --from-stage 1")
 
 
 if __name__ == "__main__":

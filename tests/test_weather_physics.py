@@ -7,7 +7,7 @@ from world_generator.climate.climate_generator import _wind_exposure, generate_c
 from world_generator.core.config import ClimateConfig, WeatherConfig, WorldGridConfig
 from world_generator.core.datatypes import ClimateBaseline, HydrologyState, TerrainFeatures
 from world_generator.weather.physics import extraterrestrial_hourly_irradiance, latitude_grid, saturation_vapor_pressure_hpa, solar_direction, surface_pressure_hpa
-from world_generator.weather.weather_generator import _gaussian_field, generate_daily_weather, generate_hourly_weather_week
+from world_generator.weather.weather_generator import _gaussian_field, aggregate_daily_weather, generate_daily_weather, generate_hourly_weather_week
 
 
 def _fixture(shape=(6, 7)):
@@ -44,18 +44,21 @@ def test_pressure_decreases_hydrostatically_and_rh_uses_saturation():
     np.testing.assert_allclose(saturation_vapor_pressure_hpa(np.array([0.0, 20.0])), [6.108, 23.38], rtol=0.001)
 
 
-def test_hourly_conserves_all_daily_means_and_rain_totals_with_night_zero():
+def test_hourly_conserves_declared_daily_constraints_and_diagnoses_daily_means():
     terrain, hydrology, climate, grid = _fixture()
     config = WeatherConfig(days=12, hourly_week_days=7, start_day_of_year=358)
     daily = generate_daily_weather(terrain, hydrology, climate, grid, config, np.random.default_rng(10))
     hourly = generate_hourly_weather_week(daily, config, np.random.default_rng(21), grid=grid)
     indices = {name: i for i, name in enumerate(daily.channel_names)}
+    summary = aggregate_daily_weather(hourly)
     start = int(hourly.timestamps[0] // 24 - daily.timestamps[0])
     for day in range(config.hourly_week_days):
         values = hourly.dynamic[day * 24:(day + 1) * 24].astype(float)
         for name, index in indices.items():
             aggregate = values[:, index].sum(axis=0) if name == "precipitation" else values[:, index].mean(axis=0)
-            np.testing.assert_allclose(aggregate, daily.dynamic[start + day, index], rtol=2e-6, atol=2e-5)
+            np.testing.assert_allclose(aggregate, summary.dynamic[day, index], rtol=2e-6, atol=2e-5)
+            if name in hourly.metadata["daily_constraints"]:
+                np.testing.assert_allclose(aggregate, daily.dynamic[start + day, index], rtol=2e-6, atol=2e-5)
         toa = extraterrestrial_hourly_irradiance(latitude_grid(grid, terrain.elevation.shape), hourly.timestamps[day * 24] // 24)
         assert np.all(values[:, indices["irradiance"]][toa == 0] == 0)
         assert np.all(values[:, indices["irradiance"]] <= toa + 1e-4)
@@ -120,7 +123,7 @@ def test_invalid_daily_radiation_and_latitude_are_rejected():
     ("humidity", -0.1, "\\[0, 1\\]"),
     ("pressure", 0.0, "positive"),
     ("temperature", -300.0, "absolute zero"),
-    ("wind_speed", 100.0, "wind_speed = hypot"),
+    ("wind_speed", 0.0, "wind_speed must be >= hypot"),
     ("wind_speed", -1.0, "nonnegative"),
     ("irradiance", -1.0, "nonnegative"),
     ("temperature", np.nan, "finite"),

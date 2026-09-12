@@ -9,10 +9,11 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from world_generator.core.output_layout import WorldDataLayout
-from world_generator.operation.stage_cache import load_stage12_checkpoint
+from world_generator.core.contracts import entity_ids
+from world_generator.operation.stage_cache import load_stage12_checkpoint, load_dynamic_hydrology_checkpoint, load_source_load_checkpoint, load_asset_boundary_checkpoint, load_operation_checkpoint, validate_weather_checkpoint_time
 
 
-SCHEMA_VERSION = "0.6.0"
+SCHEMA_VERSION = "0.10.0"
 
 STATIC_CONTINUOUS_CHANNELS = (
     "elevation",
@@ -83,6 +84,7 @@ STATIC_UNITS = {
     "hydrology_elevation": "m",
     "population_density": "persons/km2",
     "flow_accumulation": "upstream_cell_count",
+    "catchment_area_km2": "km2",
     "distance_to_water": "km",
     "mean_temperature": "degC",
     "annual_temperature_amplitude": "degC",
@@ -122,10 +124,12 @@ def build_dataset(
     partitions: dict[int, str] | None = None,
     show_progress: bool = True,
 ) -> dict[str, object]:
+    world_paths = [Path(world_dir) for world_dir in world_dirs]
+    for world_dir in world_paths:
+        _reject_failed_generation(world_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     sample_root = output_dir / "samples"
     sample_root.mkdir(parents=True, exist_ok=True)
-    world_paths = [Path(world_dir) for world_dir in world_dirs]
     iterator = tqdm(
         world_paths,
         desc="Packaging dataset",
@@ -154,12 +158,18 @@ def build_dataset(
     return manifest
 
 
+def _reject_failed_generation(world_dir: Path) -> None:
+    if (world_dir / "generation_failure.json").exists():
+        raise ValueError(f"Cannot package failed generation {world_dir}: generation_failure.json is present; rerun generation successfully before using remaining artifacts")
+
+
 def package_world(
     world_dir: Path,
     sample_root: Path,
     *,
     partitions: dict[int, str] | None = None,
 ) -> dict[str, object]:
+    _reject_failed_generation(world_dir)
     data_dir = world_dir / "data"
     layout = WorldDataLayout(data_dir)
     world_metadata = json.loads(layout.metadata.read_text(encoding="utf-8")) if layout.metadata.exists() else {}
@@ -196,13 +206,14 @@ def package_world(
         layout.config_snapshot,
     ]
     missing = [str(path) for path in required if not path.exists()]
-    if world_metadata.get("generator_version") == "physics_v3" and not exogenous_path.exists():
+    if _has_physical_units(world_metadata) and not exogenous_path.exists():
         missing.append(str(exogenous_path))
     if missing:
         raise FileNotFoundError("World output is incomplete: " + ", ".join(missing))
 
     static_source = _load_npz(static_path)
     weather = _load_npz(weather_path)
+    validate_weather_checkpoint_time(weather)
     forecast = _load_npz(forecast_path)
     power_flow = _load_npz(power_flow_path)
     storage = _load_npz(storage_path)
@@ -218,6 +229,26 @@ def package_world(
         "continuous_channels": np.asarray(STATIC_CONTINUOUS_CHANNELS),
         "categorical_channels": np.asarray(STATIC_CATEGORICAL_CHANNELS),
     }
+    if "catchment_area_km2" in static_source:
+        static_payload["catchment_area_km2"] = static_source["catchment_area_km2"].copy()
+    land_payload = _land_accounting_payload(layout, static_source, world_metadata)
+    hydrology_store = load_dynamic_hydrology_checkpoint(world_dir, expected_timestamps=weather["timestamps"],
+                                                       expected_grid_shape=static_source["elevation"].shape)
+    hydrology_payload = hydrology_store.as_arrays() if hydrology_store is not None else {}
+    source_load_store = load_source_load_checkpoint(world_dir, expected_timestamps=weather["timestamps"], expected_grid_shape=static_source["elevation"].shape) if exogenous is not None else None
+    source_load_payload = source_load_store.as_arrays() if source_load_store is not None and source_load_store.nameplate_capacity_mw is not None else {}
+    operation_detail, power_flow_detail, asset_payload = {}, {}, {}
+    boundary_path = world_dir / "data" / "planning" / "asset_boundary.json"
+    if boundary_path.exists() or world_metadata.get("asset_planning") is not None:
+        boundary = load_asset_boundary_checkpoint(world_dir, expected_timestamps=weather["timestamps"],
+                    expected_bus_ids=forecast["bus_ids"],expected_branch_ids=power_flow["branch_ids"])
+        modern_power, modern_storage = load_operation_checkpoint(world_dir,expected_timestamps=weather["timestamps"],require_modern=True)
+        operation_detail, power_flow_detail = modern_storage.as_arrays(), modern_power.as_arrays()
+        asset_payload = {f"{group}__{name}":value for group in ("initial_assets","frozen_assets") for name,value in boundary[group].items()}
+        asset_payload["boundary_metadata_json"] = np.asarray(json.dumps(boundary["metadata"],sort_keys=True))
+        world_metadata["asset_planning"] = boundary["metadata"]
+    elif "operation_schema_version" in storage or "operation_schema_version" in power_flow:
+        raise ValueError("F runtime outputs require an explicit asset planning boundary")
     dynamic_payload = {
         "timestamps": weather["timestamps"].astype(np.int32),
         "weather": weather["dynamic"].astype(np.float32),
@@ -226,8 +257,21 @@ def package_world(
         "time_unit": weather["time_unit"],
         "start_day_of_year": weather["start_day_of_year"].astype(np.int32),
     }
+    for name, values in weather.items():
+        if name.startswith("diagnostic__"):
+            if values.shape != weather["weather_class"].shape or not np.isfinite(values).all():
+                raise ValueError(f"Weather diagnostic {name!r} must be finite [T,H,W]")
+            dynamic_payload[name] = values.astype(np.float32)
+        elif name in {"time_bounds_hours", "static_elevation_m"}:
+            dynamic_payload[name] = values.copy()
 
     graph_payload, graph_metadata = _graph_payload(topology, electrical)
+    graph_metadata["capacity_sources"] = {
+        "node_features.capacity_mw":"Stage12 pre-operation topology design capacity; retained legacy values",
+        "node_electrical.p_capacity_mw":"Stage14 electrical bus capacity; may include storage interface capacity",
+        "final_asset_capacity":"asset_planning.frozen_assets__bus_nameplate_capacity_mw is authoritative for the declared frozen bus asset snapshot" if asset_payload else "legacy_no_frozen_asset_boundary",
+        "physical_thermal_capacity":"operation_detail.op__thermal_installed_capacity_mw excludes storage; thermal_bus_ids define applicability" if operation_detail else "legacy_no_separate_physical_generator_account",
+    }
     operation_payload = _operation_payload(forecast, power_flow, storage, exogenous=exogenous)
 
     validation = _validate_modalities(
@@ -242,7 +286,7 @@ def package_world(
     config_path = layout.config_snapshot
     provenance = _world_provenance(world_metadata)
     static_units = dict(STATIC_UNITS)
-    if provenance["generator_version"] != "physics_v3":
+    if not _has_physical_units(provenance):
         # Repackaging old outputs cannot magically convert their normalized
         # density index to persons/km2. Keep the original data and its meaning.
         static_units["population_density"] = "legacy_normalized_index"
@@ -261,7 +305,29 @@ def package_world(
             "categorical_channels": list(STATIC_CATEGORICAL_CHANNELS),
             "continuous_statistics": _channel_statistics(static_continuous, STATIC_CONTINUOUS_CHANNELS),
         },
+        "land": {
+            "accounting_version": world_metadata.get("land_accounting_version", "legacy_no_land_guarantee"),
+            "fields": list(land_payload),
+            "fraction_support": "whole_cell; nine mutually exclusive land_use_fraction maps sum to one",
+            "project_area_semantics": "exclusive envelope inside energy_reserve; project areas are nested, not additional top-level fractions or impervious cover",
+            "display_compatibility": "legacy static categorical tensor retains mixed land_cover/land_use_zone display encoding; independent land__* arrays preserve actual cover and protection",
+        },
+        "hydrology": {
+            **world_metadata.get("dynamic_hydrology", {"mode": "legacy_static_only", "artifact": None}),
+            "fields": list(hydrology_payload),
+            "state_support": "T+1 interval boundaries; all mm stores are whole-cell equivalent depths",
+            "forcing_availability": "realized hourly precipitation; no implicit NWP or forecast availability",
+        },
+        "source_load": {
+            **(source_load_store.metadata if source_load_payload else {"mode": "legacy_no_diagnostics"}),
+            "fields": list(source_load_payload), "source_artifact": "stage_11_operation/source_load_forecast.npz",
+            "semantics": "Exogenous requested load, generation availability and planned generation; no delivery or curtailment claim",
+            "node_identity": "Original Stage11 bus_ids; independent of the final graph's node order",
+            "window_accounting": "period_* are realized summaries, never static inputs; windows recompute them from their own intervals and use the preceding effective-temperature boundary",
+        },
         "dynamic": {
+            "weather_generation": json.loads(str(weather["weather_metadata_json"])) if "weather_metadata_json" in weather else {"generation_mode": "unspecified_legacy"},
+            "optional_diagnostics": [name for name in dynamic_payload if name.startswith("diagnostic__")],
             "weather_channels": [str(value) for value in weather["channel_names"]],
             "weather_statistics": _channel_statistics(
                 np.moveaxis(weather["dynamic"], 1, 0),
@@ -269,6 +335,9 @@ def package_world(
             ),
         },
         "graph": graph_metadata,
+        "asset_planning": world_metadata.get("asset_planning", {"mode":"legacy_full_window_unspecified"}),
+        "operation_detail": {"mode":"operation_v1" if operation_detail else "legacy_no_appendix",
+                             "fields":list(operation_detail),"semantics":"physical gross demand and generator output exclude storage; explicit island-local reserve accounts"},
         "operation": {
             "units": OPERATION_UNITS,
             "exogenous_available": exogenous is not None,
@@ -288,6 +357,12 @@ def package_world(
     sample_path = sample_root / sample_name
     payload = {
         **_prefix_payload("static", static_payload),
+        **_prefix_payload("land", land_payload),
+        **_prefix_payload("hydrology", hydrology_payload),
+        **_prefix_payload("source_load", source_load_payload),
+        **_prefix_payload("operation_detail", operation_detail),
+        **_prefix_payload("power_flow_detail", power_flow_detail),
+        **_prefix_payload("asset_planning", asset_payload),
         **_prefix_payload("dynamic", dynamic_payload),
         **_prefix_payload("graph", graph_payload),
         **_prefix_payload("operation", operation_payload),
@@ -327,16 +402,57 @@ def dataset_schema() -> dict[str, object]:
                 "continuous": "float32 [C_static,H,W]",
                 "categorical": "int32 [C_categorical,H,W]",
             },
+            "land": {
+                "semantics": "Optional complete land_use_v1 appendix; static/background cover, planned whole-cell fractions and Stage8/9 project budgets. Never time-sliced.",
+                "landform/land_cover_type": "integer [H,W]; separate geomorphology and potential background cover",
+                "protected_mask/*_land_eligible": "bool [H,W]; hard identities and project exclusions",
+                "allocatable_land_fraction/land_use_fraction_*": "float [H,W]; fractions of whole-cell area, use fractions sum to one",
+                "*_area_km2": "float [H,W]; allocated or residual geometric budget",
+                "energy_project_land_ledger/thermal_land_ledger": "float64 [N,9]; named columns preserve identity, reserved area and capacity",
+                "*_project_area_by_cell_km2": "float64 [N,H,W]; project-by-cell reserved areas",
+                "wind_candidates/pv_candidates/load_candidates": "legacy [N,7] tables, kept unchanged",
+            },
             "dynamic": {
                 "weather": "float32 [T,C_weather,H,W]",
                 "weather_class": "int16 [T,H,W]",
+                "diagnostic__*": "optional float32 [T,H,W]; units and statistic support in metadata.dynamic.weather_generation",
+                "time_bounds_hours": "optional float64 [T,2], interval start/end in local solar hours",
+                "static_elevation_m": "optional float32 [H,W], terrain elevation for moist-air diagnostics",
                 "timestamps": "int32 [T] hours from start of year",
+            },
+            "hydrology": {
+                "semantics": "Optional hydrology_v1 water account; explicit names and field_schema_json define time support",
+                "state__*": "float64 [T+1,H,W] boundary states; state_time_hours includes terminal boundary",
+                "flux__*": "float64 [T,H,W] interval accumulations, except discharge_m3_s interval mean",
+                "static__*": "[H,W] fixed geometry/parameters; never time-sliced",
+                "budget__*": "float64 [T] world-wide interval water accounts",
+                "timestamps/time_bounds_hours/state_time_hours": "[T]/[T,2]/[T+1] hours in local solar convention",
+                "absent": "Legacy or static_only worlds have no simulated dynamic hydrology arrays",
+            },
+            "source_load": {
+                "semantics": "Optional complete source_load_v1 Stage11 exogenous appendix; original bus IDs are independent of final graph order",
+                "static_assets": "nameplate_capacity_mw/reference_load_mw/weather_sample_row/weather_sample_col/capacity_factor_valid [N]",
+                "power/energy/CF/diag__*": "Explicit schema fields [T,N]; energy is interval MWh, effective temperature is interval-end state",
+                "initial_effective_temperature_c": "[N] preceding boundary; temporal windows take their own preceding state",
+                "period_*_energy_mwh": "[N] realized whole-period audits or targets, never static input; each temporal window recomputes its own sums",
+                "field_schema": "source_load_field_schema_json declares units and support; no shape-based classification",
+                "absent": "Legacy worlds remain readable without fabricated capacities or diagnostics",
+            },
+            "operation_detail/power_flow_detail": {
+                "semantics":"Complete operation_v1 Stores; explicit named support, no leading-dimension inference",
+                "op__*":"Physical interval mean demand/generation/reserve and [T,N]/[T,E] runtime topology",
+                "soc_mwh":"[T+1,S] boundary states; window initial and previous power use their own preceding boundary",
+            },
+            "asset_planning": {
+                "initial_assets__/frozen_assets__":"Explicit fixed ID/capacity arrays and original/frozen asset snapshots",
+                "boundary_metadata_json":"Mode, input hashes, information cutoff, separate planning/operation clocks and dispatch foresight",
+                "window_use":"Separate design group; full-window planning assets remain oracle context, never relabeled issue-time inputs",
             },
             "graph": {
                 "semantics": "only node and line are graph entities; A* paths are optional line geometry metadata",
                 "node_id": "int32 [N]",
                 "node_type": "int8 [N]",
-                "node_features": "float32 [N,5]",
+                "node_features": "float32 [N,5]; capacity_mw retains Stage12 pre-operation design values; F authoritative frozen assets live in asset_planning",
                 "node_source_id": "int32 [N] auxiliary source relationship",
                 "node_electrical": "float32 [N,6]",
                 "edge_id": "int32 [E]",
@@ -349,6 +465,7 @@ def dataset_schema() -> dict[str, object]:
                 },
             },
             "operation": {
+                "source_load_appendix": "Separate source_load group preserves Stage11 original node identity, nameplate/CF, diagnostics and interval/period MWh",
                 "node_dynamic": "float32 [T,C_node,N]",
                 "node_dynamic_semantics": "Stage 14 dispatch quantities; includes storage charging and inverter capacity",
                 "exogenous_p_load_mw": "optional float32 [T,N]: Stage 11 requested demand, without storage charging",
@@ -366,7 +483,7 @@ def dataset_schema() -> dict[str, object]:
         "node_type_mapping": NODE_TYPE_TO_ID,
         "static_units": STATIC_UNITS,
         "operation_units": OPERATION_UNITS,
-        "dispatch_semantics": "perfect_foresight_dispatch",
+        "dispatch_semantics": "declared_per_world_separately_from_asset_planning_mode",
         "forecast_evaluation": "Future weather is realized weather, not a forecast available at issue time. Final topology and dispatch were planned using the operation period.",
     }
 
@@ -531,10 +648,8 @@ def _exogenous_payload(source: dict[str, np.ndarray], final_bus_ids: np.ndarray,
     """
     if not np.array_equal(source["timestamps"], timestamps):
         raise ValueError("Stage 11 and final-operation timestamps differ")
-    original_ids = np.asarray(source["bus_ids"])
-    target_ids = np.asarray(final_bus_ids)
-    if len(np.unique(original_ids)) != original_ids.size or len(np.unique(target_ids)) != target_ids.size:
-        raise ValueError("Exogenous bus mapping requires unique bus IDs")
+    original_ids = entity_ids(source["bus_ids"], "exogenous bus_ids")
+    target_ids = entity_ids(final_bus_ids, "final bus_ids")
     source_index = {int(bus_id): i for i, bus_id in enumerate(original_ids)}
     missing = ~np.isin(original_ids, target_ids)
     payload: dict[str, np.ndarray] = {}
@@ -563,14 +678,58 @@ def _exogenous_payload(source: dict[str, np.ndarray], final_bus_ids: np.ndarray,
     return payload
 
 
+def _has_physical_units(world_metadata: dict[str, object]) -> bool:
+    # Explicit compatibility, never treat arbitrary future/legacy labels as SI.
+    return world_metadata.get("generator_version") in {"physics_v3", "physics_v4"}
+
+
+def _land_accounting_payload(layout: WorldDataLayout, static: dict[str, np.ndarray], metadata: dict[str, object]) -> dict[str, np.ndarray]:
+    """Append C axes/ledgers without changing legacy model tensor channels."""
+    version = metadata.get("land_accounting_version")
+    has_new_fields = any(name in static for name in ("landform", "land_cover_type", "allocatable_land_fraction"))
+    if version is None and not has_new_fields:
+        return {}
+    if version != "land_use_v1":
+        raise ValueError("New land fields require the explicit land_use_v1 accounting version")
+    maps = ("landform", "land_cover_type", "protected_mask", "allocatable_land_fraction",
+            "energy_available_area_km2", "energy_wind_project_area_km2", "energy_pv_project_area_km2", "energy_unallocated_area_km2",
+            "wind_land_eligible", "pv_land_eligible", "thermal_land_eligible", "thermal_allocated_area_km2", "energy_unallocated_after_thermal_area_km2")
+    maps += tuple(f"land_use_fraction_{name}" for name in ("water", "wetland", "residential", "commercial", "industrial", "agriculture", "park_green", "natural", "energy_reserve"))
+    missing = [name for name in maps if name not in static]
+    if missing:
+        raise ValueError(f"Incomplete modern land accounting maps: {missing}")
+    shape = static["elevation"].shape
+    for name in maps:
+        if static[name].shape != shape or not np.isfinite(static[name]).all():
+            raise ValueError(f"Land map {name} must be finite HxW")
+    payload = {name: static[name].copy() for name in maps}
+    candidates = _load_npz(layout.existing(layout.energy, "source_load_candidates.npz", layout.root / "source_load_candidates.npz"))
+    nodes = _load_npz(layout.existing(layout.buses, "grid_nodes.npz", layout.root / "grid_nodes.npz"))
+    for source, names in ((candidates, ("wind_candidates", "pv_candidates", "load_candidates", "energy_project_land_ledger", "energy_project_land_columns", "energy_project_area_by_cell_km2")),
+                          (nodes, ("thermal_land_ledger", "thermal_land_columns", "thermal_project_area_by_cell_km2", "thermal_land_accounting_mode"))):
+        for name in names:
+            if name not in source:
+                raise ValueError(f"Incomplete modern project land accounting: {name}")
+            payload[name] = source[name].copy()
+    return payload
+
+
 def _world_provenance(world_metadata: dict[str, object]) -> dict[str, object]:
+    planning = world_metadata.get("asset_planning", {})
+    if not isinstance(planning,dict):
+        raise ValueError("Asset planning metadata must be a mapping")
+    mode = planning.get("mode","legacy_full_window_unspecified")
+    assets_oracle = mode in {"full_window_planning","legacy_full_window_unspecified"}
     return {
         "generator_version": world_metadata.get("generator_version", "legacy_unspecified"),
         "scenario_semantics": world_metadata.get("scenario_semantics", "unspecified_legacy"),
         "time_convention": world_metadata.get("time_convention", "unspecified_legacy"),
         "execution_stage_order": world_metadata.get("execution_stage_order", []),
-        "dispatch_semantics": "perfect_foresight_dispatch",
-        "forecast_feature_availability": "Future weather is realized; final topology, capacities and dispatch use the full operation period.",
+        "land_accounting_version": world_metadata.get("land_accounting_version", "legacy_no_land_guarantee"),
+        "asset_planning_mode": mode,
+        "asset_planning_uses_operation_future": assets_oracle,
+        "dispatch_semantics": planning.get("dispatch_foresight","perfect_foresight_dispatch"),
+        "forecast_feature_availability": "Future weather is realized. " + ("Assets use the full operation period and are oracle context. " if assets_oracle else "Assets are frozen before operation. ") + "Operation optimizer foresight is declared independently and is not implied by the asset mode.",
     }
 
 

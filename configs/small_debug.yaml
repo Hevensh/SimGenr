@@ -1,4 +1,19 @@
 seed: 42
+validation:
+  max_failure_locations: 5
+
+planning:
+  # S: oracle asset planning with full operation-window truth, explicit default.
+  mode: full_window_planning
+  design_days: 7
+  design_start_day_of_year: 0
+  design_seed: 190731
+
+# S: the public generator currently supports one-hour intervals only.
+# P: all integrations and accumulated depths carry explicit time support.
+contracts:
+  time_step_hours: 1.0
+  export_field_contracts: true
 
 world:
   height: 64
@@ -53,7 +68,49 @@ hydrology:
   lake_min_area_km2: 2.0
   depression_fill_epsilon_m: 0.02
 
+hydrology_dynamic:
+  # S: optional hourly buckets; no RNG and no feedback to static city planning.
+  enabled: true
+  soil_capacity_mm: 150.0
+  initial_soil_fraction: 0.35
+  infiltration_capacity_mm_h: 20.0
+  soil_field_capacity_fraction: 0.65
+  soil_percolation_time_hours: 48.0
+  groundwater_capacity_mm: 500.0
+  initial_groundwater_fraction: 0.10
+  baseflow_time_hours: 240.0
+  initial_channel_storage_mm: 0.0
+  initial_lake_storage_fraction: 0.0
+  routing_velocity_m_s: 0.5
+  routing_substeps_per_hour: 1
+  interior_sink_policy: closed_storage
+  pet_shortwave_absorptivity: 0.77
+  pet_latent_energy_fraction: 0.65
+  latent_heat_vaporization_j_kg: 2450000.0
+  budget_absolute_tolerance_m3: 0.00001
+  budget_relative_tolerance: 0.0000000001
+  # S: surface sealing coefficients, distinct from exclusive project envelopes.
+  impervious_fraction_by_use:
+    water: 0.0
+    wetland: 0.0
+    residential: 0.65
+    commercial: 0.85
+    industrial: 0.8
+    agriculture: 0.05
+    park_green: 0.02
+    natural: 0.02
+    energy_reserve: 0.05
+
 land:
+  # S: synthetic cover/landform labels and hard terrain eligibility.
+  hill_elevation_m: 1800.0
+  mountain_elevation_m: 2800.0
+  hill_slope_threshold: 0.12
+  mountain_slope_threshold: 0.22
+  wetland_flood_threshold: 0.45
+  bare_vegetation_threshold: 0.12
+  woodland_vegetation_threshold: 0.45
+  allocatable_max_slope: 0.35
   protected_fraction: 0.10
   water_buffer_km: 1.5
   steep_slope_threshold: 0.22
@@ -62,6 +119,11 @@ land:
   random_patch_count: 5
 
 climate:
+  # S: uncalibrated latent Gaussian covariance lengths, in physical km.
+  spatial_scale_mode: physical
+  climate_correlation_length_km: 20.0
+  wind_direction_correlation_length_km: 12.0
+  spatial_boundary: reflect
   base_temperature_c: 28.0
   latitude_temperature_gradient_c: 12.0
   lapse_rate_c_per_km: 5.8
@@ -73,7 +135,7 @@ climate:
   wind_speed_terrain_factor: 0.35
   wind_direction_terrain_steering: 1.20
   wind_direction_noise_degrees: 28.0
-  wind_direction_smoothing_steps: 6
+  wind_direction_smoothing_steps: 6  # Used only when spatial_scale_mode: legacy.
   humidity_water_decay_km: 10.0
   precipitation_base_mm_year: 760.0
   orographic_precipitation_factor: 0.55
@@ -82,6 +144,17 @@ climate:
   climate_noise_weight: 0.12
 
 weather:
+  # S: conditional hourly realization; daily_weather is driver anchors.
+  # Realized daily statistics are saved in hourly_daily_summary.npz.
+  hourly_generation_mode: primitive_hourly
+  spatial_scale_mode: physical
+  innovation_correlation_length_km: 10.0
+  spatial_boundary: open
+  temporal_scale_mode: physical
+  synoptic_memory_hours: 288.0
+  hourly_memory_hours: 8.0
+  synoptic_advection_speed_km_per_hour: 0.12
+  hourly_wind_direction_std_degrees: 15.0
   wet_day_probability: 0.30
   wet_day_persistence: 0.55
   precipitation_gamma_shape: 1.5
@@ -140,6 +213,12 @@ city:
   city_size_alpha: 1.25
 
 land_use:
+  # S: sequential whole-cell area budgets; these are not suitability scores.
+  built_population_density_persons_km2: 6000.0
+  maximum_built_fraction: 0.80
+  agriculture_fraction_of_remaining: 0.45
+  park_fraction_of_remaining: 0.10
+  energy_reserve_fraction_of_remaining: 0.50
   industrial_edge_preference: 0.55
   park_waterfront_weight: 0.55
   agriculture_max_urban_density: 0.22
@@ -152,6 +231,11 @@ land_use:
   load_industrial_weight: 0.18
 
 energy:
+  # S: quadrature resolution and technology-specific hard project boundaries.
+  project_area_subcells_per_axis: 4
+  urban_exclusion_density_threshold: 0.18
+  wind_max_project_slope: 0.35
+  pv_max_project_slope: 0.24
   wind_capacity_density_mw_km2: 3.0
   pv_capacity_density_mw_km2: 35.0
   per_capita_peak_load_kw: 1.5
@@ -187,6 +271,11 @@ energy:
   load_capacity_max_mw: 120.0
 
 power_grid:
+  # S: exclusive thermal project envelopes, consuming the unused energy reserve.
+  thermal_capacity_density_mw_km2: 200.0
+  thermal_project_radius_km: 2.0
+  thermal_project_area_subcells_per_axis: 4
+  thermal_residential_score_threshold: 0.22
   nominal_voltage_kv: 220.0
   thermal_scale_with_load: true
   thermal_planning_reserve_margin: 1.15
@@ -286,6 +375,14 @@ output:
 
 # Scenario priors; these values require regional data calibration.
 source_load:
+  wind_reference_density_kg_m3: 1.225
+  wind_density_height_mode: isothermal_surface_to_hub
+  wind_density_fallback: dry_air_then_reference
+  pv_module_height_m: 2.0
+  pv_wind_shear_exponent: 0.14
+  load_initial_temperature_mode: first_hour
+  load_initial_temperature_c: 20.0
+  thermal_dispatch_half_distance_km: 24.0
   calendar_start_date: "2025-01-01"
   wind_reference_height_m: 10.0
   wind_hub_height_m: 90.0

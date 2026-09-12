@@ -15,6 +15,9 @@ from world_generator.core.datatypes import (
     StaticLandState,
     TerrainFeatures,
 )
+from world_generator.grid.thermal_land import (
+    allocate_thermal_land, thermal_land_eligibility, validate_remaining_area,
+)
 
 
 def build_grid_nodes(
@@ -43,6 +46,23 @@ def build_grid_nodes(
         grid,
         config,
     )
+    # Legacy hand-built EnergyCandidateState objects do not carry an area axis.
+    # Keep that compatibility explicit; never infer hectares from old scores.
+    remaining_area = energy.land_accounting_maps.get("energy_unallocated_area_km2")
+    if remaining_area is None and (
+        energy.land_accounting_maps or energy.project_land_ledger is not None
+        or energy.project_area_by_cell_km2 is not None
+    ):
+        raise ValueError("Stage8 land accounting is missing energy_unallocated_area_km2")
+    land_mode = "legacy_no_land_guarantee"
+    land_maps: dict[str, np.ndarray] = {}
+    land_ledger = None
+    land_cube = None
+    if remaining_area is not None:
+        remaining_area = validate_remaining_area(remaining_area, grid)
+        land_eligible = thermal_land_eligibility(land, hydrology, land_use, energy, grid, config)
+        thermal_suitability[~land_eligible | (remaining_area <= 0.0)] = 0.0
+        land_mode = "exclusive_project_envelopes"
     selection_config = config
     if config.thermal_scale_with_load:
         maximum = max(config.thermal_capacity_max_mw, config.thermal_capacity_min_mw)
@@ -59,6 +79,10 @@ def build_grid_nodes(
         existing_generation_buses=tuple(bus for bus in buses if bus.kind in {"wind_bus", "pv_bus"}),
     )
     thermal_candidates = _size_thermal_capacity_for_adequacy(buses, thermal_candidates, config)
+    if remaining_area is not None:
+        thermal_candidates, land_ledger, land_cube, land_maps = allocate_thermal_land(
+            thermal_candidates, remaining_area, land_eligible, grid, config,
+        )
     buses.extend(thermal_candidates)
 
     load_bus_map = _bus_map(thermal_suitability.shape, buses, {"load_bus"})
@@ -74,6 +98,10 @@ def build_grid_nodes(
         source_bus_map=source_bus_map,
         thermal_bus_map=thermal_bus_map,
         buses=tuple(buses),
+        land_accounting_maps=land_maps,
+        thermal_project_land_ledger=land_ledger,
+        thermal_project_area_by_cell_km2=land_cube,
+        thermal_land_accounting_mode=land_mode,
     )
 
 
@@ -151,7 +179,7 @@ def _thermal_suitability(
     buildability = np.clip(land.buildability, 0.0, 1.0)
     slope_ok = 1.0 - _normalize01(terrain.slope)
     load_mask = energy.load_candidate_map >= 0
-    residential_core = land_use.residential > 0.22
+    residential_core = land_use.residential > config.thermal_residential_score_threshold
 
     load_distance = _distance_to_mask(load_mask, grid)
     residential_distance = _distance_to_mask(residential_core, grid)
